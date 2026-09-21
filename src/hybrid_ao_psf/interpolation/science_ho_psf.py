@@ -117,7 +117,9 @@ class ScienceHoPsfInterpolator:
 
     ``coordinate_order`` records the active interpolation coordinates. Fixed
     wavelength and fixed zenith values remain in their metadata axes but are not
-    included in ``coordinate_order``.
+    included in ``coordinate_order``. The loaded provider prepares its
+    process-local SciPy interpolator on first evaluation and reuses it for
+    subsequent queries; that runtime state is not part of the artifact.
     """
 
     coordinate_order: tuple[str, ...]
@@ -134,6 +136,9 @@ class ScienceHoPsfInterpolator:
     meta: Mapping[str, Any] = field(default_factory=dict)
     provenance: tuple[str, ...] = ()
     builder: Mapping[str, Any] = field(default_factory=dict)
+    _prepared_psf_interpolator: RegularGridInterpolator | None = field(
+        default=None, init=False, repr=False, compare=False
+    )
 
     def __post_init__(self) -> None:
         object.__setattr__(self, "coordinate_order", tuple(self.coordinate_order))
@@ -167,6 +172,14 @@ class ScienceHoPsfInterpolator:
             x=x,
             y=y,
         )
+
+    def _prepared_runtime(self) -> _ScienceHoPsfRuntimeInterpolator:
+        psf_interpolator = self._prepared_psf_interpolator
+        if psf_interpolator is None:
+            runtime = _prepare_science_ho_psf_runtime_interpolator(self)
+            psf_interpolator = runtime.psf_interpolator
+            object.__setattr__(self, "_prepared_psf_interpolator", psf_interpolator)
+        return _ScienceHoPsfRuntimeInterpolator(self, psf_interpolator)
 
 
 @dataclass(frozen=True)
@@ -343,9 +356,11 @@ def evaluate_science_ho_psf_interpolator(
     is active; otherwise a supplied value is checked against the fixed artifact
     wavelength.
     """
+    if not isinstance(interpolator, ScienceHoPsfInterpolator):
+        raise TypeError("interpolator must be a ScienceHoPsfInterpolator instance.")
 
     return _evaluate_science_ho_psf_runtime_interpolator(
-        _prepare_science_ho_psf_runtime_interpolator(interpolator),
+        interpolator._prepared_runtime(),
         zenith_angle=zenith_angle,
         wavelength=wavelength,
         x=x,

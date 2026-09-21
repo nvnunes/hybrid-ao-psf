@@ -138,6 +138,53 @@ def test_science_ho_psf_interpolator_round_trips_and_replays_sources(tmp_path) -
     assert replay.metric_max_abs["ee"].to_value(u.one) == pytest.approx(0.0, abs=1.0e-5)
 
 
+def test_science_provider_prepares_runtime_once_for_repeated_queries(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    path = tmp_path / "science.h5"
+    save_science_ho_psf_interpolator(build_science_ho_psf_interpolator(_science_samples()), path)
+    interpolator = load_science_ho_psf_interpolator(path)
+    prepare = science_ho_psf._prepare_science_ho_psf_runtime_interpolator
+    calls = 0
+
+    def observed_prepare(provider):
+        nonlocal calls
+        calls += 1
+        return prepare(provider)
+
+    monkeypatch.setattr(science_ho_psf, "_prepare_science_ho_psf_runtime_interpolator", observed_prepare)
+    query = {
+        "zenith_angle": 20.0 * u.deg,
+        "wavelength": 1.0 * u.um,
+        "x": _science_samples().x,
+        "y": _science_samples().y,
+    }
+    reference = science_ho_psf._evaluate_science_ho_psf_runtime_interpolator(
+        prepare(interpolator), **query
+    )
+
+    first = interpolator.predict(**query)
+    second = interpolator.predict(**query)
+    via_function = evaluate_science_ho_psf_interpolator(interpolator, **query)
+
+    assert calls == 1
+    np.testing.assert_array_equal(first.psfs, reference.psfs)
+    np.testing.assert_array_equal(first.psfs, second.psfs)
+    np.testing.assert_array_equal(first.psfs, via_function.psfs)
+
+
+def test_science_evaluator_rejects_wrong_provider_type() -> None:
+    with pytest.raises(TypeError, match="ScienceHoPsfInterpolator"):
+        evaluate_science_ho_psf_interpolator(
+            object(),
+            zenith_angle=20.0 * u.deg,
+            wavelength=1.0 * u.um,
+            x=np.asarray([0.0]) * u.arcsec,
+            y=np.asarray([0.0]) * u.arcsec,
+        )
+
+
 def test_science_ho_psf_interpolator_uses_rectangular_grid() -> None:
     interpolator = build_science_ho_psf_interpolator(_science_samples())
 
