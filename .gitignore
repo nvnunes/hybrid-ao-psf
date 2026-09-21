@@ -1,0 +1,13 @@
+.DS_Store
+.conda/
+.pytest_cache/
+.ruff_cache/
+__pycache__/
+*.py[cod]
+*.egg-info/
+build/
+dist/
+examples/products/
+examples/results/
+site/
+tmp

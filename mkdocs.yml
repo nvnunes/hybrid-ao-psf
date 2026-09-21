@@ -1,0 +1,36 @@
+site_name: Hybrid AO PSF
+site_description: Standalone hybrid adaptive-optics PSF simulation engine
+repo_url: https://github.com/nvnunes/hybrid-ao-psf
+
+theme:
+  name: material
+
+nav:
+  - Home: index.md
+  - API Guide: api.md
+  - Configuration: configuration.md
+  - Interpolation Products: interpolation.md
+  - Engine: engine.md
+  - Result Files: results.md
+  - Architecture: architecture.md
+  - Development: development.md
+  - Testing: testing.md
+  - Reference:
+      - Python API: reference/api.md
+
+plugins:
+  - search
+  - mkdocstrings:
+      handlers:
+        python:
+          paths: [src]
+          options:
+            docstring_style: google
+            show_source: false
+            show_root_heading: true
+            members_order: source
+
+markdown_extensions:
+  - admonition
+  - toc:
+      permalink: true

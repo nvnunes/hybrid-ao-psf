@@ -1,0 +1,68 @@
+[build-system]
+requires = ["setuptools>=64", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "hybrid-ao-psf"
+description = "Standalone MASTSEL-backed hybrid adaptive-optics PSF simulation engine"
+readme = "README.md"
+requires-python = ">=3.12"
+license = "MIT"
+license-files = ["LICENSE"]
+authors = [
+    {name = "Nelson V. Nunes", email = "nvnunes@yorku.ca"},
+]
+dynamic = ["version"]
+classifiers = [
+    "Development Status :: 2 - Pre-Alpha",
+    "Intended Audience :: Science/Research",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.12",
+    "Topic :: Scientific/Engineering :: Astronomy",
+]
+dependencies = [
+    "ao-stats>=0.1.0",
+    "astropy>=7.0.0",
+    "h5py>=3.11.0",
+    "mastsel>=1.3.11,<2",
+    "numpy>=2.2.0",
+    "scipy>=1.14.0",
+]
+
+[project.scripts]
+hybrid-ao-psf = "hybrid_ao_psf.cli:main"
+
+[project.urls]
+Homepage = "https://github.com/nvnunes/hybrid-ao-psf"
+Documentation = "https://github.com/nvnunes/hybrid-ao-psf#readme"
+Repository = "https://github.com/nvnunes/hybrid-ao-psf"
+Issues = "https://github.com/nvnunes/hybrid-ao-psf/issues"
+
+[project.optional-dependencies]
+dev = [
+    "build>=1.2",
+    "PyYAML>=6.0",
+    "pytest>=8.0",
+    "ruff",
+]
+docs = [
+    "mkdocs>=1.6.0,<2.0",
+    "mkdocs-material>=9.5.0",
+    "mkdocstrings[python]>=0.26.0",
+]
+
+[tool.setuptools]
+package-dir = {"" = "src"}
+
+[tool.setuptools.packages.find]
+where = ["src"]
+include = ["hybrid_ao_psf*"]
+
+[tool.setuptools.dynamic]
+version = {attr = "hybrid_ao_psf._version.__version__"}
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+markers = [
+    "slow_mastsel: real MASTSEL scientific regression",
+]
