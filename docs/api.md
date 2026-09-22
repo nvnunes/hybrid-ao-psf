@@ -44,6 +44,21 @@ blur, derives jitter, and returns `HybridResult`. Providers are borrowed and
 may be reused across calls. See [Engine](engine.md) for the Ctot and diagnostic
 policies.
 
+`blur_psfs_with_ctot(psfs, ctot_wavefront, *, pixel_scale,
+angle_to_wavefront_scale)` is a narrower public operation for externally
+supplied PSFs. It accepts a symmetric, already-conditioned wavefront Ctot cube
+in `nm2`, checks for materially non-PSD matrices, and returns a separate array
+with the same dtype. It uses the engine's finite-field blur without
+renormalizing spill, running MASTSEL, or applying a clipping policy. Zero Ctot
+leaves the corresponding PSF unchanged.
+
+For comparisons that already have pixel-space covariance or OTFs,
+`image_plane_gaussian_otf(covariance_pix2, shape, *, mean_shift_pix=None)`
+constructs one Gaussian OTF, and `apply_finite_fov_otfs(psfs, otfs)` applies a
+matching OTF cube to PSFs in place. OTF shapes are twice the retained PSF
+height and width; both operations use NumPy's unshifted FFT convention. The
+application crops and clips numerical negatives without renormalizing flux.
+
 ## Configuration
 
 `load_configuration()` reads one combined Hybrid-and-MASTSEL INI, resolves

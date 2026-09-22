@@ -338,13 +338,55 @@ def apply_ctot_blur(
     psfs_array[active] = active_psfs
 
 
+def blur_psfs_with_ctot(
+    psfs: np.ndarray,
+    ctot_wavefront: u.Quantity,
+    *,
+    pixel_scale: u.Quantity,
+    angle_to_wavefront_scale: u.Quantity,
+) -> np.ndarray:
+    """Blur external PSFs with an already-conditioned wavefront Ctot cube.
+
+    Return a new array without renormalizing finite-field spill. This focused
+    operation does not run MASTSEL or apply a non-PSD conditioning policy.
+    """
+    source = np.asarray(psfs)
+    if source.ndim != 3:
+        raise ValueError(f"psfs must have shape (N, y, x); got {source.shape}.")
+    validate_ctot_shape(ctot_wavefront, expected_size=source.shape[0], label="Ctot")
+    values = quantity_value(
+        ctot_wavefront, u.nm**2, label="ctot_wavefront", dtype=float
+    )
+    if not np.allclose(values, np.swapaxes(values, -1, -2)):
+        raise ValueError("Ctot matrices must be symmetric.")
+    if values.size and np.min(np.linalg.eigvalsh(values)) < -CTOT_PSD_TOLERANCE_NM2:
+        raise ValueError(
+            "Ctot must already be positive semidefinite within the fixed "
+            f"{CTOT_PSD_TOLERANCE_NM2:.6g} nm2 tolerance."
+        )
+    result = source.copy()
+    apply_ctot_blur(
+        result,
+        ctot_wavefront,
+        pixel_scale=pixel_scale,
+        angle_to_wavefront_scale=angle_to_wavefront_scale,
+    )
+    return result
+
+
 def image_plane_gaussian_otf(
     covariance_pix2: np.ndarray,
     shape: tuple[int, int],
     *,
     mean_shift_pix: np.ndarray | None = None,
 ) -> np.ndarray:
-    """Return an image-plane Gaussian OTF in NumPy's FFT convention."""
+    """Return a finite-field Gaussian OTF for an x/y covariance in pixel squared.
+
+    ``shape`` is the padded image shape in y/x order. ``mean_shift_pix`` is an
+    optional x/y displacement in pixels. The returned array uses NumPy's
+    unshifted FFT frequency convention and can be passed to
+    :func:`apply_finite_fov_otfs`.
+    """
     covariance_pix2 = np.asarray(covariance_pix2, dtype=float)
     if covariance_pix2.shape != (2, 2) or not np.all(np.isfinite(covariance_pix2)):
         raise ValueError("covariance_pix2 must be a finite 2 x 2 matrix.")
@@ -374,7 +416,14 @@ def image_plane_gaussian_otf(
 
 
 def apply_finite_fov_otfs(psfs: np.ndarray, otfs: np.ndarray) -> None:
-    """Apply matching OTFs using the retained finite-field convention."""
+    """Blur a PSF cube in place with matching precomputed finite-field OTFs.
+
+    ``psfs`` has shape ``(N, y, x)`` and ``otfs`` has shape
+    ``(N, 2*y, 2*x)`` in NumPy's unshifted FFT convention. Each PSF is padded,
+    blurred, cropped, and clipped for numerical negatives. Cropped flux is
+    not renormalized. Invalid shapes, non-finite values, or non-positive
+    retained flux raise ``ValueError``.
+    """
     psfs_array = np.asarray(psfs)
     otfs_array = np.asarray(otfs)
     if psfs_array.ndim != 3:
@@ -461,5 +510,8 @@ def _load_mavis_lo() -> Any:
 
 
 __all__ = [
+    "apply_finite_fov_otfs",
+    "blur_psfs_with_ctot",
+    "image_plane_gaussian_otf",
     "simulate",
 ]

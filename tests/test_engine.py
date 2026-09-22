@@ -13,7 +13,10 @@ from hybrid_ao_psf import (
     NgsHoMetricPrediction,
     NonPsdPolicy,
     ScienceHoPsfPrediction,
+    apply_finite_fov_otfs,
+    blur_psfs_with_ctot,
     engine,
+    image_plane_gaussian_otf,
 )
 
 
@@ -273,15 +276,58 @@ def test_ctot_blur_preserves_zero_and_allows_finite_field_spill() -> None:
     assert np.all(flux < np.array([2.0, 5.0]))
 
 
+def test_public_blur_matches_engine_without_mutating_external_psfs() -> None:
+    psfs = np.zeros((2, 9, 9), dtype=np.float32)
+    psfs[:, 0, 0] = [2.0, 5.0]
+    original = psfs.copy()
+    ctot = np.stack([400.0 * np.eye(2), np.zeros((2, 2))]) * u.nm**2
+    expected = psfs.copy()
+    engine.apply_ctot_blur(
+        expected,
+        ctot,
+        pixel_scale=4.0 * u.mas,
+        angle_to_wavefront_scale=2.0 * u.nm / u.mas,
+    )
+
+    actual = blur_psfs_with_ctot(
+        psfs,
+        ctot,
+        pixel_scale=4.0 * u.mas,
+        angle_to_wavefront_scale=2.0 * u.nm / u.mas,
+    )
+
+    np.testing.assert_array_equal(actual, expected)
+    np.testing.assert_array_equal(psfs, original)
+    assert actual.dtype == psfs.dtype
+
+
+def test_public_blur_rejects_unconditioned_ctot() -> None:
+    psfs = np.ones((1, 9, 9), dtype=np.float32)
+    with pytest.raises(ValueError, match="already be positive semidefinite"):
+        blur_psfs_with_ctot(
+            psfs,
+            np.array([[[-1.0, 0.0], [0.0, 2.0]]]) * u.nm**2,
+            pixel_scale=4.0 * u.mas,
+            angle_to_wavefront_scale=2.0 * u.nm / u.mas,
+        )
+    with pytest.raises(ValueError, match="symmetric"):
+        blur_psfs_with_ctot(
+            psfs,
+            np.array([[[2.0, 1.0], [0.0, 2.0]]]) * u.nm**2,
+            pixel_scale=4.0 * u.mas,
+            angle_to_wavefront_scale=2.0 * u.nm / u.mas,
+        )
+
+
 def test_finite_field_otf_applies_mean_shift_without_renormalizing() -> None:
     psfs = np.zeros((1, 9, 9), dtype=np.float32)
     psfs[0, 4, 4] = 2.0
-    otf = engine.image_plane_gaussian_otf(
+    otf = image_plane_gaussian_otf(
         np.zeros((2, 2)),
         (18, 18),
         mean_shift_pix=np.array([2.0, -1.0]),
     )
-    engine.apply_finite_fov_otfs(psfs, otf[None])
+    apply_finite_fov_otfs(psfs, otf[None])
 
     expected = np.zeros_like(psfs)
     expected[0, 3, 6] = 2.0

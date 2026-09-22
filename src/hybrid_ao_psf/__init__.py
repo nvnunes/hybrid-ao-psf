@@ -13,7 +13,12 @@ from .contracts import (
     ScienceHoPsfPrediction,
     SciencePsfProvider,
 )
-from .engine import simulate
+from .engine import (
+    apply_finite_fov_otfs,
+    blur_psfs_with_ctot,
+    image_plane_gaussian_otf,
+    simulate,
+)
 from .interpolation import (
     NgsHoMetricInterpolator,
     NgsHoMetricReplaySummary,
@@ -74,12 +79,15 @@ __all__ = [
     "ScienceHoPsfSamples",
     "SciencePsfProvider",
     "__version__",
+    "apply_finite_fov_otfs",
+    "blur_psfs_with_ctot",
     "build_ngs_ho_metric_interpolator",
     "build_ngs_ho_metric_interpolator_from_psfs",
     "build_ngs_ho_metric_samples_from_psfs",
     "build_science_ho_psf_interpolator",
     "evaluate_ngs_ho_metric_interpolator",
     "evaluate_science_ho_psf_interpolator",
+    "image_plane_gaussian_otf",
     "load_configuration",
     "load_ngs_ho_metric_interpolator",
     "load_result",

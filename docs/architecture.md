@@ -32,8 +32,9 @@ re-exports every supported user-facing contract and operation. The
 `hybrid_ao_psf.interpolation` submodule is also public for focused
 interpolation workflows, and its public names are the same names re-exported
 from the package root. Other submodules are implementation details; storage
-mechanics, MASTSEL adaptation, numerical helpers, and runtime preparation are
-private.
+mechanics, MASTSEL adaptation, and runtime preparation are private. The
+package-root OTF helpers are the supported numerical primitives for external
+finite-field blur comparisons; other numerical helpers remain private.
 
 Physical values use Astropy quantities. Public requests and results are
 immutable typed objects. One simulation call accepts one resolved request and
@@ -55,10 +56,16 @@ preparation remain outside the stateless engine operation. The combined
 configuration boundary is `HybridConfiguration` plus `load_configuration()`;
 standalone results use `save_result()` and `load_result()`.
 
-`simulate()` is the sole scientific execution path. It is stateless, borrows
-its immutable providers, owns MASTSEL translation and execution, and returns a
-new result. `simulate_configuration()`, `run_configuration()`, and the CLI call
-this operation rather than defining separate scientific behavior.
+`simulate()` is the sole complete scientific simulation path. It is stateless,
+borrows its immutable providers, owns MASTSEL translation and execution, and
+returns a new result. `simulate_configuration()`, `run_configuration()`, and the
+CLI call this operation rather than defining separate scientific behavior.
+`blur_psfs_with_ctot()` is a focused operation for externally supplied PSFs
+and already-conditioned Ctot; it uses the same finite-field blur without
+running MASTSEL or producing a complete simulation result.
+`image_plane_gaussian_otf()` and `apply_finite_fov_otfs()` expose the same
+Gaussian OTF construction and in-place finite-field application when callers
+provide pixel-space covariance or precomputed OTFs directly.
 
 ## Persisted Contracts
 

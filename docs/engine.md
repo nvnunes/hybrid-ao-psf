@@ -23,6 +23,14 @@ One call:
 The finite-field crop is not renormalized. Energy blurred beyond the retained
 PSF support remains absent from the result.
 
+For comparisons that supply their own PSFs and conditioned Ctot,
+`blur_psfs_with_ctot()` exposes this same finite-field blur without running the
+complete simulation. It returns a copy and rejects materially non-PSD Ctot;
+callers remain responsible for the covariance conditioning they intend.
+Callers with pixel-space covariance or precomputed OTFs can instead use
+`image_plane_gaussian_otf()` and `apply_finite_fov_otfs()` directly. The latter
+mutates the supplied PSF cube and preserves the same finite-field convention.
+
 ## Ctot Policy
 
 Zero Ctot is valid and leaves its PSF unchanged. Ctot is symmetrized before
