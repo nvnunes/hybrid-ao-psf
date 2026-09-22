@@ -69,6 +69,22 @@ running MASTSEL or producing a complete simulation result.
 Gaussian OTF construction and in-place finite-field application when callers
 provide pixel-space covariance or precomputed OTFs directly.
 
+## Coordinate And Image Orientation
+
+Request and field coordinates are Cartesian `(x, y)` pairs in arcseconds.
+Hybrid passes science and NGS pairs to MASTSEL in that order. Each Ctot matrix
+uses `(x, y)` on both axes: element `[0, 0]` is x variance, `[1, 1]` is
+y variance, and `[0, 1]` is x/y covariance. PSF cubes have shape
+`(N, y, x)`. Increasing column index points toward `+x`; increasing row
+index points toward `+y` in the same Cartesian frame. The Gaussian OTF maps
+x covariance to column frequencies and y covariance to row frequencies.
+
+Science providers must supply source PSFs in this orientation. The PSF
+metadata provides pixel scale and physical context but does not encode an
+image-axis rotation or flip. Hybrid preserves the source array orientation;
+it does not infer or apply a transform from metadata. This contract does not
+assign celestial north or east to either Cartesian axis.
+
 ## Persisted Contracts
 
 Interpolator artifacts and standalone HDF5 results use project-owned schema

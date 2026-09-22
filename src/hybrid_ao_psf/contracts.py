@@ -37,7 +37,9 @@ class ScienceHoPsfPrediction:
     """Science high-order PSFs returned by a loaded provider.
 
     Attributes:
-        psfs: One non-negative PSF image per requested science coordinate.
+        psfs: One non-negative PSF image per requested science coordinate, in
+            ``(N, y, x)`` order. Columns increase toward ``+x`` and rows
+            toward ``+y`` in the request's Cartesian frame.
         pixel_scale: Scalar angular pixel scale shared by the returned PSFs.
         metadata: Physical PSF metadata compatible with AO Stats.
         meta: Optional scalar physical metadata propagated from the source.
@@ -135,10 +137,11 @@ class HybridRequest:
     """Resolved inputs for one stateless Hybrid AO PSF simulation.
 
     Attributes:
-        science_x: Science field x-coordinates.
-        science_y: Science field y-coordinates.
-        ngs_x: Natural-guide-star x-coordinates.
-        ngs_y: Natural-guide-star y-coordinates.
+        science_x: Science field x-coordinates in arcseconds.
+        science_y: Science field y-coordinates in arcseconds.
+        ngs_x: Natural-guide-star x-coordinates in arcseconds.
+        ngs_y: Natural-guide-star y-coordinates in arcseconds. Each x/y pair
+            is passed to MASTSEL in that order.
         ngs_flux: Photon rate for each active natural guide star.
         wavelength: Science wavelength.
         zenith_angle: Observation zenith angle.
@@ -303,12 +306,13 @@ class HybridResult:
     """Immutable standard result of one Hybrid AO PSF simulation.
 
     Attributes:
-        psfs: Final PSFs after low-order blurring.
+        psfs: Final PSFs after low-order blurring, in ``(N, y, x)`` order.
         metadata: Physical metadata for ``psfs``.
         source_metadata: Scalar metadata from the science PSF provider.
         ngs_metrics: Interpolated guide-star high-order metrics.
-        ctot_wavefront: Conditioned low-order covariance in wavefront units.
-        ctot_angle: The same covariance in angular units.
+        ctot_wavefront: Conditioned low-order covariance in wavefront units,
+            with matrix axes ordered ``(x, y)``.
+        ctot_angle: The same ``(x, y)`` covariance in angular units.
         angle_to_wavefront_scale: Scale relating angular and wavefront Ctot.
         ngs_flux: Effective guide-star photon rates.
         ngs_frame_rate: Effective guide-star frame rates.

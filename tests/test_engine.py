@@ -160,6 +160,57 @@ def test_simulate_builds_owned_result_and_passes_resolved_mastsel_inputs(
     assert "zenith = [0, 1]" in result.effective_mastsel_ini.lower()
 
 
+def test_directional_field_pairs_and_covariance_axes_reach_mastsel(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    calls: dict[str, np.ndarray] = {}
+    ctot = np.array(
+        [
+            [[100.0, 20.0], [20.0, 400.0]],
+            [[200.0, -30.0], [-30.0, 500.0]],
+        ]
+    )
+
+    class FakeMavisLO:
+        error = False
+        mas2nm = 2.0
+
+        def __init__(self, *_: object, **__: object) -> None:
+            pass
+
+        def computeTotalResidualMatrix(self, science, ngs, *_: object, **__: object) -> np.ndarray:
+            calls["science"] = np.asarray(science)
+            calls["ngs"] = np.asarray(ngs)
+            return ctot
+
+    monkeypatch.setattr(engine, "_load_mavis_lo", lambda: FakeMavisLO)
+    request = replace(
+        _request(),
+        science_x=np.array([12.0, -4.0]) * u.arcsec,
+        science_y=np.array([-3.0, 8.0]) * u.arcsec,
+        ngs_x=np.array([9.0, -7.0]) * u.arcsec,
+        ngs_y=np.array([2.0, -6.0]) * u.arcsec,
+    )
+    science, ngs = _providers()
+    directional_psfs = np.zeros((2, 33, 33), dtype=np.float32)
+    directional_psfs[:, 15, 18] = 1.0
+    directional_psfs[:, 21, 12] = 0.2
+    science = _ScienceProvider(replace(science.prediction, psfs=directional_psfs))
+
+    result = engine.simulate(request, science, ngs)
+
+    np.testing.assert_array_equal(calls["science"], [[12.0, -3.0], [-4.0, 8.0]])
+    np.testing.assert_array_equal(calls["ngs"], [[9.0, 2.0], [-7.0, -6.0]])
+    np.testing.assert_array_equal(result.ctot_wavefront.to_value(u.nm**2), ctot)
+    expected = blur_psfs_with_ctot(
+        directional_psfs,
+        ctot * u.nm**2,
+        pixel_scale=8.0 * u.mas,
+        angle_to_wavefront_scale=2.0 * u.nm / u.mas,
+    )
+    np.testing.assert_array_equal(result.psfs, expected)
+
+
 def test_simulate_uses_frame_rate_from_ini(monkeypatch: pytest.MonkeyPatch) -> None:
     calls: dict[str, np.ndarray] = {}
 
@@ -366,6 +417,8 @@ def test_public_blur_rejects_unconditioned_ctot() -> None:
 def test_finite_field_otf_applies_mean_shift_without_renormalizing() -> None:
     psfs = np.zeros((1, 9, 9), dtype=np.float32)
     psfs[0, 4, 4] = 2.0
+    psfs[0, 2, 5] = 0.5
+    psfs[0, 6, 3] = 0.25
     otf = image_plane_gaussian_otf(
         np.zeros((2, 2)),
         (18, 18),
@@ -375,4 +428,36 @@ def test_finite_field_otf_applies_mean_shift_without_renormalizing() -> None:
 
     expected = np.zeros_like(psfs)
     expected[0, 3, 6] = 2.0
+    expected[0, 1, 7] = 0.5
+    expected[0, 5, 5] = 0.25
     np.testing.assert_allclose(psfs, expected, rtol=0.0, atol=2.0e-7)
+
+
+def test_directional_covariance_blurs_x_columns_and_y_rows() -> None:
+    yy, xx = np.indices((65, 65), dtype=float)
+    psfs = np.zeros((1, 65, 65), dtype=np.float32)
+    psfs[0] = (
+        np.exp(-((xx - 34.0) ** 2 + (yy - 29.0) ** 2) / (2.0 * 1.7**2))
+        + 0.2 * np.exp(-((xx - 28.0) ** 2 + (yy - 36.0) ** 2) / (2.0 * 1.7**2))
+    )
+    ctot_xy = np.array([[[4.0, 1.2], [1.2, 1.0]]])
+
+    blurred = blur_psfs_with_ctot(
+        psfs,
+        ctot_xy * u.nm**2,
+        pixel_scale=1.0 * u.mas,
+        angle_to_wavefront_scale=1.0 * u.nm / u.mas,
+    )
+
+    def moments(image: np.ndarray) -> np.ndarray:
+        weights = image / image.sum()
+        dx = xx - np.sum(weights * xx)
+        dy = yy - np.sum(weights * yy)
+        return np.array(
+            [
+                [np.sum(weights * dx * dx), np.sum(weights * dx * dy)],
+                [np.sum(weights * dx * dy), np.sum(weights * dy * dy)],
+            ]
+        )
+
+    np.testing.assert_allclose(moments(blurred[0]) - moments(psfs[0]), ctot_xy[0], atol=2.0e-4)

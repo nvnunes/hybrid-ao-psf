@@ -215,6 +215,36 @@ def test_science_ho_psf_interpolator_uses_rectangular_grid() -> None:
     np.testing.assert_allclose(interpolator.y, np.asarray([-1.0, 1.0]) * u.arcsec)
 
 
+def test_science_field_queries_preserve_directional_psf_pixels() -> None:
+    x = np.array([1.0, -1.0, 1.0, -1.0])
+    y = np.array([-1.0, -1.0, 1.0, 1.0])
+    psfs = np.zeros((4, 9, 9), dtype=np.float32)
+    for index, (field_x, field_y) in enumerate(zip(x, y, strict=True)):
+        psfs[index, 4, 4] = 1.0
+        psfs[index, 4 + int(field_y), 4 + int(field_x)] = 0.4 + 0.1 * index
+        psfs[index, 1, 6] = 0.05
+    samples = ScienceHoPsfSamples(
+        x=x * u.arcsec,
+        y=y * u.arcsec,
+        psfs=psfs,
+        wavelength=1.65 * u.um,
+        pixel_scale=4.0 * u.mas,
+        tel_diameter=8.0 * u.m,
+        tel_pupil=np.ones((4, 4), dtype=np.float32) * u.one,
+    )
+
+    prediction = build_science_ho_psf_interpolator(samples).predict(
+        zenith_angle=20.0 * u.deg,
+        wavelength=1.65 * u.um,
+        x=np.array([1.0, -1.0]) * u.arcsec,
+        y=np.array([-1.0, 1.0]) * u.arcsec,
+    )
+
+    np.testing.assert_array_equal(prediction.psfs, psfs[[0, 3]])
+    assert prediction.psfs[0, 3, 5] > prediction.psfs[0, 5, 3]
+    assert prediction.psfs[1, 5, 3] > prediction.psfs[1, 3, 5]
+
+
 def test_rectangular_field_helpers_fill_values_in_y_x_order() -> None:
     x = np.asarray([1.0, -1.0, 1.0, -1.0])
     y = np.asarray([1.0, -1.0, -1.0, 1.0])

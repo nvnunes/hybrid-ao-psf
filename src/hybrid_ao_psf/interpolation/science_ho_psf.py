@@ -75,7 +75,10 @@ class ScienceHoPsfSamples:
         x: Science field x-coordinates in arcseconds.
         y: Science field y-coordinates in arcseconds.
         psfs: PSF array with shape ``(points, y, x)`` for fixed-plane samples
-            or ``(planes, points, y, x)`` for physical-axis samples.
+            or ``(planes, points, y, x)`` for physical-axis samples. Columns
+            increase toward ``+x`` and rows toward ``+y`` in the field frame;
+            source orientation is supplied by the caller, not inferred from
+            the PSF metadata.
         wavelength: Scalar fixed wavelength or one wavelength per plane.
         pixel_scale: Scalar fixed pixel scale or one value per plane.
         tel_diameter: Telescope diameter in meters.

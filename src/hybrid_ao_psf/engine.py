@@ -305,7 +305,12 @@ def apply_ctot_blur(
     pixel_scale: u.Quantity,
     angle_to_wavefront_scale: u.Quantity,
 ) -> None:
-    """Apply finite-field Ctot blur in place without renormalizing."""
+    """Blur ``(N, y, x)`` PSFs with ``(N, 2, 2)`` Ctot in place.
+
+    Ctot axes are ``(x, y)``. Image columns and rows increase toward ``+x``
+    and ``+y`` respectively.
+    The finite-field result is not renormalized.
+    """
     validate_ctot_shape(
         ctot_wavefront,
         expected_size=np.asarray(psfs).shape[0],

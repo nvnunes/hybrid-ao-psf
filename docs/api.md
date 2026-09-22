@@ -9,6 +9,8 @@ NGS coordinates, physical scalars, and NGS fluxes are Astropy quantities.
 Array-valued inputs are copied and exposed read-only. The request also contains
 the MASTSEL INI text plus the selected non-PSD and diagnostics policies. The
 engine reads `RTC.SensorFrameRate_LO` from that INI for every active NGS.
+Coordinates, Ctot axes, and PSF image orientation follow the
+[coordinate contract](architecture.md#coordinate-and-image-orientation).
 
 `SciencePsfProvider` and `NgsMetricProvider` define the two reusable loaded
 provider boundaries. Their predictions use `ScienceHoPsfPrediction` and

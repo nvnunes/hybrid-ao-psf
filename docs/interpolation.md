@@ -17,6 +17,8 @@ metadata, provenance, and a prepared SciPy regular-grid interpolator.
 `save_science_ho_psf_interpolator()` writes a version-2 pickle with identity
 `hybrid_ao_psf_science_ho_psf_interpolator`. Loading returns ready-to-evaluate
 read-only state without preparing the interpolator again.
+Source images must follow the [coordinate and image orientation contract](architecture.md#coordinate-and-image-orientation);
+interpolation does not rotate or flip their pixels.
 
 ## NGS High-Order Metrics
 
