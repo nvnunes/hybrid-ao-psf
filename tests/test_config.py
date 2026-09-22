@@ -71,6 +71,8 @@ def test_load_configuration_resolves_paths_and_cartesian_coordinates(tmp_path: P
     assert configuration.request.diagnostics_level is DiagnosticsLevel.DEBUG
     assert "[hybrid]" not in configuration.request.mastsel_ini.lower()
     assert "[telescope]" in configuration.request.mastsel_ini
+    assert "SensorFrameRate_LO = 500.0" in configuration.request.mastsel_ini
+    assert not hasattr(configuration.request, "ngs_frame_rate")
 
 
 def test_load_configuration_rejects_ngs_flux_shape(tmp_path: Path) -> None:

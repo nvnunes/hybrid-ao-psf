@@ -60,6 +60,8 @@ standalone results use `save_result()` and `load_result()`.
 borrows its immutable providers, owns MASTSEL translation and execution, and
 returns a new result. `simulate_configuration()`, `run_configuration()`, and the
 CLI call this operation rather than defining separate scientific behavior.
+The engine reads the active NGS frame rate from `RTC.SensorFrameRate_LO` in the
+effective MASTSEL configuration and reports the applied rates in the result.
 `blur_psfs_with_ctot()` is a focused operation for externally supplied PSFs
 and already-conditioned Ctot; it uses the same finite-field blur without
 running MASTSEL or producing a complete simulation result.

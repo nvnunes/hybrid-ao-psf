@@ -5,10 +5,10 @@ This guide defines the supported public Python surface of Hybrid AO PSF.
 ## Requests And Providers
 
 `HybridRequest` is the single resolved simulation input. Cartesian science and
-NGS coordinates, physical scalars, NGS fluxes, and NGS frame rates are Astropy
-quantities. Array-valued inputs are copied and exposed read-only. The request
-also contains the MASTSEL INI text plus the selected non-PSD and diagnostics
-policies.
+NGS coordinates, physical scalars, and NGS fluxes are Astropy quantities.
+Array-valued inputs are copied and exposed read-only. The request also contains
+the MASTSEL INI text plus the selected non-PSD and diagnostics policies. The
+engine reads `RTC.SensorFrameRate_LO` from that INI for every active NGS.
 
 `SciencePsfProvider` and `NgsMetricProvider` define the two reusable loaded
 provider boundaries. Their predictions use `ScienceHoPsfPrediction` and

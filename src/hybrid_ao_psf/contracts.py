@@ -139,10 +139,9 @@ class HybridRequest:
         science_y: Science field y-coordinates.
         ngs_x: Natural-guide-star x-coordinates.
         ngs_y: Natural-guide-star y-coordinates.
+        ngs_flux: Photon rate for each active natural guide star.
         wavelength: Science wavelength.
         zenith_angle: Observation zenith angle.
-        ngs_flux: Photon rate for each active natural guide star.
-        ngs_frame_rate: Sensor frame rate for each active natural guide star.
         mastsel_ini: Complete MASTSEL configuration text.
         non_psd_policy: Handling of materially non-PSD covariance matrices.
         diagnostics_level: Amount of optional intermediate data to retain.
@@ -152,10 +151,9 @@ class HybridRequest:
     science_y: u.Quantity
     ngs_x: u.Quantity
     ngs_y: u.Quantity
+    ngs_flux: u.Quantity
     wavelength: u.Quantity
     zenith_angle: u.Quantity
-    ngs_flux: u.Quantity
-    ngs_frame_rate: u.Quantity
     mastsel_ini: str
     non_psd_policy: NonPsdPolicy | str = NonPsdPolicy.ERROR
     diagnostics_level: DiagnosticsLevel | str = DiagnosticsLevel.NONE
@@ -168,25 +166,18 @@ class HybridRequest:
         ngs_flux = _readonly_quantity(
             self.ngs_flux, u.photon / u.s, "ngs_flux", ndim=1
         )
-        ngs_frame_rate = _readonly_quantity(
-            self.ngs_frame_rate, u.Hz, "ngs_frame_rate", ndim=1
-        )
         if science_x.size == 0:
             raise ValueError("At least one science coordinate is required.")
         if ngs_x.size == 0:
             raise ValueError("At least one active NGS is required.")
         if science_x.shape != science_y.shape:
             raise ValueError("science_x and science_y must have identical shapes.")
-        if not (
-            ngs_x.shape == ngs_y.shape == ngs_flux.shape == ngs_frame_rate.shape
-        ):
+        if not (ngs_x.shape == ngs_y.shape == ngs_flux.shape):
             raise ValueError(
-                "NGS coordinates, flux, and frame-rate vectors must have identical shapes."
+                "NGS coordinates and flux vectors must have identical shapes."
             )
         if np.any(ngs_flux.value <= 0.0):
             raise ValueError("ngs_flux must be positive.")
-        if np.any(ngs_frame_rate.value <= 0.0):
-            raise ValueError("ngs_frame_rate must be positive.")
         wavelength = _positive_scalar(self.wavelength, u.um, "wavelength")
         zenith_angle = _scalar(self.zenith_angle, u.deg, "zenith_angle")
         if not 0.0 <= zenith_angle.to_value(u.deg) < 90.0:
@@ -208,10 +199,9 @@ class HybridRequest:
         object.__setattr__(self, "science_y", science_y)
         object.__setattr__(self, "ngs_x", ngs_x)
         object.__setattr__(self, "ngs_y", ngs_y)
+        object.__setattr__(self, "ngs_flux", ngs_flux)
         object.__setattr__(self, "wavelength", wavelength)
         object.__setattr__(self, "zenith_angle", zenith_angle)
-        object.__setattr__(self, "ngs_flux", ngs_flux)
-        object.__setattr__(self, "ngs_frame_rate", ngs_frame_rate)
         object.__setattr__(self, "mastsel_ini", mastsel_ini + "\n")
         object.__setattr__(self, "non_psd_policy", non_psd_policy)
         object.__setattr__(self, "diagnostics_level", diagnostics_level)

@@ -78,23 +78,17 @@ def load_configuration(path: str | Path) -> HybridConfiguration:
     ngs_flux = _array(hybrid, "ngs_flux_photon_per_s", label="hybrid.ngs_flux_photon_per_s")
     if ngs_flux.shape != ngs_r.shape:
         raise ValueError("hybrid.ngs_flux_photon_per_s must match sources_LO coordinates.")
-    frame_rate = _scalar(
-        parser["RTC"], "SensorFrameRate_LO", label="RTC.SensorFrameRate_LO"
-    )
-    ngs_frame_rate = np.full(ngs_r.shape, frame_rate, dtype=float)
-
     request = HybridRequest(
         science_x=science_x * u.arcsec,
         science_y=science_y * u.arcsec,
         ngs_x=ngs_x * u.arcsec,
         ngs_y=ngs_y * u.arcsec,
+        ngs_flux=ngs_flux * (u.photon / u.s),
         wavelength=float(wavelength_values[0]) * u.m,
         zenith_angle=_scalar(
             parser["telescope"], "ZenithAngle", label="telescope.ZenithAngle"
         )
         * u.deg,
-        ngs_flux=ngs_flux * (u.photon / u.s),
-        ngs_frame_rate=ngs_frame_rate * u.Hz,
         mastsel_ini=_mastsel_ini(parser),
         non_psd_policy=hybrid.get("non_psd_policy", NonPsdPolicy.ERROR.value),
         diagnostics_level=hybrid.get(

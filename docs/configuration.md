@@ -41,11 +41,12 @@ request:
 | `sources_science.Wavelength` | One science wavelength in metres |
 | `sources_science.Zenith`, `Azimuth` | Science polar coordinates in arcseconds and degrees |
 | `sources_LO.Zenith`, `Azimuth` | Active-NGS polar coordinates in arcseconds and degrees |
-| `RTC.SensorFrameRate_LO` | Scalar frame rate broadcast across active NGSs |
 
 The two polar coordinate pairs are converted to Cartesian arcsecond vectors
 before `HybridRequest` is constructed. All other non-Hybrid sections and
 values remain MASTSEL-owned configuration and are retained for engine use.
+The engine reads the positive scalar `RTC.SensorFrameRate_LO` from the effective
+MASTSEL configuration and applies it to each active NGS.
 
 ## Example Shape
 

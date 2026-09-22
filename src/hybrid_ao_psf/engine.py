@@ -60,13 +60,14 @@ def simulate(
     if metrics.ee.size != request.ngs_x.size:
         raise ValueError("NGS provider output length does not match the request.")
 
-    effective_ini = _effective_mastsel_ini(request)
+    effective_ini, ngs_frame_rate = _resolve_effective_mastsel(request)
     ctot_raw, angle_to_wavefront_scale = _compute_mastsel_ctot(
         request,
         metrics.ee,
         metrics.fwhm,
         metrics.sr,
         effective_ini,
+        ngs_frame_rate,
     )
     ctot_wavefront, psd_clipped = condition_ctot(
         ctot_raw,
@@ -101,7 +102,7 @@ def simulate(
         ctot_angle=ctot_angle,
         angle_to_wavefront_scale=angle_to_wavefront_scale,
         ngs_flux=request.ngs_flux,
-        ngs_frame_rate=request.ngs_frame_rate,
+        ngs_frame_rate=ngs_frame_rate,
         jitter=_jitter_from_ctot(ctot_angle),
         effective_mastsel_ini=effective_ini,
         psd_clipped=psd_clipped,
@@ -173,6 +174,7 @@ def _compute_mastsel_ctot(
     fwhm: u.Quantity,
     sr: u.Quantity,
     effective_ini: str,
+    ngs_frame_rate: u.Quantity,
 ) -> tuple[u.Quantity, u.Quantity]:
     MavisLO = _load_mavis_lo()
     with tempfile.TemporaryDirectory(prefix="hybrid_ao_psf_") as temporary:
@@ -195,7 +197,7 @@ def _compute_mastsel_ctot(
                 science_coordinates,
                 ngs_coordinates,
                 request.ngs_flux.to_value(u.photon / u.s),
-                request.ngs_frame_rate.to_value(u.Hz),
+                ngs_frame_rate.to_value(u.Hz),
                 sr.to_value(u.dimensionless_unscaled),
                 ee.to_value(u.dimensionless_unscaled),
                 fwhm.to_value(u.mas),
@@ -219,13 +221,22 @@ def _compute_mastsel_ctot(
         return ctot, scale
 
 
-def _effective_mastsel_ini(request: HybridRequest) -> str:
+def _resolve_effective_mastsel(request: HybridRequest) -> tuple[str, u.Quantity]:
+    """Resolve the MASTSEL INI and its configured per-NGS frame rates."""
     parser = ConfigParser(interpolation=None)
     parser.optionxform = str
     parser.read_string(request.mastsel_ini)
     for section in ("telescope", "sources_LO"):
         if not parser.has_section(section):
             raise ValueError(f"MASTSEL configuration requires [{section}].")
+    if not parser.has_section("RTC") or "SensorFrameRate_LO" not in parser["RTC"]:
+        raise ValueError("MASTSEL configuration requires RTC.SensorFrameRate_LO.")
+    try:
+        frame_rate = float(parser["RTC"]["SensorFrameRate_LO"])
+    except ValueError as exc:
+        raise ValueError("RTC.SensorFrameRate_LO must be a positive finite scalar.") from exc
+    if not np.isfinite(frame_rate) or frame_rate <= 0.0:
+        raise ValueError("RTC.SensorFrameRate_LO must be a positive finite scalar.")
     if not parser.has_section("sources_science"):
         parser.add_section("sources_science")
     parser["telescope"]["ZenithAngle"] = _format_scalar(
@@ -255,7 +266,7 @@ def _effective_mastsel_ini(request: HybridRequest) -> str:
         )
     stream = StringIO()
     parser.write(stream)
-    return stream.getvalue()
+    return stream.getvalue(), np.full(request.ngs_x.size, frame_rate, dtype=float) * u.Hz
 
 
 def _cartesian_to_polar(

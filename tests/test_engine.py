@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 
 import numpy as np
 import pytest
@@ -40,17 +40,17 @@ def _request(
     *,
     policy: NonPsdPolicy = NonPsdPolicy.ERROR,
     diagnostics: DiagnosticsLevel = DiagnosticsLevel.DEBUG,
+    frame_rate: str = "500.0",
 ) -> HybridRequest:
     return HybridRequest(
         science_x=np.array([0.0, 1.0]) * u.arcsec,
         science_y=np.array([0.0, 0.0]) * u.arcsec,
         ngs_x=np.array([10.0, -5.0]) * u.arcsec,
         ngs_y=np.array([0.0, 5.0 * np.sqrt(3.0)]) * u.arcsec,
+        ngs_flux=np.array([1000.0, 2000.0]) * u.photon / u.s,
         wavelength=1.65 * u.um,
         zenith_angle=30.0 * u.deg,
-        ngs_flux=np.array([1000.0, 2000.0]) * u.photon / u.s,
-        ngs_frame_rate=np.array([500.0, 500.0]) * u.Hz,
-        mastsel_ini="""[telescope]
+        mastsel_ini=f"""[telescope]
 ZenithAngle = 0.0
 
 [sources_science]
@@ -65,6 +65,9 @@ Azimuth = [0.0]
 
 [sensor_LO]
 NumberLenslets = [1]
+
+[RTC]
+SensorFrameRate_LO = {frame_rate}
 """,
         non_psd_policy=policy,
         diagnostics_level=diagnostics,
@@ -124,6 +127,7 @@ def test_simulate_builds_owned_result_and_passes_resolved_mastsel_inputs(
     np.testing.assert_allclose(args[1], [[10.0, 0.0], [-5.0, 5.0 * np.sqrt(3.0)]])
     np.testing.assert_allclose(args[2], [1000.0, 2000.0])
     np.testing.assert_allclose(args[3], [500.0, 500.0])
+    np.testing.assert_allclose(result.ngs_frame_rate.to_value(u.Hz), [500.0, 500.0])
     assert calls["kwargs"] == {"aNGS_FWHM_DL_mas": None, "doAll": True}
     assert result.psfs.dtype == np.float32
     assert result.psfs.shape == (2, 9, 9)
@@ -154,6 +158,46 @@ def test_simulate_builds_owned_result_and_passes_resolved_mastsel_inputs(
     assert not np.any(result.psd_clipped)
     assert "zenithangle = 30" in result.effective_mastsel_ini.lower()
     assert "zenith = [0, 1]" in result.effective_mastsel_ini.lower()
+
+
+def test_simulate_uses_frame_rate_from_ini(monkeypatch: pytest.MonkeyPatch) -> None:
+    calls: dict[str, np.ndarray] = {}
+
+    class FakeMavisLO:
+        error = False
+        mas2nm = 2.0
+
+        def __init__(self, *_: object, **__: object) -> None:
+            pass
+
+        def computeTotalResidualMatrix(self, *args: object, **__: object) -> np.ndarray:
+            calls["frame_rate"] = np.asarray(args[3], dtype=float)
+            return np.stack([400.0 * np.eye(2), 800.0 * np.eye(2)])
+
+    monkeypatch.setattr(engine, "_load_mavis_lo", lambda: FakeMavisLO)
+    science, ngs = _providers()
+    result = engine.simulate(_request(frame_rate="250.0"), science, ngs)
+
+    np.testing.assert_allclose(calls["frame_rate"], [250.0, 250.0])
+    np.testing.assert_allclose(result.ngs_frame_rate.to_value(u.Hz), [250.0, 250.0])
+
+
+@pytest.mark.parametrize("frame_rate", ["0", "-1", "nan", "invalid"])
+def test_simulate_rejects_invalid_ini_frame_rate(frame_rate: str) -> None:
+    science, ngs = _providers()
+    with pytest.raises(ValueError, match="RTC.SensorFrameRate_LO"):
+        engine.simulate(_request(frame_rate=frame_rate), science, ngs)
+
+
+def test_simulate_requires_ini_frame_rate() -> None:
+    request = _request()
+    request = replace(
+        request,
+        mastsel_ini=request.mastsel_ini.replace("SensorFrameRate_LO = 500.0\n", ""),
+    )
+    science, ngs = _providers()
+    with pytest.raises(ValueError, match="RTC.SensorFrameRate_LO"):
+        engine.simulate(request, science, ngs)
 
 
 def test_validation_diagnostics_omit_pre_blur_psfs(

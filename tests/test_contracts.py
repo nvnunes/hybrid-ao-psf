@@ -1,4 +1,4 @@
-from dataclasses import FrozenInstanceError, replace
+from dataclasses import FrozenInstanceError, fields, replace
 
 import numpy as np
 import pytest
@@ -71,10 +71,9 @@ def test_request_normalizes_units_and_owns_readonly_arrays() -> None:
         science_y=np.array([0.0, -1.0]) * u.arcsec,
         ngs_x=np.array([10.0]) * u.arcsec,
         ngs_y=np.array([20.0]) * u.arcsec,
+        ngs_flux=np.array([1000.0]) * u.photon / u.s,
         wavelength=1.65 * u.um,
         zenith_angle=30.0 * u.deg,
-        ngs_flux=np.array([1000.0]) * u.photon / u.s,
-        ngs_frame_rate=np.array([500.0]) * u.Hz,
         mastsel_ini="[telescope]\nZenithAngle = 30\n",
         non_psd_policy="clip",
         diagnostics_level="none",
@@ -91,6 +90,16 @@ def test_request_normalizes_units_and_owns_readonly_arrays() -> None:
         request.wavelength = 2.2 * u.um
 
 
+def test_request_groups_ngs_flux_with_ngs_coordinates() -> None:
+    assert [item.name for item in fields(HybridRequest)[:5]] == [
+        "science_x",
+        "science_y",
+        "ngs_x",
+        "ngs_y",
+        "ngs_flux",
+    ]
+
+
 def test_request_rejects_mismatched_ngs_vectors() -> None:
     with pytest.raises(ValueError, match="identical shapes"):
         HybridRequest(
@@ -98,10 +107,9 @@ def test_request_rejects_mismatched_ngs_vectors() -> None:
             science_y=np.array([0.0]) * u.arcsec,
             ngs_x=np.array([1.0, 2.0]) * u.arcsec,
             ngs_y=np.array([1.0]) * u.arcsec,
+            ngs_flux=np.array([1000.0]) * u.photon / u.s,
             wavelength=1.65 * u.um,
             zenith_angle=30.0 * u.deg,
-            ngs_flux=np.array([1000.0]) * u.photon / u.s,
-            ngs_frame_rate=np.array([500.0]) * u.Hz,
             mastsel_ini="[telescope]\nZenithAngle = 30\n",
         )
 
@@ -200,10 +208,9 @@ def test_request_accepts_validation_diagnostics_level() -> None:
         science_y=np.array([0.0]) * u.arcsec,
         ngs_x=np.array([1.0]) * u.arcsec,
         ngs_y=np.array([1.0]) * u.arcsec,
+        ngs_flux=np.array([1000.0]) * u.photon / u.s,
         wavelength=1.65 * u.um,
         zenith_angle=30.0 * u.deg,
-        ngs_flux=np.array([1000.0]) * u.photon / u.s,
-        ngs_frame_rate=np.array([500.0]) * u.Hz,
         mastsel_ini="[telescope]\nZenithAngle = 30\n",
         diagnostics_level="validation",
     )
