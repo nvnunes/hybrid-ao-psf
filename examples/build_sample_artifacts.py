@@ -41,7 +41,7 @@ def main() -> None:
                 provenance=("Hybrid AO PSF standalone sample",),
             )
         ),
-        PRODUCTS / "science.h5",
+        PRODUCTS / "science.pkl",
         overwrite=True,
     )
     save_ngs_ho_metric_interpolator(

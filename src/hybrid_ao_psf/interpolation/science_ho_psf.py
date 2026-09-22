@@ -3,12 +3,12 @@
 from __future__ import annotations
 
 from collections.abc import Mapping
+from copy import copy
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
 
-import h5py
 import numpy as np
 from ao_stats import (
     EE_GEOMETRY_ENCIRCLED,
@@ -19,7 +19,6 @@ from ao_stats import (
 from astropy import units as u
 from scipy.interpolate import RegularGridInterpolator
 
-from .._io import atomic_output_path
 from .._units import quantity_value, require_quantity
 from .._validation import validate_meta_field_name
 from ..contracts import ScienceHoPsfPrediction
@@ -29,19 +28,22 @@ from ._core import (
     freeze_artifact_value,
     grid_field_values,
     interpolation_axis_weights,
+    load_payload,
     rectangular_field_axes,
     require_finite_vector,
     require_positive_scalar,
     require_positive_vector,
     require_pupil,
+    save_payload,
     snap_rectangular_field_query,
     unique_sorted,
+    validate_payload_kind,
     validate_rectangular_field_query,
     zenith_angle_to_airmass,
 )
 
 SCIENCE_HO_PSF_ARTIFACT_KIND = "hybrid_ao_psf_science_ho_psf_interpolator"
-SCIENCE_HO_PSF_ARTIFACT_VERSION = 1
+SCIENCE_HO_PSF_ARTIFACT_VERSION = 2
 SCIENCE_HO_PSF_FIELD_QUERY_ATOL = 1.0e-6 * u.arcsec
 SCIENCE_COORD_AIRMASS = "airmass"
 SCIENCE_COORD_WAVELENGTH = "wavelength"
@@ -117,9 +119,8 @@ class ScienceHoPsfInterpolator:
 
     ``coordinate_order`` records the active interpolation coordinates. Fixed
     wavelength and fixed zenith values remain in their metadata axes but are not
-    included in ``coordinate_order``. The loaded provider prepares its
-    process-local SciPy interpolator on first evaluation and reuses it for
-    subsequent queries; that runtime state is not part of the artifact.
+    included in ``coordinate_order``. The persisted provider contains a
+    prepared SciPy interpolator and is ready to evaluate after loading.
     """
 
     coordinate_order: tuple[str, ...]
@@ -455,26 +456,17 @@ def save_science_ho_psf_interpolator(
     *,
     overwrite: bool = False,
 ) -> None:
-    """Save a science-HO-PSF interpolation artifact as explicit HDF5 state."""
-    if not isinstance(interpolator, ScienceHoPsfInterpolator):
-        raise TypeError("interpolator must be a ScienceHoPsfInterpolator instance.")
-    _validate_interpolator(interpolator)
-    path = Path(path)
-    if path.exists() and not overwrite:
-        raise FileExistsError(f"Refusing to overwrite existing artifact: {path}")
-    path.parent.mkdir(parents=True, exist_ok=True)
-    with atomic_output_path(path) as temporary_path:
-        _write_science_artifact(interpolator, temporary_path)
+    """Save a ready-to-evaluate science-HO-PSF pickle artifact."""
+    save_payload(_science_to_payload(interpolator), Path(path), overwrite=overwrite)
 
 
 def load_science_ho_psf_interpolator(path: Path) -> ScienceHoPsfInterpolator:
-    """Load and validate a project-owned science-HO-PSF HDF5 artifact."""
-    path = Path(path)
-    if not path.is_file():
-        raise FileNotFoundError(f"Science-HO-PSF interpolation artifact not found: {path}")
-    interpolator = _read_science_artifact(path)
-    _validate_interpolator(interpolator)
-    return interpolator
+    """Load and validate a trusted, ready-to-evaluate science-HO-PSF pickle.
+
+    Pickle reconstruction can execute Python code. Load only artifacts from a
+    trusted source.
+    """
+    return _science_from_payload(load_payload(Path(path)))
 
 
 # Sample preparation and grid construction
@@ -940,106 +932,94 @@ def _interpolation_method(coordinate_order: tuple[str, ...]) -> str:
     return "regular_grid_linear_" + "_".join(label_by_coordinate[name] for name in coordinate_order)
 
 
-def _write_science_artifact(
-    interpolator: ScienceHoPsfInterpolator, path: Path
+def _science_to_payload(interpolator: ScienceHoPsfInterpolator) -> dict[str, Any]:
+    if not isinstance(interpolator, ScienceHoPsfInterpolator):
+        raise TypeError("interpolator must be a ScienceHoPsfInterpolator instance.")
+    _validate_interpolator(interpolator)
+    prepared = copy(interpolator._prepared_runtime().psf_interpolator)
+    # SciPy has moved this helper between private modules; NumPy input is the
+    # supported query contract and keeps the pickle usable across that move.
+    prepared._asarray = np.asarray
+    return {
+        "kind": SCIENCE_HO_PSF_ARTIFACT_KIND,
+        "version": SCIENCE_HO_PSF_ARTIFACT_VERSION,
+        "builder": dict(interpolator.builder),
+        "interpolation": {
+            "method": _interpolation_method(interpolator.coordinate_order),
+            "coordinate_order": tuple(interpolator.coordinate_order),
+        },
+        "metadata": {
+            "zenith_angle_axis": interpolator.zenith_angle_axis,
+            "airmass_axis": interpolator.airmass_axis,
+            "wavelength_axis": interpolator.wavelength_axis,
+            "x": interpolator.x,
+            "y": interpolator.y,
+            "psf_shape": tuple(interpolator.psf_shape),
+            "pixel_scale_grid": interpolator.pixel_scale_grid,
+            "tel_diameter": interpolator.tel_diameter,
+            "tel_pupil": interpolator.tel_pupil,
+            "meta": dict(interpolator.meta),
+            "provenance": tuple(interpolator.provenance),
+        },
+        "model": {"prepared_psf_interpolator": prepared},
+    }
+
+
+def _science_from_payload(payload: Mapping[str, Any]) -> ScienceHoPsfInterpolator:
+    validate_payload_kind(
+        payload,
+        kind=SCIENCE_HO_PSF_ARTIFACT_KIND,
+        version=SCIENCE_HO_PSF_ARTIFACT_VERSION,
+    )
+    interpolation = dict(payload.get("interpolation", {}))
+    coordinate_order = tuple(str(value) for value in interpolation.get("coordinate_order", ()))
+    _validate_coordinate_order(coordinate_order)
+    if interpolation.get("method") != _interpolation_method(coordinate_order):
+        raise ValueError("Unsupported science-HO-PSF interpolation method.")
+    model = dict(payload.get("model", {}))
+    prepared = model.get("prepared_psf_interpolator")
+    if not isinstance(prepared, RegularGridInterpolator):
+        raise TypeError("Science-HO-PSF artifact requires a prepared RegularGridInterpolator.")
+    psf_grid = np.asarray(prepared.values)
+    if psf_grid.dtype != np.float32:
+        raise ValueError("Science-HO-PSF prepared interpolator values must be float32.")
+    metadata = dict(payload.get("metadata", {}))
+    interpolator = ScienceHoPsfInterpolator(
+        coordinate_order=coordinate_order,
+        zenith_angle_axis=require_quantity(metadata.get("zenith_angle_axis"), u.deg, label="metadata.zenith_angle_axis"),
+        airmass_axis=require_quantity(metadata.get("airmass_axis"), u.one, label="metadata.airmass_axis"),
+        wavelength_axis=require_quantity(metadata.get("wavelength_axis"), u.um, label="metadata.wavelength_axis"),
+        x=require_quantity(metadata.get("x"), u.arcsec, label="metadata.x"),
+        y=require_quantity(metadata.get("y"), u.arcsec, label="metadata.y"),
+        psf_shape=tuple(int(value) for value in metadata.get("psf_shape", ())),
+        pixel_scale_grid=require_quantity(metadata.get("pixel_scale_grid"), u.mas, label="metadata.pixel_scale_grid"),
+        tel_diameter=require_quantity(metadata.get("tel_diameter"), u.m, label="metadata.tel_diameter"),
+        tel_pupil=require_quantity(metadata.get("tel_pupil"), u.one, label="metadata.tel_pupil"),
+        meta=dict(metadata.get("meta", {})),
+        psf_grid=psf_grid,
+        provenance=tuple(str(value) for value in metadata.get("provenance", ())),
+        builder=dict(payload.get("builder", {})),
+    )
+    _validate_interpolator(interpolator)
+    _validate_prepared_interpolator(interpolator, prepared)
+    psf_grid.flags.writeable = False
+    object.__setattr__(interpolator, "psf_grid", psf_grid)
+    object.__setattr__(interpolator, "_prepared_psf_interpolator", prepared)
+    return interpolator
+
+
+def _validate_prepared_interpolator(
+    interpolator: ScienceHoPsfInterpolator,
+    prepared: RegularGridInterpolator,
 ) -> None:
-    string_dtype = h5py.string_dtype(encoding="utf-8")
-    with h5py.File(path, "w") as root:
-        root.attrs["kind"] = SCIENCE_HO_PSF_ARTIFACT_KIND
-        root.attrs["version"] = SCIENCE_HO_PSF_ARTIFACT_VERSION
-        interpolation = root.create_group("interpolation")
-        interpolation.attrs["method"] = _interpolation_method(
-            interpolator.coordinate_order
-        )
-        interpolation.create_dataset(
-            "coordinate_order",
-            data=np.asarray(interpolator.coordinate_order, dtype=object),
-            dtype=string_dtype,
-        )
-        metadata = root.create_group("metadata")
-        _write_quantity(metadata, "zenith_angle_axis", interpolator.zenith_angle_axis)
-        _write_quantity(metadata, "airmass_axis", interpolator.airmass_axis)
-        _write_quantity(metadata, "wavelength_axis", interpolator.wavelength_axis)
-        _write_quantity(metadata, "x", interpolator.x)
-        _write_quantity(metadata, "y", interpolator.y)
-        metadata.create_dataset("psf_shape", data=interpolator.psf_shape, dtype=np.int64)
-        _write_quantity(metadata, "pixel_scale_grid", interpolator.pixel_scale_grid)
-        _write_quantity(metadata, "tel_diameter", interpolator.tel_diameter)
-        _write_quantity(metadata, "tel_pupil", interpolator.tel_pupil)
-        meta = metadata.create_group("meta")
-        for name, value in interpolator.meta.items():
-            _write_quantity(meta, name, value)
-        metadata.create_dataset(
-            "provenance",
-            data=np.asarray(interpolator.provenance, dtype=object),
-            dtype=string_dtype,
-        )
-        builder = root.create_group("builder")
-        for name, value in interpolator.builder.items():
-            builder.attrs[str(name)] = str(value)
-        root.create_dataset(
-            "model/psf_grid",
-            data=np.asarray(interpolator.psf_grid, dtype=np.float32),
-            dtype=np.float32,
-        )
-
-
-def _read_science_artifact(path: Path) -> ScienceHoPsfInterpolator:
-    with h5py.File(path, "r") as root:
-        kind = _hdf5_text(root.attrs.get("kind", ""))
-        version = int(root.attrs.get("version", -1))
-        if kind != SCIENCE_HO_PSF_ARTIFACT_KIND:
-            raise ValueError(f"Unsupported artifact kind: {kind!r}.")
-        if version != SCIENCE_HO_PSF_ARTIFACT_VERSION:
-            raise ValueError(f"Unsupported artifact version: {version!r}.")
-        metadata = root["metadata"]
-        meta_group = metadata.get("meta")
-        meta = (
-            {}
-            if meta_group is None
-            else {str(name): _read_quantity(value) for name, value in meta_group.items()}
-        )
-        coordinate_order = tuple(
-            _hdf5_text(value)
-            for value in root["interpolation/coordinate_order"][...]
-        )
-        _validate_coordinate_order(coordinate_order)
-        return ScienceHoPsfInterpolator(
-            coordinate_order=coordinate_order,
-            zenith_angle_axis=_read_quantity(metadata["zenith_angle_axis"]),
-            airmass_axis=_read_quantity(metadata["airmass_axis"]),
-            wavelength_axis=_read_quantity(metadata["wavelength_axis"]),
-            x=_read_quantity(metadata["x"]),
-            y=_read_quantity(metadata["y"]),
-            psf_shape=tuple(int(value) for value in metadata["psf_shape"][...]),
-            pixel_scale_grid=_read_quantity(metadata["pixel_scale_grid"]),
-            tel_diameter=_read_quantity(metadata["tel_diameter"]),
-            tel_pupil=_read_quantity(metadata["tel_pupil"]),
-            meta=meta,
-            psf_grid=np.asarray(root["model/psf_grid"][...], dtype=np.float32),
-            provenance=tuple(
-                _hdf5_text(value) for value in metadata["provenance"][...]
-            ),
-            builder={
-                str(name): _hdf5_text(value)
-                for name, value in root["builder"].attrs.items()
-            },
-        )
-
-
-def _write_quantity(group: h5py.Group, name: str, value: u.Quantity) -> None:
-    dataset = group.create_dataset(name, data=np.asarray(value.value))
-    dataset.attrs["unit"] = value.unit.to_string()
-
-
-def _read_quantity(dataset: h5py.Dataset) -> u.Quantity:
-    return np.asarray(dataset[()]) * u.Unit(_hdf5_text(dataset.attrs["unit"]))
-
-
-def _hdf5_text(value: object) -> str:
-    if isinstance(value, bytes):
-        return value.decode("utf-8")
-    return str(value)
+    if prepared.method != "linear" or prepared.bounds_error is not True:
+        raise ValueError("Science-HO-PSF prepared interpolator must use bounded linear interpolation.")
+    axes = _interpolation_axes(interpolator)
+    if len(prepared.grid) != len(axes) or any(
+        not np.array_equal(stored, expected)
+        for stored, expected in zip(prepared.grid, axes, strict=True)
+    ):
+        raise ValueError("Science-HO-PSF prepared interpolator axes do not match artifact metadata.")
 
 
 def _validate_interpolator(interpolator: ScienceHoPsfInterpolator) -> None:

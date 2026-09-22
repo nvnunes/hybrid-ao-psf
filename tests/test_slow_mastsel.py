@@ -38,7 +38,7 @@ def test_real_mastsel_engine_matches_retained_hybrid_golden(tmp_path: Path) -> N
     pytest.importorskip("mastsel")
     products = tmp_path / "products"
     products.mkdir()
-    science_path = products / "science.h5"
+    science_path = products / "science.pkl"
     ngs_path = products / "ngs.pkl"
     save_science_ho_psf_interpolator(
         build_science_ho_psf_interpolator(

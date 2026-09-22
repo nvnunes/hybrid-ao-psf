@@ -46,7 +46,7 @@ def make_result(*, diagnostics: bool = True) -> HybridResult:
         jitter=np.full(2, np.sqrt(1.75)) * u.mas,
         effective_mastsel_ini="[telescope]\nZenithAngle = 30\n",
         psd_clipped=np.array([False, True]),
-        provenance={"science_psf_artifact": "science.h5"},
+        provenance={"science_psf_artifact": "science.pkl"},
         diagnostics=(
             HybridDiagnostics(
                 psd_valid_mask=np.array([True, True]),

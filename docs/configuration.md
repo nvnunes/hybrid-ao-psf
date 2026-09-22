@@ -67,7 +67,7 @@ Azimuth = [0.0, 120.0, 240.0]
 SensorFrameRate_LO = 500.0
 
 [hybrid]
-science_psf_artifact = products/science.h5
+science_psf_artifact = products/science.pkl
 ngs_metric_artifact = products/ngs.pkl
 output = results/hybrid.h5
 ngs_flux_photon_per_s = [1200.0, 950.0, 1100.0]

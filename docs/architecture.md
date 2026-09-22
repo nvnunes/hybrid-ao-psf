@@ -74,15 +74,15 @@ identities and explicit versions. Loaders accept only the current supported
 Hybrid AO PSF contracts. Conversion from other artifact formats occurs outside
 the canonical loaders.
 
-Science-HO-PSF fitted state is explicit numeric grid data and uses the
-project-owned HDF5 artifact identity
-`hybrid_ao_psf_science_ho_psf_interpolator`, version 1. NGS-HO-metric state may
-contain ready-to-evaluate SciPy RBF objects and therefore uses a versioned
-pickle with identity `hybrid_ao_psf_ngs_ho_metric_interpolator`, version 1.
-Its owned classes resolve only through stable public `hybrid_ao_psf` module
-paths; persisted interpolation configuration types live in
-`hybrid_ao_psf.interpolation.config`. NGS pickle input is trusted data, while
-all artifact writers protect existing destinations with atomic replacement.
+Science-HO-PSF fitted state uses a version-2 pickle with identity
+`hybrid_ao_psf_science_ho_psf_interpolator` and a prepared SciPy regular-grid
+interpolator. NGS-HO-metric state may contain ready-to-evaluate SciPy RBF
+objects and uses a version-1 pickle with identity
+`hybrid_ao_psf_ngs_ho_metric_interpolator`. Pickle-owned classes resolve only
+through stable `hybrid_ao_psf` module paths; persisted interpolation
+configuration types live in `hybrid_ao_psf.interpolation.config`. Both pickle
+inputs must be trusted, while all artifact writers protect existing
+destinations with atomic replacement.
 New artifacts respect the process umask, and replacements preserve the
 destination's existing mode.
 

@@ -13,7 +13,7 @@ def _write_config(
     flux: str = "[1000, 2000]",
     hybrid_extra: str = "",
 ) -> None:
-    (path.parent / "science.h5").touch()
+    (path.parent / "science.pkl").touch()
     (path.parent / "ngs.pkl").touch()
     path.write_text(
         f"""[telescope]
@@ -34,7 +34,7 @@ Azimuth = [0.0, 180.0]
 SensorFrameRate_LO = 500.0
 
 [hybrid]
-science_psf_artifact = science.h5
+science_psf_artifact = science.pkl
 ngs_metric_artifact = ngs.pkl
 output = results/result.h5
 ngs_flux_photon_per_s = {flux}
@@ -54,7 +54,7 @@ def test_load_configuration_resolves_paths_and_cartesian_coordinates(tmp_path: P
     configuration = load_configuration(path)
 
     assert configuration.source == path.resolve()
-    assert configuration.science_psf_artifact == (path.parent / "science.h5").resolve()
+    assert configuration.science_psf_artifact == (path.parent / "science.pkl").resolve()
     assert configuration.ngs_metric_artifact == (path.parent / "ngs.pkl").resolve()
     assert configuration.output == (path.parent / "results/result.h5").resolve()
     np.testing.assert_allclose(

@@ -1,8 +1,8 @@
 from __future__ import annotations
 
+import pickle
 from pathlib import Path
 
-import h5py
 import numpy as np
 import pytest
 from astropy import units as u
@@ -90,24 +90,24 @@ def test_failed_ngs_artifact_overwrite_preserves_existing_file(
 def test_failed_science_artifact_overwrite_preserves_existing_file(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    path = tmp_path / "science.h5"
+    path = tmp_path / "science.pkl"
     path.write_bytes(b"existing artifact")
     interpolator = build_science_ho_psf_interpolator(_science_samples())
 
-    def fail_write(*_: object) -> None:
+    def fail_write(*_: object, **__: object) -> None:
         raise RuntimeError("write failed")
 
-    monkeypatch.setattr(science_ho_psf, "_write_science_artifact", fail_write)
+    monkeypatch.setattr(_core.pickle, "dump", fail_write)
     with pytest.raises(RuntimeError, match="write failed"):
         save_science_ho_psf_interpolator(interpolator, path, overwrite=True)
 
     assert path.read_bytes() == b"existing artifact"
-    assert list(tmp_path.glob(".science.h5.*.tmp")) == []
+    assert list(tmp_path.glob(".science.pkl.*.tmp")) == []
 
 
 def test_science_ho_psf_interpolator_round_trips_and_replays_sources(tmp_path) -> None:
     interpolator = build_science_ho_psf_interpolator(_science_samples())
-    path = tmp_path / "science.h5"
+    path = tmp_path / "science.pkl"
 
     save_science_ho_psf_interpolator(interpolator, path)
     loaded = load_science_ho_psf_interpolator(path)
@@ -138,11 +138,33 @@ def test_science_ho_psf_interpolator_round_trips_and_replays_sources(tmp_path) -
     assert replay.metric_max_abs["ee"].to_value(u.one) == pytest.approx(0.0, abs=1.0e-5)
 
 
-def test_science_provider_prepares_runtime_once_for_repeated_queries(
+def test_science_ho_psf_pickle_rejects_old_artifact_version(tmp_path: Path) -> None:
+    path = tmp_path / "science.pkl"
+    save_science_ho_psf_interpolator(build_science_ho_psf_interpolator(_science_samples()), path)
+    with path.open("rb") as handle:
+        payload = pickle.load(handle)
+    payload["version"] = 1
+    with path.open("wb") as handle:
+        pickle.dump(payload, handle)
+
+    with pytest.raises(ValueError, match="Unsupported artifact version"):
+        load_science_ho_psf_interpolator(path)
+
+
+def test_science_pickle_does_not_reference_scipy_private_array_adapter(tmp_path: Path) -> None:
+    path = tmp_path / "science.pkl"
+    save_science_ho_psf_interpolator(build_science_ho_psf_interpolator(_science_samples()), path)
+    with path.open("rb") as handle:
+        payload = pickle.load(handle)
+
+    assert payload["model"]["prepared_psf_interpolator"]._asarray is np.asarray
+
+
+def test_loaded_science_provider_reuses_persisted_runtime_for_repeated_queries(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    path = tmp_path / "science.h5"
+    path = tmp_path / "science.pkl"
     save_science_ho_psf_interpolator(build_science_ho_psf_interpolator(_science_samples()), path)
     interpolator = load_science_ho_psf_interpolator(path)
     prepare = science_ho_psf._prepare_science_ho_psf_runtime_interpolator
@@ -168,7 +190,7 @@ def test_science_provider_prepares_runtime_once_for_repeated_queries(
     second = interpolator.predict(**query)
     via_function = evaluate_science_ho_psf_interpolator(interpolator, **query)
 
-    assert calls == 1
+    assert calls == 0
     np.testing.assert_array_equal(first.psfs, reference.psfs)
     np.testing.assert_array_equal(first.psfs, second.psfs)
     np.testing.assert_array_equal(first.psfs, via_function.psfs)
@@ -261,7 +283,7 @@ def test_science_ho_psf_field_only_artifact_omits_physical_queries(tmp_path) -> 
     )
 
     interpolator = build_science_ho_psf_interpolator(samples)
-    path = tmp_path / "science-field.h5"
+    path = tmp_path / "science-field.pkl"
     save_science_ho_psf_interpolator(interpolator, path)
     loaded = load_science_ho_psf_interpolator(path)
     replay = replay_science_ho_psf_interpolator(loaded, samples)
@@ -470,10 +492,13 @@ def test_science_ho_psf_interpolator_rejects_malformed_grids() -> None:
 
 def test_science_ho_psf_interpolator_defaults_missing_payload_meta(tmp_path) -> None:
     interpolator = build_science_ho_psf_interpolator(_science_samples())
-    path = tmp_path / "missing-meta.h5"
+    path = tmp_path / "missing-meta.pkl"
     save_science_ho_psf_interpolator(interpolator, path)
-    with h5py.File(path, "r+") as root:
-        del root["metadata/meta"]
+    with path.open("rb") as handle:
+        payload = pickle.load(handle)
+    del payload["metadata"]["meta"]
+    with path.open("wb") as handle:
+        pickle.dump(payload, handle)
 
     loaded = load_science_ho_psf_interpolator(path)
     prediction = evaluate_science_ho_psf_interpolator(

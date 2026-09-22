@@ -13,10 +13,10 @@ project-owned persisted identities.
 engine-facing operation.
 
 Science fitted state consists of explicit axes, grids, quantities, source
-metadata, and provenance. `save_science_ho_psf_interpolator()` therefore writes
-HDF5 with identity `hybrid_ao_psf_science_ho_psf_interpolator` and schema
-version 1. `load_science_ho_psf_interpolator()` accepts only that current
-project-owned contract and returns ready-to-evaluate read-only state.
+metadata, provenance, and a prepared SciPy regular-grid interpolator.
+`save_science_ho_psf_interpolator()` writes a version-2 pickle with identity
+`hybrid_ao_psf_science_ho_psf_interpolator`. Loading returns ready-to-evaluate
+read-only state without preparing the interpolator again.
 
 ## NGS High-Order Metrics
 
@@ -29,14 +29,13 @@ strategies are selected with `RegularGridInterpolationConfig` and
 `build_ngs_ho_metric_interpolator()` produces an immutable
 `NgsHoMetricInterpolator`; evaluation returns `NgsHoMetricPrediction`. A fitted
 RBF product contains ready-to-evaluate SciPy state that has no simpler portable
-array representation. NGS artifacts therefore remain versioned pickles, now
-owned by `hybrid_ao_psf_ngs_ho_metric_interpolator`, version 1. Any project
-types in the pickle live at stable `hybrid_ao_psf` module paths. Because pickle
-reconstruction can execute Python code, NGS artifacts must come from a trusted
-source. Interpolation strategy configuration types persist through the public
-`hybrid_ao_psf.interpolation.config` module rather than a private implementation
-module. Fitted SciPy RBF state remains ready to evaluate but is held behind an
-immutable wrapper instead of being exposed for caller mutation.
+array representation. NGS artifacts use version-1 pickles with identity
+`hybrid_ao_psf_ngs_ho_metric_interpolator`. Project-owned types in the pickle
+use stable `hybrid_ao_psf` module paths. Because pickle reconstruction can
+execute Python code, both interpolator families must come from trusted sources.
+Interpolation strategy configuration types persist through the public
+`hybrid_ao_psf.interpolation.config` module. An immutable wrapper protects the
+ready-to-evaluate SciPy RBF state from caller mutation.
 
 ## Validation And Replay
 
