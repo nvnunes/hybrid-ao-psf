@@ -644,7 +644,9 @@ def _validate_and_prepare_query_physical_values(
 
 def _validate_fixed_value(value: float, fixed: float, *, label: str) -> None:
     if not np.isclose(float(value), float(fixed), rtol=0.0, atol=_AXIS_ATOL):
-        raise ValueError(f"{label}={value} does not match fixed artifact value {fixed}.")
+        raise ValueError(
+            f"{label}={value} does not match this interpolator's fixed {label}={fixed}."
+        )
 
 
 def _query_points(

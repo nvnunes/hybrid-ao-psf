@@ -737,14 +737,15 @@ def _query_values(interpolator: NgsHoMetricInterpolator, zenith_angle: Any, x: A
                 f"got {zenith.size}, {x.size}, {y.size}."
             )
         airmass = zenith_angle_to_airmass(zenith * u.deg).to_value(u.dimensionless_unscaled)
-        _validate_airmass_support(interpolator, airmass)
+        _validate_airmass_support(interpolator, airmass, zenith)
         query[NGS_COORD_AIRMASS] = airmass
     elif zenith_angle is not None and interpolator.zenith_angle_axis.size == 1:
         zenith = require_finite_vector(quantity_value(zenith_angle, u.deg, label="zenith_angle"), label="zenith_angle")
         fixed_zenith = float(interpolator.zenith_angle_axis[0].to_value(u.deg))
         if not np.all(np.isclose(zenith, fixed_zenith, rtol=0.0, atol=_FIELD_ATOL)):
             raise ValueError(
-                f"zenith_angle query does not match fixed artifact value {fixed_zenith}."
+                "zenith_angle query does not match this interpolator's "
+                f"fixed zenith_angle={fixed_zenith}."
             )
     return query
 
@@ -795,14 +796,23 @@ def _regular_grid_axes(interpolator: NgsHoMetricInterpolator) -> tuple[np.ndarra
     return tuple(axes)
 
 
-def _validate_airmass_support(interpolator: NgsHoMetricInterpolator, airmass: np.ndarray) -> None:
+def _validate_airmass_support(
+    interpolator: NgsHoMetricInterpolator, airmass: np.ndarray, zenith_angle: np.ndarray
+) -> None:
     axis = interpolator.airmass_axis.to_value(u.dimensionless_unscaled).reshape(-1)
     minimum = float(np.min(axis))
     maximum = float(np.max(axis))
-    if np.any((airmass < minimum) & ~np.isclose(airmass, minimum, rtol=0.0, atol=_FIELD_ATOL)):
-        raise ValueError(f"airmass query is below the supported range minimum {minimum}.")
-    if np.any((airmass > maximum) & ~np.isclose(airmass, maximum, rtol=0.0, atol=_FIELD_ATOL)):
-        raise ValueError(f"airmass query is above the supported range maximum {maximum}.")
+    outside = (
+        ((airmass < minimum) & ~np.isclose(airmass, minimum, rtol=0.0, atol=_FIELD_ATOL))
+        | ((airmass > maximum) & ~np.isclose(airmass, maximum, rtol=0.0, atol=_FIELD_ATOL))
+    )
+    if np.any(outside):
+        requested = float(zenith_angle[np.flatnonzero(outside)[0]])
+        supported = interpolator.zenith_angle_axis.to_value(u.deg)
+        raise ValueError(
+            f"zenith_angle={requested} deg is outside this interpolator's "
+            f"supported zenith_angle range [{supported[0]}, {supported[-1]}] deg."
+        )
 
 
 def _validate_regular_grid_field_support(interpolator: NgsHoMetricInterpolator, x: np.ndarray, y: np.ndarray) -> None:

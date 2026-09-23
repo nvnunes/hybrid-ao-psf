@@ -413,6 +413,44 @@ def test_science_ho_psf_query_validation_rejects_out_of_range_before_runtime() -
         )
 
 
+@pytest.mark.parametrize(
+    ("zenith_angle", "wavelength", "message"),
+    [
+        (
+            20.0 * u.deg,
+            1.1 * u.um,
+            "wavelength=1.1 does not match this interpolator's fixed wavelength=1.0",
+        ),
+        (
+            21.0 * u.deg,
+            1.0 * u.um,
+            "zenith_angle=21.0 does not match this interpolator's fixed zenith_angle=20.0",
+        ),
+    ],
+)
+def test_science_ho_psf_fixed_coordinate_errors(
+    zenith_angle: u.Quantity, wavelength: u.Quantity, message: str
+) -> None:
+    samples = _science_samples()
+    interpolator = build_science_ho_psf_interpolator(
+        ScienceHoPsfSamples(
+            zenith_angle=20.0 * u.deg,
+            wavelength=1.0 * u.um,
+            x=samples.x,
+            y=samples.y,
+            psfs=samples.psfs[0],
+            pixel_scale=samples.pixel_scale[0],
+            tel_diameter=samples.tel_diameter,
+            tel_pupil=samples.tel_pupil,
+        )
+    )
+
+    with pytest.raises(ValueError, match=message):
+        validate_science_ho_psf_query(
+            interpolator, zenith_angle=zenith_angle, wavelength=wavelength
+        )
+
+
 def test_science_ho_psf_interpolator_rejects_malformed_grids() -> None:
     samples = _science_samples()
 
@@ -632,7 +670,7 @@ def test_ngs_ho_metric_field_only_regular_grid_and_rbf_omit_zenith() -> None:
     )
     np.testing.assert_allclose(regular_prediction.ee, np.asarray([0.26]) * u.one)
     np.testing.assert_allclose(rbf_prediction.ee, np.asarray([0.20]) * u.one, atol=1.0e-8)
-    with pytest.raises(ValueError, match="fixed artifact value"):
+    with pytest.raises(ValueError, match="interpolator's fixed zenith_angle=20.0"):
         evaluate_ngs_ho_metric_interpolator(
             regular,
             zenith_angle=30.0 * u.deg,
@@ -702,13 +740,28 @@ def test_ngs_ho_metric_query_validation_rejects_unsupported_queries_before_evalu
         x=np.asarray([0.0]) * u.arcsec,
         y=np.asarray([0.0]) * u.arcsec,
     )
-    with pytest.raises(ValueError, match="airmass"):
+    with pytest.raises(ValueError) as above:
         validate_ngs_ho_metric_query(
             interpolator,
             zenith_angle=40.0 * u.deg,
             x=np.asarray([0.0]) * u.arcsec,
             y=np.asarray([0.0]) * u.arcsec,
         )
+    assert str(above.value) == (
+        "zenith_angle=40.0 deg is outside this interpolator's "
+        "supported zenith_angle range [20.0, 30.0] deg."
+    )
+    with pytest.raises(ValueError) as below:
+        validate_ngs_ho_metric_query(
+            interpolator,
+            zenith_angle=10.0 * u.deg,
+            x=np.asarray([0.0]) * u.arcsec,
+            y=np.asarray([0.0]) * u.arcsec,
+        )
+    assert str(below.value) == (
+        "zenith_angle=10.0 deg is outside this interpolator's "
+        "supported zenith_angle range [20.0, 30.0] deg."
+    )
     with pytest.raises(ValueError, match="field"):
         evaluate_ngs_ho_metric_interpolator(
             interpolator,
@@ -727,7 +780,7 @@ def test_ngs_ho_metric_regular_grid_rejects_unsupported_queries_before_evaluatio
         x=np.asarray([0.0]) * u.arcsec,
         y=np.asarray([0.0]) * u.arcsec,
     )
-    with pytest.raises(ValueError, match="airmass"):
+    with pytest.raises(ValueError, match="zenith_angle=40.0 deg is outside"):
         validate_ngs_ho_metric_query(
             interpolator,
             zenith_angle=40.0 * u.deg,
