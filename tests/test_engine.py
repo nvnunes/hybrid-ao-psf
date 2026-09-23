@@ -6,6 +6,10 @@ import numpy as np
 import pytest
 from ao_stats import PsfMetadata
 from astropy import units as u
+from ngs_photometry import (
+    WFSPhotometryConfig,
+    magnitudes_to_effective_photons_per_second,
+)
 
 from hybrid_ao_psf import (
     DiagnosticsLevel,
@@ -158,6 +162,54 @@ def test_simulate_builds_owned_result_and_passes_resolved_mastsel_inputs(
     assert not np.any(result.psd_clipped)
     assert "zenithangle = 30" in result.effective_mastsel_ini.lower()
     assert "zenith = [0, 1]" in result.effective_mastsel_ini.lower()
+
+
+def test_magnitude_request_resolves_the_same_flux_and_psf_as_direct_flux(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    calls: list[np.ndarray] = []
+
+    class FakeMavisLO:
+        error = False
+        mas2nm = 2.0
+
+        def __init__(self, path: str, name: str, *, verbose: bool) -> None:
+            pass
+
+        def computeTotalResidualMatrix(self, *args: object, **kwargs: object) -> np.ndarray:
+            calls.append(np.asarray(args[2]))
+            return np.stack([400.0 * np.eye(2), 800.0 * np.eye(2)])
+
+    monkeypatch.setattr(engine, "_load_mavis_lo", lambda: FakeMavisLO)
+    zeropoint = 6_277_173_913.043478 * u.photon / (u.m**2 * u.s)
+    magnitudes = np.array([12.0, 15.0]) * u.mag
+    photometry = WFSPhotometryConfig(
+        telescope_diameter=8.0 * u.m,
+        n_channels=1.0,
+        frame_rate=500.0 * u.Hz,
+        zeropoint=zeropoint,
+    )
+    expected_flux = magnitudes_to_effective_photons_per_second(magnitudes, photometry)
+    base = _request()
+    ini = base.mastsel_ini.replace("ZenithAngle = 0.0", "ZenithAngle = 0.0\nTelescopeDiameter = 8.0")
+    magnitude_request = replace(
+        base,
+        mastsel_ini=ini,
+        ngs_flux=None,
+        ngs_magnitude=magnitudes,
+        ngs_magnitude_zeropoint=zeropoint,
+    )
+    science, ngs = _providers()
+    magnitude_result = engine.simulate(magnitude_request, science, ngs)
+    direct_result = engine.simulate(replace(base, mastsel_ini=ini, ngs_flux=expected_flux), science, ngs)
+    np.testing.assert_allclose(calls[0], expected_flux.to_value(u.photon / u.s))
+    np.testing.assert_array_equal(calls[0], calls[1])
+    np.testing.assert_array_equal(magnitude_result.ctot_wavefront.value, direct_result.ctot_wavefront.value)
+    np.testing.assert_array_equal(magnitude_result.psfs, direct_result.psfs)
+    assert magnitude_result.ngs_magnitude is not None
+    np.testing.assert_array_equal(magnitude_result.ngs_magnitude.value, magnitudes.value)
+    assert magnitude_result.ngs_magnitude_zeropoint == zeropoint
+    assert direct_result.ngs_magnitude is None
 
 
 def test_directional_field_pairs_and_covariance_axes_reach_mastsel(

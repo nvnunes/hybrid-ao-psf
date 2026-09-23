@@ -25,6 +25,7 @@ dependencies = [
     "astropy>=7.0.0",
     "h5py>=3.11.0",
     "mastsel>=1.3.11,<2",
+    "ngs-photometry>=0.1.0",
     "numpy>=2.2.0",
     "scipy>=1.14.0",
 ]

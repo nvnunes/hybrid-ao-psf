@@ -4,11 +4,20 @@ This guide defines the supported public Python surface of Hybrid AO PSF.
 
 ## Requests And Providers
 
-`HybridRequest` is the single resolved simulation input. Cartesian science and
-NGS coordinates, physical scalars, and NGS fluxes are Astropy quantities.
+`HybridRequest` is the single simulation input. Its constructor is keyword-only,
+with the NGS flux, magnitude, and zeropoint fields grouped after `ngs_y`.
+Cartesian science and NGS coordinates, physical scalars, and NGS inputs are
+Astropy quantities.
 Array-valued inputs are copied and exposed read-only. The request also contains
 the MASTSEL INI text plus the selected non-PSD and diagnostics policies. The
 engine reads `RTC.SensorFrameRate_LO` from that INI for every active NGS.
+Supply exactly one of `ngs_flux` (effective `photon / s`) or
+`ngs_magnitude` (one `mag` value per active NGS). Magnitudes require a
+positive, scalar `ngs_magnitude_zeropoint` in `photon / (m2 s)` supplied by
+the caller, not stored in the MASTSEL INI. The engine uses
+`telescope.TelescopeDiameter`, the first `sensor_LO.NumberLenslets` value,
+and `RTC.SensorFrameRate_LO` with NGS Photometry to resolve effective flux
+once before MASTSEL. Calibration selection remains the caller's responsibility.
 Coordinates, Ctot axes, and PSF image orientation follow the
 [coordinate contract](architecture.md#coordinate-and-image-orientation).
 
@@ -26,7 +35,8 @@ surface is exported from both `hybrid_ao_psf` and
 
 `HybridResult` is the immutable standard result. It carries the final
 `float32` PSF cube, neutral `ao_stats.PsfMetadata`, source metadata, NGS
-metrics, Ctot in wavefront and angular units, conversion scale, NGS inputs,
+metrics, Ctot in wavefront and angular units, conversion scale, effective NGS
+flux and frame rates, optional supplied magnitudes and zeropoint,
 jitter, effective MASTSEL configuration, PSD-clipping mask, and provenance.
 `HybridDiagnostics` carries the selected validation summaries. At the debug
 level it also carries the large pre-blur PSF cube.

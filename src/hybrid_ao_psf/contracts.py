@@ -132,9 +132,9 @@ class NgsMetricProvider(Protocol):
         ...
 
 
-@dataclass(frozen=True)
+@dataclass(frozen=True, kw_only=True)
 class HybridRequest:
-    """Resolved inputs for one stateless Hybrid AO PSF simulation.
+    """Inputs for one stateless Hybrid AO PSF simulation.
 
     Attributes:
         science_x: Science field x-coordinates in arcseconds.
@@ -142,7 +142,12 @@ class HybridRequest:
         ngs_x: Natural-guide-star x-coordinates in arcseconds.
         ngs_y: Natural-guide-star y-coordinates in arcseconds. Each x/y pair
             is passed to MASTSEL in that order.
-        ngs_flux: Photon rate for each active natural guide star.
+        ngs_flux: Effective photon rate for each active guide star, as an
+            alternative to ``ngs_magnitude`` and its zeropoint.
+        ngs_magnitude: Magnitude of each active guide star, when supplying
+            magnitudes instead of effective flux.
+        ngs_magnitude_zeropoint: Caller-supplied pre-aperture zero-magnitude
+            photon flux, required only with magnitudes.
         wavelength: Science wavelength.
         zenith_angle: Observation zenith angle.
         mastsel_ini: Complete MASTSEL configuration text.
@@ -154,7 +159,9 @@ class HybridRequest:
     science_y: u.Quantity
     ngs_x: u.Quantity
     ngs_y: u.Quantity
-    ngs_flux: u.Quantity
+    ngs_flux: u.Quantity | None = None
+    ngs_magnitude: u.Quantity | None = None
+    ngs_magnitude_zeropoint: u.Quantity | None = None
     wavelength: u.Quantity
     zenith_angle: u.Quantity
     mastsel_ini: str
@@ -166,21 +173,39 @@ class HybridRequest:
         science_y = _readonly_quantity(self.science_y, u.arcsec, "science_y", ndim=1)
         ngs_x = _readonly_quantity(self.ngs_x, u.arcsec, "ngs_x", ndim=1)
         ngs_y = _readonly_quantity(self.ngs_y, u.arcsec, "ngs_y", ndim=1)
-        ngs_flux = _readonly_quantity(
-            self.ngs_flux, u.photon / u.s, "ngs_flux", ndim=1
-        )
+        if (self.ngs_flux is None) == (self.ngs_magnitude is None):
+            raise ValueError("Supply exactly one of ngs_flux or ngs_magnitude.")
+        ngs_flux = None
+        ngs_magnitude = None
+        zeropoint = None
+        if self.ngs_flux is not None:
+            if self.ngs_magnitude_zeropoint is not None:
+                raise ValueError("ngs_magnitude_zeropoint requires ngs_magnitude.")
+            ngs_flux = _readonly_quantity(
+                self.ngs_flux, u.photon / u.s, "ngs_flux", ndim=1
+            )
+            if np.any(ngs_flux.value <= 0.0):
+                raise ValueError("ngs_flux must be positive.")
+        else:
+            ngs_magnitude = _readonly_quantity(
+                self.ngs_magnitude, u.mag, "ngs_magnitude", ndim=1
+            )
+            zeropoint = _positive_scalar(
+                self.ngs_magnitude_zeropoint,
+                u.photon / (u.m**2 * u.s),
+                "ngs_magnitude_zeropoint",
+            )
         if science_x.size == 0:
             raise ValueError("At least one science coordinate is required.")
         if ngs_x.size == 0:
             raise ValueError("At least one active NGS is required.")
         if science_x.shape != science_y.shape:
             raise ValueError("science_x and science_y must have identical shapes.")
-        if not (ngs_x.shape == ngs_y.shape == ngs_flux.shape):
+        ngs_input = ngs_flux if ngs_flux is not None else ngs_magnitude
+        if not (ngs_x.shape == ngs_y.shape == ngs_input.shape):
             raise ValueError(
-                "NGS coordinates and flux vectors must have identical shapes."
+                "NGS coordinates and flux or magnitude vectors must have identical shapes."
             )
-        if np.any(ngs_flux.value <= 0.0):
-            raise ValueError("ngs_flux must be positive.")
         wavelength = _positive_scalar(self.wavelength, u.um, "wavelength")
         zenith_angle = _scalar(self.zenith_angle, u.deg, "zenith_angle")
         if not 0.0 <= zenith_angle.to_value(u.deg) < 90.0:
@@ -203,6 +228,8 @@ class HybridRequest:
         object.__setattr__(self, "ngs_x", ngs_x)
         object.__setattr__(self, "ngs_y", ngs_y)
         object.__setattr__(self, "ngs_flux", ngs_flux)
+        object.__setattr__(self, "ngs_magnitude", ngs_magnitude)
+        object.__setattr__(self, "ngs_magnitude_zeropoint", zeropoint)
         object.__setattr__(self, "wavelength", wavelength)
         object.__setattr__(self, "zenith_angle", zenith_angle)
         object.__setattr__(self, "mastsel_ini", mastsel_ini + "\n")
@@ -315,6 +342,8 @@ class HybridResult:
         ctot_angle: The same ``(x, y)`` covariance in angular units.
         angle_to_wavefront_scale: Scale relating angular and wavefront Ctot.
         ngs_flux: Effective guide-star photon rates.
+        ngs_magnitude: Optional supplied guide-star magnitudes.
+        ngs_magnitude_zeropoint: Optional supplied pre-aperture zeropoint.
         ngs_frame_rate: Effective guide-star frame rates.
         jitter: Radial jitter derived from angular Ctot.
         effective_mastsel_ini: Exact configuration supplied to MASTSEL.
@@ -337,6 +366,8 @@ class HybridResult:
     psd_clipped: np.ndarray
     provenance: Mapping[str, str] = field(default_factory=dict)
     diagnostics: HybridDiagnostics | None = None
+    ngs_magnitude: u.Quantity | None = None
+    ngs_magnitude_zeropoint: u.Quantity | None = None
 
     def __post_init__(self) -> None:
         psfs = _readonly_array(self.psfs, dtype=np.float32, label="psfs", ndim=3)
@@ -389,6 +420,19 @@ class HybridResult:
         ngs_flux = _vector_with_length(
             self.ngs_flux, u.photon / u.s, "ngs_flux", num_ngs, positive=True
         )
+        if (self.ngs_magnitude is None) != (self.ngs_magnitude_zeropoint is None):
+            raise ValueError("ngs_magnitude and ngs_magnitude_zeropoint must be paired.")
+        ngs_magnitude = None
+        zeropoint = None
+        if self.ngs_magnitude is not None:
+            ngs_magnitude = _vector_with_length(
+                self.ngs_magnitude, u.mag, "ngs_magnitude", num_ngs, positive=False
+            )
+            zeropoint = _positive_scalar(
+                self.ngs_magnitude_zeropoint,
+                u.photon / (u.m**2 * u.s),
+                "ngs_magnitude_zeropoint",
+            )
         ngs_frame_rate = _vector_with_length(
             self.ngs_frame_rate, u.Hz, "ngs_frame_rate", num_ngs, positive=True
         )
@@ -454,6 +498,8 @@ class HybridResult:
         object.__setattr__(self, "ctot_angle", ctot_angle)
         object.__setattr__(self, "angle_to_wavefront_scale", angle_to_wavefront_scale)
         object.__setattr__(self, "ngs_flux", ngs_flux)
+        object.__setattr__(self, "ngs_magnitude", ngs_magnitude)
+        object.__setattr__(self, "ngs_magnitude_zeropoint", zeropoint)
         object.__setattr__(self, "ngs_frame_rate", ngs_frame_rate)
         object.__setattr__(self, "jitter", jitter)
         object.__setattr__(self, "effective_mastsel_ini", effective_mastsel_ini + "\n")

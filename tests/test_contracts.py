@@ -1,4 +1,5 @@
 from dataclasses import FrozenInstanceError, fields, replace
+from inspect import Parameter, signature
 
 import numpy as np
 import pytest
@@ -90,14 +91,20 @@ def test_request_normalizes_units_and_owns_readonly_arrays() -> None:
         request.wavelength = 2.2 * u.um
 
 
-def test_request_groups_ngs_flux_with_ngs_coordinates() -> None:
-    assert [item.name for item in fields(HybridRequest)[:5]] == [
+def test_request_groups_ngs_inputs_after_coordinates() -> None:
+    expected = [
         "science_x",
         "science_y",
         "ngs_x",
         "ngs_y",
         "ngs_flux",
+        "ngs_magnitude",
+        "ngs_magnitude_zeropoint",
     ]
+    assert [item.name for item in fields(HybridRequest)[:7]] == expected
+    parameters = signature(HybridRequest).parameters
+    assert list(parameters)[:7] == expected
+    assert all(parameter.kind is Parameter.KEYWORD_ONLY for parameter in parameters.values())
 
 
 def test_request_rejects_mismatched_ngs_vectors() -> None:
@@ -112,6 +119,33 @@ def test_request_rejects_mismatched_ngs_vectors() -> None:
             zenith_angle=30.0 * u.deg,
             mastsel_ini="[telescope]\nZenithAngle = 30\n",
         )
+
+
+def test_request_requires_one_complete_ngs_input_path() -> None:
+    base = {
+        "science_x": np.array([0.0]) * u.arcsec,
+        "science_y": np.array([0.0]) * u.arcsec,
+        "ngs_x": np.array([1.0]) * u.arcsec,
+        "ngs_y": np.array([1.0]) * u.arcsec,
+        "wavelength": 1.65 * u.um,
+        "zenith_angle": 30.0 * u.deg,
+        "mastsel_ini": "[telescope]\nZenithAngle = 30\n",
+    }
+    flux = np.array([1000.0]) * u.photon / u.s
+    magnitude = np.array([12.0]) * u.mag
+    zeropoint = 1.0 * u.photon / (u.m**2 * u.s)
+    with pytest.raises(ValueError, match="exactly one"):
+        HybridRequest(**base)
+    with pytest.raises(ValueError, match="exactly one"):
+        HybridRequest(**base, ngs_flux=flux, ngs_magnitude=magnitude, ngs_magnitude_zeropoint=zeropoint)
+    with pytest.raises(ValueError, match="requires ngs_magnitude"):
+        HybridRequest(**base, ngs_flux=flux, ngs_magnitude_zeropoint=zeropoint)
+    with pytest.raises((TypeError, ValueError), match="ngs_magnitude_zeropoint"):
+        HybridRequest(**base, ngs_magnitude=magnitude)
+    with pytest.raises(ValueError, match="ngs_magnitude_zeropoint"):
+        HybridRequest(**base, ngs_magnitude=magnitude, ngs_magnitude_zeropoint=0.0 * zeropoint)
+    with pytest.raises(ValueError, match="identical shapes"):
+        HybridRequest(**base, ngs_magnitude=np.array([12.0, 13.0]) * u.mag, ngs_magnitude_zeropoint=zeropoint)
 
 
 def test_provider_prediction_owns_inputs() -> None:

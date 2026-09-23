@@ -60,6 +60,31 @@ def test_result_hdf5_round_trip(tmp_path: Path) -> None:
     assert not actual.psfs.flags.writeable
 
 
+def test_magnitude_provenance_round_trip(tmp_path: Path) -> None:
+    expected = replace(
+        make_result(),
+        ngs_magnitude=np.array([12.0, 15.0]) * u.mag,
+        ngs_magnitude_zeropoint=6_277_173_913.043478 * u.photon / (u.m**2 * u.s),
+    )
+    path = save_result(tmp_path / "magnitude.h5", expected)
+    with h5py.File(path) as root:
+        assert "result/ngs/magnitude" in root
+        assert "result/ngs/magnitude_zeropoint" in root
+    actual = load_result(path)
+    np.testing.assert_array_equal(actual.ngs_magnitude.value, expected.ngs_magnitude.value)
+    assert actual.ngs_magnitude_zeropoint == expected.ngs_magnitude_zeropoint
+
+
+def test_direct_flux_result_omits_magnitude_provenance(tmp_path: Path) -> None:
+    path = save_result(tmp_path / "flux.h5", make_result())
+    with h5py.File(path) as root:
+        assert "result/ngs/magnitude" not in root
+        assert "result/ngs/magnitude_zeropoint" not in root
+    actual = load_result(path)
+    assert actual.ngs_magnitude is None
+    assert actual.ngs_magnitude_zeropoint is None
+
+
 def test_validation_result_round_trip_omits_debug_psfs(tmp_path: Path) -> None:
     expected = make_result()
     assert expected.diagnostics is not None

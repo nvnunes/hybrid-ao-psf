@@ -2,11 +2,13 @@ from __future__ import annotations
 
 import json
 import shutil
+from dataclasses import replace
 from pathlib import Path
 
 import numpy as np
 import pytest
 from astropy import units as u
+from ngs_photometry import WFSPhotometryConfig, photons_per_frame_to_magnitudes
 
 from hybrid_ao_psf import (
     NgsHoMetricSamples,
@@ -15,10 +17,14 @@ from hybrid_ao_psf import (
     build_ngs_ho_metric_interpolator,
     build_science_ho_psf_interpolator,
     cli,
+    load_configuration,
+    load_ngs_ho_metric_interpolator,
     load_result,
+    load_science_ho_psf_interpolator,
     run_configuration,
     save_ngs_ho_metric_interpolator,
     save_science_ho_psf_interpolator,
+    simulate,
 )
 
 DATA = Path(__file__).parent / "data"
@@ -107,6 +113,33 @@ def test_real_mastsel_engine_matches_retained_hybrid_golden(tmp_path: Path) -> N
         rtol=1e-5,
         atol=1e-7,
     )
+
+    # The same MASTSEL-only INI and loaded providers also work through the
+    # public Python magnitude path, independently of AO Predict.
+    configuration = load_configuration(configuration_path)
+    zeropoint = 1.0e10 * u.photon / (u.m**2 * u.s)
+    photometry = WFSPhotometryConfig(
+        telescope_diameter=TELESCOPE_DIAMETER_M * u.m,
+        n_channels=1.0,
+        frame_rate=500.0 * u.Hz,
+        zeropoint=zeropoint,
+    )
+    magnitudes = photons_per_frame_to_magnitudes(
+        configuration.request.ngs_flux / (500.0 * u.Hz), photometry
+    )
+    magnitude_result = simulate(
+        replace(
+            configuration.request,
+            ngs_flux=None,
+            ngs_magnitude=magnitudes,
+            ngs_magnitude_zeropoint=zeropoint,
+        ),
+        load_science_ho_psf_interpolator(science_path),
+        load_ngs_ho_metric_interpolator(ngs_path),
+    )
+    np.testing.assert_allclose(magnitude_result.ngs_flux.value, result.ngs_flux.value, rtol=1e-14)
+    np.testing.assert_allclose(magnitude_result.ctot_wavefront.value, result.ctot_wavefront.value, rtol=1e-12)
+    np.testing.assert_allclose(magnitude_result.psfs, result.psfs, rtol=1e-6, atol=1e-7)
 
 
 def _ngs_cartesian() -> tuple[np.ndarray, np.ndarray]:

@@ -8,21 +8,23 @@ scientific ownership, public API boundaries, and persisted contracts.
 Hybrid AO PSF owns:
 
 - science-HO-PSF and NGS-HO-metric interpolation products;
-- translation of resolved Hybrid inputs into MASTSEL configuration;
+- translation of Hybrid inputs into MASTSEL configuration;
 - MASTSEL low-order execution and Ctot interpretation;
 - finite-field Ctot blur, jitter, and engine-level diagnostics; and
 - standalone combined-INI and versioned HDF5 result contracts.
 
 Hybrid AO PSF does not own batch simulation orchestration, external dataset
-schemas, instrument photometry, magnitude conversion, instrument-specific
-policy, or final PSF statistics. Callers resolve those concerns before
-constructing an engine request.
+schemas, instrument calibration selection, instrument-specific policy, or
+final PSF statistics. Callers may supply effective NGS flux directly or
+provide magnitudes with an explicit caller-owned zeropoint. Hybrid converts
+the latter to WFS-effective rates using MASTSEL geometry and NGS Photometry.
 
 ## Dependencies
 
 The package depends directly on AO Stats for neutral PSF metadata and the
-measurements required by interpolation products. It depends directly on a
-tested released MASTSEL range for low-order calculation. It has no dependency
+measurements required by interpolation products, on NGS Photometry for
+magnitude-to-effective-rate conversion, and on a tested released MASTSEL range
+for low-order calculation. It has no dependency
 on an orchestration framework or instrument package.
 
 ## Public API
@@ -37,7 +39,7 @@ package-root OTF helpers are the supported numerical primitives for external
 finite-field blur comparisons; other numerical helpers remain private.
 
 Physical values use Astropy quantities. Public requests and results are
-immutable typed objects. One simulation call accepts one resolved request and
+immutable typed objects. One simulation call accepts one request and
 loaded interpolation providers and returns one result; orchestration and
 provider reuse belong to the caller.
 
@@ -62,6 +64,11 @@ returns a new result. `simulate_configuration()`, `run_configuration()`, and the
 CLI call this operation rather than defining separate scientific behavior.
 The engine reads the active NGS frame rate from `RTC.SensorFrameRate_LO` in the
 effective MASTSEL configuration and reports the applied rates in the result.
+For magnitude requests it also reads `telescope.TelescopeDiameter` and the
+first `sensor_LO.NumberLenslets` value, converts once before MASTSEL, and
+reports both the effective flux and the supplied magnitudes and zeropoint.
+The MASTSEL INI contains no instrument zeropoint; the standalone command
+supplies resolved flux through its `[hybrid]` section.
 `blur_psfs_with_ctot()` is a focused operation for externally supplied PSFs
 and already-conditioned Ctot; it uses the same finite-field blur without
 running MASTSEL or producing a complete simulation result.

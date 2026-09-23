@@ -10,6 +10,10 @@ from typing import Any
 
 import numpy as np
 from astropy import units as u
+from ngs_photometry import (
+    WFSPhotometryConfig,
+    magnitudes_to_effective_photons_per_second,
+)
 
 from ._units import quantity_value
 from .contracts import (
@@ -32,10 +36,12 @@ def simulate(
     science_provider: SciencePsfProvider,
     ngs_provider: NgsMetricProvider,
 ) -> HybridResult:
-    """Run one resolved Hybrid AO PSF simulation.
+    """Run one Hybrid AO PSF simulation.
 
-    Providers are borrowed and reusable. The returned result owns all arrays
-    and the engine does not retain mutable per-run state.
+    The request supplies effective NGS flux or magnitudes with a caller-owned
+    zeropoint. Magnitudes are converted using MASTSEL telescope/WFS geometry
+    before Ctot evaluation. Providers are borrowed and reusable. The result
+    owns its arrays, and the engine retains no mutable per-run state.
     """
     if not isinstance(request, HybridRequest):
         raise TypeError("request must be a HybridRequest.")
@@ -60,7 +66,7 @@ def simulate(
     if metrics.ee.size != request.ngs_x.size:
         raise ValueError("NGS provider output length does not match the request.")
 
-    effective_ini, ngs_frame_rate = _resolve_effective_mastsel(request)
+    effective_ini, ngs_frame_rate, ngs_flux = _resolve_effective_mastsel(request)
     ctot_raw, angle_to_wavefront_scale = _compute_mastsel_ctot(
         request,
         metrics.ee,
@@ -68,6 +74,7 @@ def simulate(
         metrics.sr,
         effective_ini,
         ngs_frame_rate,
+        ngs_flux,
     )
     ctot_wavefront, psd_clipped = condition_ctot(
         ctot_raw,
@@ -101,7 +108,9 @@ def simulate(
         ctot_wavefront=ctot_wavefront,
         ctot_angle=ctot_angle,
         angle_to_wavefront_scale=angle_to_wavefront_scale,
-        ngs_flux=request.ngs_flux,
+        ngs_flux=ngs_flux,
+        ngs_magnitude=request.ngs_magnitude,
+        ngs_magnitude_zeropoint=request.ngs_magnitude_zeropoint,
         ngs_frame_rate=ngs_frame_rate,
         jitter=_jitter_from_ctot(ctot_angle),
         effective_mastsel_ini=effective_ini,
@@ -175,6 +184,7 @@ def _compute_mastsel_ctot(
     sr: u.Quantity,
     effective_ini: str,
     ngs_frame_rate: u.Quantity,
+    ngs_flux: u.Quantity,
 ) -> tuple[u.Quantity, u.Quantity]:
     MavisLO = _load_mavis_lo()
     with tempfile.TemporaryDirectory(prefix="hybrid_ao_psf_") as temporary:
@@ -196,7 +206,7 @@ def _compute_mastsel_ctot(
             mlo.computeTotalResidualMatrix(
                 science_coordinates,
                 ngs_coordinates,
-                request.ngs_flux.to_value(u.photon / u.s),
+                ngs_flux.to_value(u.photon / u.s),
                 ngs_frame_rate.to_value(u.Hz),
                 sr.to_value(u.dimensionless_unscaled),
                 ee.to_value(u.dimensionless_unscaled),
@@ -221,8 +231,10 @@ def _compute_mastsel_ctot(
         return ctot, scale
 
 
-def _resolve_effective_mastsel(request: HybridRequest) -> tuple[str, u.Quantity]:
-    """Resolve the MASTSEL INI and its configured per-NGS frame rates."""
+def _resolve_effective_mastsel(
+    request: HybridRequest,
+) -> tuple[str, u.Quantity, u.Quantity]:
+    """Resolve the effective MASTSEL INI, frame rates, and effective flux."""
     parser = ConfigParser(interpolation=None)
     parser.optionxform = str
     parser.read_string(request.mastsel_ini)
@@ -264,9 +276,35 @@ def _resolve_effective_mastsel(request: HybridRequest) -> tuple[str, u.Quantity]
         parser["sensor_LO"]["NumberLenslets"] = _format_array(
             np.full(request.ngs_x.size, lenslets[0], dtype=float)
         )
+    ngs_frame_rate = np.full(request.ngs_x.size, frame_rate, dtype=float) * u.Hz
+    if request.ngs_flux is not None:
+        ngs_flux = request.ngs_flux
+    else:
+        if "TelescopeDiameter" not in parser["telescope"]:
+            raise ValueError("MASTSEL configuration requires telescope.TelescopeDiameter for magnitudes.")
+        if not parser.has_section("sensor_LO") or "NumberLenslets" not in parser["sensor_LO"]:
+            raise ValueError("MASTSEL configuration requires sensor_LO.NumberLenslets for magnitudes.")
+        try:
+            diameter = float(parser["telescope"]["TelescopeDiameter"])
+        except ValueError as exc:
+            raise ValueError("telescope.TelescopeDiameter must be numeric.") from exc
+        lenslets = _parse_numeric_array(parser["sensor_LO"]["NumberLenslets"])
+        if lenslets.size == 0:
+            raise ValueError("sensor_LO.NumberLenslets must not be empty.")
+        photometry = WFSPhotometryConfig(
+            telescope_diameter=diameter * u.m,
+            n_channels=float(lenslets[0]),
+            frame_rate=frame_rate * u.Hz,
+            zeropoint=request.ngs_magnitude_zeropoint,
+        )
+        ngs_flux = magnitudes_to_effective_photons_per_second(
+            request.ngs_magnitude, photometry
+        )
+        if np.any(ngs_flux.to_value(u.photon / u.s) <= 0.0):
+            raise ValueError("ngs_magnitude resolves to non-positive ngs_flux.")
     stream = StringIO()
     parser.write(stream)
-    return stream.getvalue(), np.full(request.ngs_x.size, frame_rate, dtype=float) * u.Hz
+    return stream.getvalue(), ngs_frame_rate, ngs_flux
 
 
 def _cartesian_to_polar(

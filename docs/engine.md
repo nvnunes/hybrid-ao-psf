@@ -1,6 +1,6 @@
 # Engine
 
-`simulate()` accepts one resolved `HybridRequest`, one loaded
+`simulate()` accepts one `HybridRequest`, one loaded
 `SciencePsfProvider`, and one loaded `NgsMetricProvider`. It returns one
 immutable `HybridResult` and retains no mutable run state. Loading and provider
 reuse remain the caller's responsibility, so fitted products can be reused
@@ -11,13 +11,15 @@ efficiently across repeated simulations.
 One call:
 
 1. evaluates the science-HO-PSF and NGS-HO-metric providers;
-2. translates Cartesian request coordinates and resolved physical values into
-   an effective MASTSEL INI;
-3. calls MASTSEL for Ctot and its angular conversion;
-4. validates and, where permitted, conditions Ctot;
-5. applies the image-plane Gaussian OTF to a private `float32` PSF copy using
+2. translates Cartesian request coordinates into an effective MASTSEL INI and
+   reads the configured LO frame rate;
+3. uses supplied effective NGS flux, or converts magnitudes with the
+   caller-supplied zeropoint and MASTSEL telescope/WFS geometry;
+4. calls MASTSEL for Ctot and its angular conversion;
+5. validates and, where permitted, conditions Ctot;
+6. applies the image-plane Gaussian OTF to a private `float32` PSF copy using
    the provider-owned pixel scale and finite-field convention; and
-6. constructs the standard result, jitter, PSD facts, effective configuration,
+7. constructs the standard result, jitter, PSD facts, effective configuration,
    provenance, and selected diagnostics.
 
 The finite-field crop is not renormalized. Energy blurred beyond the retained
@@ -37,10 +39,9 @@ Zero Ctot is valid and leaves its PSF unchanged. Ctot is symmetrized before
 eigendecomposition. Negative eigenvalues with magnitude no greater than
 `1e-9 nm2` are treated as floating-point roundoff and clipped to zero.
 
-The tolerance was fixed after the project-owned released-MASTSEL regression
-produced positive eigenvalues from approximately `4.7e3` to `6.9e4 nm2`; it is
-many orders of magnitude below the scientific covariance scale. It is an
-engine constant, not a researcher setting.
+The tolerance is many orders of magnitude below the positive eigenvalues in
+the released-MASTSEL regression (`4.7e3` to `6.9e4 nm2`). It is an engine
+constant, not a researcher setting.
 
 For a materially non-positive-semidefinite matrix, `non_psd_policy = error`
 raises before blur and is the default. `non_psd_policy = clip` clips negative
@@ -50,8 +51,9 @@ whose covariance required numerical or selected policy clipping.
 ## Diagnostics
 
 The standard result always retains NGS metrics, Ctot in wavefront and angular
-units, angular conversion, resolved NGS inputs, jitter, effective MASTSEL
-configuration, and PSD-clipping facts.
+units, angular conversion, effective NGS flux and frame rates, jitter,
+effective MASTSEL configuration, and PSD-clipping facts.
+Magnitude requests also retain the supplied magnitudes and zeropoint.
 
 `diagnostics_level = none` adds nothing to that standard result.
 `diagnostics_level = validation` retains a per-field nonzero-PSD mask, its

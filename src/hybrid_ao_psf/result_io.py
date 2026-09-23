@@ -61,6 +61,14 @@ def _write_result(output: Path, result: HybridResult) -> None:
         ctot.create_dataset("psd_clipped", data=result.psd_clipped, dtype=bool)
         ngs = result_group.create_group("ngs")
         _write_quantity(ngs, "flux", result.ngs_flux, dtype=np.float32)
+        if result.ngs_magnitude is not None:
+            _write_quantity(ngs, "magnitude", result.ngs_magnitude, dtype=np.float64)
+            _write_quantity(
+                ngs,
+                "magnitude_zeropoint",
+                result.ngs_magnitude_zeropoint,
+                dtype=np.float64,
+            )
         _write_quantity(
             ngs, "frame_rate", result.ngs_frame_rate, dtype=np.float32
         )
@@ -192,6 +200,13 @@ def load_result(path: str | Path) -> HybridResult:
                 ctot["angle_to_wavefront_scale"]
             ),
             ngs_flux=_read_quantity(ngs["flux"]),
+            ngs_magnitude=(
+                _read_quantity(ngs["magnitude"]) if "magnitude" in ngs else None
+            ),
+            ngs_magnitude_zeropoint=(
+                _read_quantity(ngs["magnitude_zeropoint"])
+                if "magnitude_zeropoint" in ngs else None
+            ),
             ngs_frame_rate=_read_quantity(ngs["frame_rate"]),
             jitter=_read_quantity(result_group["jitter"]),
             effective_mastsel_ini=_text(

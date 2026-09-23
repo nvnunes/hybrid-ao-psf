@@ -5,8 +5,8 @@ Git hook activation, and routine contributor workflow.
 
 ## Bootstrap
 
-Until AO Stats has an index release, run bootstrap with its public repository
-as the explicit dependency source:
+Run bootstrap with the public AO Stats repository as the explicit dependency
+source:
 
 ```bash
 HYBRID_AO_PSF_AO_STATS_SOURCE='git+https://github.com/nvnunes/ao-stats.git@main' \
@@ -17,22 +17,18 @@ The script creates `./.conda`, installs the package with development and
 documentation dependencies, configures the versioned Git hook, runs the
 canonical checks, and builds the package.
 
-The source override also accepts a local AO Stats checkout for co-development:
+The AO Stats source override also accepts a local checkout for co-development:
 
 ```bash
 HYBRID_AO_PSF_AO_STATS_SOURCE=../ao-stats ./scripts/bootstrap.sh
 ```
 
-The override affects only dependency installation. Remote sources are
-installed normally; local paths are installed editably. Package metadata
-continues to declare the released `ao-stats` distribution contract.
-
-Once AO Stats is available from the configured package index, the ordinary
-bootstrap command needs no override:
-
-```bash
-./scripts/bootstrap.sh
-```
+Bootstrap also installs NGS Photometry from its public GitHub repository
+before installing Hybrid AO PSF. For a sibling checkout, set
+`HYBRID_AO_PSF_NGS_PHOTOMETRY_SOURCE=../ngs-photometry`; remote sources are
+installed normally and local paths editably. These overrides affect only
+dependency installation. Package metadata declares the
+`ao-stats` and `ngs-photometry` distribution contracts.
 
 ## Daily Commands
 

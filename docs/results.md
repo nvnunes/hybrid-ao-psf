@@ -15,7 +15,7 @@ rather than guessing at compatibility.
 │   ├── source_metadata/<name>
 │   ├── ngs_metrics/{ee,fwhm,sr}
 │   ├── ctot/{wavefront,angle,angle_to_wavefront_scale,psd_clipped}
-│   ├── ngs/{flux,frame_rate}
+│   ├── ngs/{flux,frame_rate,magnitude?,magnitude_zeropoint?}
 │   └── jitter
 ├── configuration/effective_mastsel_ini
 ├── provenance
@@ -30,7 +30,9 @@ Every physical quantity dataset carries a `unit` attribute containing an
 Astropy-readable unit string. The final PSF and optional pre-blur PSF datasets
 are dimensionless `float32` arrays in the provider's flux convention. Ctot,
 NGS inputs, metrics, jitter, PSF metadata, and source metadata retain explicit
-units.
+units. `ngs/flux` always stores the effective `photon / s` rate. The magnitude
+and caller-supplied zeropoint datasets are present together only for magnitude
+requests; direct-flux results omit them.
 
 `provenance` is a string mapping stored as group attributes. The effective
 MASTSEL INI is stored verbatim as UTF-8 configuration text. Optional
