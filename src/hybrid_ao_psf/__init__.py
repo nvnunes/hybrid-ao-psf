@@ -4,7 +4,10 @@ from ._version import __version__
 from .config import HYBRID_SECTION, HybridConfiguration, load_configuration
 from .contracts import (
     DiagnosticsLevel,
+    HybridCtotContext,
+    HybridCtotCorrection,
     HybridDiagnostics,
+    HybridMastselStatistics,
     HybridRequest,
     HybridResult,
     NgsHoMetricPrediction,
@@ -61,7 +64,10 @@ __all__ = [
     "RESULT_SCHEMA_VERSION",
     "DiagnosticsLevel",
     "HybridConfiguration",
+    "HybridCtotContext",
+    "HybridCtotCorrection",
     "HybridDiagnostics",
+    "HybridMastselStatistics",
     "HybridRequest",
     "HybridResult",
     "NgsHoMetricInterpolator",

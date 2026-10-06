@@ -5,8 +5,6 @@ from __future__ import annotations
 import tempfile
 from configparser import ConfigParser
 from io import StringIO
-from pathlib import Path
-from typing import Any
 
 import numpy as np
 from astropy import units as u
@@ -15,10 +13,17 @@ from ngs_photometry import (
     magnitudes_to_effective_photons_per_second,
 )
 
+from ._mastsel import (
+    _capture_mastsel,
+    _complete_mastsel_context,
+    _compute_mastsel_ctot,
+    _prepare_mastsel_context,
+)
 from ._units import quantity_value
 from .contracts import (
     CTOT_PSD_TOLERANCE_NM2,
     DiagnosticsLevel,
+    HybridCtotCorrection,
     HybridDiagnostics,
     HybridRequest,
     HybridResult,
@@ -35,6 +40,8 @@ def simulate(
     request: HybridRequest,
     science_provider: SciencePsfProvider,
     ngs_provider: NgsMetricProvider,
+    *,
+    ctot_correction: HybridCtotCorrection | None = None,
 ) -> HybridResult:
     """Run one Hybrid AO PSF simulation.
 
@@ -42,6 +49,12 @@ def simulate(
     zeropoint. Magnitudes are converted using MASTSEL telescope/WFS geometry
     before Ctot evaluation. Providers are borrowed and reusable. The result
     owns its arrays, and the engine retains no mutable per-run state.
+
+    An optional correction receives the unconditioned whole-field covariance
+    and a borrowed live runtime context. It returns a replacement in compatible
+    wavefront covariance units, or None. The engine conditions and blurs once;
+    exceptions propagate. Static correction provenance is merged with provider
+    identities; collisions are errors. The context is not retained or persisted.
     """
     if not isinstance(request, HybridRequest):
         raise TypeError("request must be a HybridRequest.")
@@ -49,6 +62,21 @@ def simulate(
         raise TypeError("science_provider must implement SciencePsfProvider.")
     if not isinstance(ngs_provider, NgsMetricProvider):
         raise TypeError("ngs_provider must implement NgsMetricProvider.")
+    if ctot_correction is not None and not isinstance(
+        ctot_correction, HybridCtotCorrection
+    ):
+        raise TypeError("ctot_correction must be HybridCtotCorrection or None.")
+    provenance = {
+        "science_provider": _type_identity(science_provider),
+        "ngs_provider": _type_identity(ngs_provider),
+    }
+    if ctot_correction is not None:
+        collisions = provenance.keys() & ctot_correction.provenance.keys()
+        if collisions:
+            raise ValueError(
+                f"Correction provenance collides with engine keys: {sorted(collisions)}."
+            )
+        provenance.update(ctot_correction.provenance)
 
     science = science_provider.predict(
         zenith_angle=request.zenith_angle,
@@ -67,15 +95,30 @@ def simulate(
         raise ValueError("NGS provider output length does not match the request.")
 
     effective_ini, ngs_frame_rate, ngs_flux = _resolve_effective_mastsel(request)
-    ctot_raw, angle_to_wavefront_scale = _compute_mastsel_ctot(
-        request,
-        metrics.ee,
-        metrics.fwhm,
-        metrics.sr,
-        effective_ini,
-        ngs_frame_rate,
-        ngs_flux,
-    )
+    with tempfile.TemporaryDirectory(prefix="hybrid_ao_psf_") as temporary:
+        context = _prepare_mastsel_context(
+            temporary, request, metrics, effective_ini, ngs_frame_rate, ngs_flux
+        )
+        if ctot_correction is None:
+            ctot_raw = _compute_mastsel_ctot(context)
+        else:
+            with _capture_mastsel(context) as captured:
+                ctot_raw = _compute_mastsel_ctot(context)
+            context = _complete_mastsel_context(context, captured)
+        validate_ctot_shape(
+            ctot_raw, expected_size=request.science_x.size, label="MASTSEL Ctot"
+        )
+        angle_to_wavefront_scale = context.angle_to_wavefront_scale
+        if ctot_correction is not None:
+            ctot_raw.flags.writeable = False
+            corrected = ctot_correction.apply(ctot_raw, context)
+            if corrected is not None:
+                validate_ctot_shape(
+                    corrected,
+                    expected_size=request.science_x.size,
+                    label="Corrected Ctot",
+                )
+                ctot_raw = corrected.to(u.nm**2)
     ctot_wavefront, psd_clipped = condition_ctot(
         ctot_raw,
         policy=request.non_psd_policy,
@@ -115,10 +158,7 @@ def simulate(
         jitter=_jitter_from_ctot(ctot_angle),
         effective_mastsel_ini=effective_ini,
         psd_clipped=psd_clipped,
-        provenance={
-            "science_provider": _type_identity(science_provider),
-            "ngs_provider": _type_identity(ngs_provider),
-        },
+        provenance=provenance,
         diagnostics=diagnostics,
     )
 
@@ -177,60 +217,6 @@ def condition_ctot(
     return symmetric * u.nm**2, clipped
 
 
-def _compute_mastsel_ctot(
-    request: HybridRequest,
-    ee: u.Quantity,
-    fwhm: u.Quantity,
-    sr: u.Quantity,
-    effective_ini: str,
-    ngs_frame_rate: u.Quantity,
-    ngs_flux: u.Quantity,
-) -> tuple[u.Quantity, u.Quantity]:
-    MavisLO = _load_mavis_lo()
-    with tempfile.TemporaryDirectory(prefix="hybrid_ao_psf_") as temporary:
-        ini_path = Path(temporary) / "simulation.ini"
-        ini_path.write_text(effective_ini, encoding="utf-8")
-        mlo = MavisLO(str(ini_path.parent), ini_path.stem, verbose=False)
-        if getattr(mlo, "error", False):
-            raise RuntimeError("MASTSEL failed to load the effective Hybrid configuration.")
-        science_coordinates = np.column_stack(
-            [
-                request.science_x.to_value(u.arcsec),
-                request.science_y.to_value(u.arcsec),
-            ]
-        )
-        ngs_coordinates = np.column_stack(
-            [request.ngs_x.to_value(u.arcsec), request.ngs_y.to_value(u.arcsec)]
-        )
-        values = np.asarray(
-            mlo.computeTotalResidualMatrix(
-                science_coordinates,
-                ngs_coordinates,
-                ngs_flux.to_value(u.photon / u.s),
-                ngs_frame_rate.to_value(u.Hz),
-                sr.to_value(u.dimensionless_unscaled),
-                ee.to_value(u.dimensionless_unscaled),
-                fwhm.to_value(u.mas),
-                aNGS_FWHM_DL_mas=None,
-                doAll=True,
-            ),
-            dtype=float,
-        )
-        ctot = values * u.nm**2
-        validate_ctot_shape(
-            ctot,
-            expected_size=request.science_x.size,
-            label="MASTSEL Ctot",
-        )
-        mas2nm = getattr(mlo, "mas2nm", None)
-        if mas2nm is None:
-            raise ValueError("MASTSEL did not expose mas2nm conversion.")
-        scale = float(mas2nm) * u.nm / u.mas
-        if not np.isfinite(scale.value) or scale.value <= 0.0:
-            raise ValueError(f"MASTSEL returned invalid angular conversion: {mas2nm!r}.")
-        return ctot, scale
-
-
 def _resolve_effective_mastsel(
     request: HybridRequest,
 ) -> tuple[str, u.Quantity, u.Quantity]:
@@ -246,7 +232,9 @@ def _resolve_effective_mastsel(
     try:
         frame_rate = float(parser["RTC"]["SensorFrameRate_LO"])
     except ValueError as exc:
-        raise ValueError("RTC.SensorFrameRate_LO must be a positive finite scalar.") from exc
+        raise ValueError(
+            "RTC.SensorFrameRate_LO must be a positive finite scalar."
+        ) from exc
     if not np.isfinite(frame_rate) or frame_rate <= 0.0:
         raise ValueError("RTC.SensorFrameRate_LO must be a positive finite scalar.")
     if not parser.has_section("sources_science"):
@@ -254,19 +242,13 @@ def _resolve_effective_mastsel(
     parser["telescope"]["ZenithAngle"] = _format_scalar(
         request.zenith_angle.to_value(u.deg)
     )
-    science_r, science_theta = _cartesian_to_polar(
-        request.science_x, request.science_y
-    )
+    science_r, science_theta = _cartesian_to_polar(request.science_x, request.science_y)
     ngs_r, ngs_theta = _cartesian_to_polar(request.ngs_x, request.ngs_y)
     parser["sources_science"]["Wavelength"] = _format_array(
         np.asarray([request.wavelength.to_value(u.m)])
     )
-    parser["sources_science"]["Zenith"] = _format_array(
-        science_r.to_value(u.arcsec)
-    )
-    parser["sources_science"]["Azimuth"] = _format_array(
-        science_theta.to_value(u.deg)
-    )
+    parser["sources_science"]["Zenith"] = _format_array(science_r.to_value(u.arcsec))
+    parser["sources_science"]["Azimuth"] = _format_array(science_theta.to_value(u.deg))
     parser["sources_LO"]["Zenith"] = _format_array(ngs_r.to_value(u.arcsec))
     parser["sources_LO"]["Azimuth"] = _format_array(ngs_theta.to_value(u.deg))
     if parser.has_section("sensor_LO") and "NumberLenslets" in parser["sensor_LO"]:
@@ -281,9 +263,16 @@ def _resolve_effective_mastsel(
         ngs_flux = request.ngs_flux
     else:
         if "TelescopeDiameter" not in parser["telescope"]:
-            raise ValueError("MASTSEL configuration requires telescope.TelescopeDiameter for magnitudes.")
-        if not parser.has_section("sensor_LO") or "NumberLenslets" not in parser["sensor_LO"]:
-            raise ValueError("MASTSEL configuration requires sensor_LO.NumberLenslets for magnitudes.")
+            raise ValueError(
+                "MASTSEL configuration requires telescope.TelescopeDiameter for magnitudes."
+            )
+        if (
+            not parser.has_section("sensor_LO")
+            or "NumberLenslets" not in parser["sensor_LO"]
+        ):
+            raise ValueError(
+                "MASTSEL configuration requires sensor_LO.NumberLenslets for magnitudes."
+            )
         try:
             diameter = float(parser["telescope"]["TelescopeDiameter"])
         except ValueError as exc:
@@ -307,9 +296,7 @@ def _resolve_effective_mastsel(
     return stream.getvalue(), ngs_frame_rate, ngs_flux
 
 
-def _cartesian_to_polar(
-    x: u.Quantity, y: u.Quantity
-) -> tuple[u.Quantity, u.Quantity]:
+def _cartesian_to_polar(x: u.Quantity, y: u.Quantity) -> tuple[u.Quantity, u.Quantity]:
     x_value = x.to_value(u.arcsec)
     y_value = y.to_value(u.arcsec)
     radius = np.hypot(x_value, y_value)
@@ -386,7 +373,10 @@ def apply_ctot_blur(
     active_psfs = psfs_array[active].copy()
     work_shape = tuple(2 * size for size in psfs_array.shape[-2:])
     otfs = np.stack(
-        [image_plane_gaussian_otf(covariance_pix2[index], work_shape) for index in active]
+        [
+            image_plane_gaussian_otf(covariance_pix2[index], work_shape)
+            for index in active
+        ]
     )
     apply_finite_fov_otfs(active_psfs, otfs)
     psfs_array[active] = active_psfs
@@ -458,14 +448,16 @@ def image_plane_gaussian_otf(
     fx = np.fft.fftfreq(nx)
     fx_grid, fy_grid = np.meshgrid(fx, fy)
     covariance = 0.5 * (covariance_pix2 + covariance_pix2.T)
-    exponent = -2.0 * np.pi**2 * (
-        float(covariance[0, 0]) * fx_grid**2
-        + float(covariance[1, 1]) * fy_grid**2
-        + 2.0 * float(covariance[0, 1]) * fx_grid * fy_grid
+    exponent = (
+        -2.0
+        * np.pi**2
+        * (
+            float(covariance[0, 0]) * fx_grid**2
+            + float(covariance[1, 1]) * fy_grid**2
+            + 2.0 * float(covariance[0, 1]) * fx_grid * fy_grid
+        )
     )
-    phase = -2j * np.pi * (
-        float(mean[0]) * fx_grid + float(mean[1]) * fy_grid
-    )
+    phase = -2j * np.pi * (float(mean[0]) * fx_grid + float(mean[1]) * fy_grid)
     return np.exp(exponent + phase)
 
 
@@ -507,7 +499,9 @@ def _centered_pad(psf: np.ndarray, shape: tuple[int, int]) -> np.ndarray:
     source_y, source_x = psf.shape
     target_y, target_x = shape
     if target_y < source_y or target_x < source_x:
-        raise ValueError(f"Target padded shape {shape} cannot contain PSF shape {psf.shape}.")
+        raise ValueError(
+            f"Target padded shape {shape} cannot contain PSF shape {psf.shape}."
+        )
     before_y = (target_y - source_y) // 2
     before_x = (target_x - source_x) // 2
     return np.pad(
@@ -524,7 +518,9 @@ def _center_crop(psf: np.ndarray, shape: tuple[int, int]) -> np.ndarray:
     target_y, target_x = shape
     source_y, source_x = psf.shape
     if target_y > source_y or target_x > source_x:
-        raise ValueError(f"Target crop shape {shape} cannot exceed PSF shape {psf.shape}.")
+        raise ValueError(
+            f"Target crop shape {shape} cannot exceed PSF shape {psf.shape}."
+        )
     start_y = (source_y - target_y) // 2
     start_x = (source_x - target_x) // 2
     return psf[start_y : start_y + target_y, start_x : start_x + target_x]
@@ -553,14 +549,6 @@ def validate_ctot_shape(
         )
     if not np.all(np.isfinite(ctot.value)):
         raise ValueError(f"{label} contains non-finite values.")
-
-
-def _load_mavis_lo() -> Any:
-    try:
-        from mastsel import MavisLO
-    except Exception as exc:  # pragma: no cover - environment failure.
-        raise RuntimeError("MASTSEL is not importable; cannot run Hybrid AO PSF.") from exc
-    return MavisLO
 
 
 __all__ = [

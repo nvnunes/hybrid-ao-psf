@@ -8,7 +8,9 @@ from astropy import units as u
 
 from hybrid_ao_psf import (
     DiagnosticsLevel,
+    HybridCtotCorrection,
     HybridDiagnostics,
+    HybridMastselStatistics,
     HybridRequest,
     HybridResult,
     NgsHoMetricPrediction,
@@ -24,6 +26,44 @@ def _metadata() -> PsfMetadata:
         tel_diameter=8.0 * u.m,
         tel_pupil=np.ones((4, 4)) * u.dimensionless_unscaled,
     )
+
+
+def test_correction_owns_immutable_metadata_and_validates_definition() -> None:
+    metadata = {"fit": "fit.json"}
+    correction = HybridCtotCorrection(lambda ctot, context: None, metadata)
+    metadata["fit"] = "changed.json"
+    assert correction.provenance["fit"] == "fit.json"
+    with pytest.raises(TypeError):
+        correction.provenance["fit"] = "other"
+    with pytest.raises(FrozenInstanceError):
+        correction.apply = lambda ctot, context: ctot
+    with pytest.raises(TypeError, match="callable"):
+        HybridCtotCorrection(None)
+    with pytest.raises(TypeError, match="string-to-string"):
+        HybridCtotCorrection(lambda ctot, context: None, {"fit": 1})
+
+
+def test_mastsel_statistics_copy_and_freeze_arrays() -> None:
+    css = np.eye(4) * u.nm**2
+    cas = np.ones((3, 2, 4)) * u.nm**2
+    r = np.ones((3, 2, 4))
+    statistics = HybridMastselStatistics(css, cas, cas[0], r, css)
+    css[0, 0] = 99 * u.nm**2
+    r[0, 0, 0] = 99
+    assert statistics.ngs_covariance[0, 0] == 1 * u.nm**2
+    assert statistics.reconstructor[0, 0, 0] == 1
+    for value in (
+        statistics.ngs_covariance,
+        statistics.science_ngs_covariance,
+        statistics.centre_ngs_covariance,
+        statistics.reconstructor,
+        statistics.measurement_noise,
+    ):
+        assert not value.flags.writeable
+    with pytest.raises(ValueError, match="interleaved"):
+        replace(statistics, ngs_covariance=np.eye(3) * u.nm**2)
+    with pytest.raises(ValueError, match="shape"):
+        replace(statistics, measurement_noise=np.eye(2) * u.nm**2)
 
 
 def make_result(*, diagnostics: bool = True) -> HybridResult:
@@ -104,7 +144,9 @@ def test_request_groups_ngs_inputs_after_coordinates() -> None:
     assert [item.name for item in fields(HybridRequest)[:7]] == expected
     parameters = signature(HybridRequest).parameters
     assert list(parameters)[:7] == expected
-    assert all(parameter.kind is Parameter.KEYWORD_ONLY for parameter in parameters.values())
+    assert all(
+        parameter.kind is Parameter.KEYWORD_ONLY for parameter in parameters.values()
+    )
 
 
 def test_request_rejects_mismatched_ngs_vectors() -> None:
@@ -137,15 +179,26 @@ def test_request_requires_one_complete_ngs_input_path() -> None:
     with pytest.raises(ValueError, match="exactly one"):
         HybridRequest(**base)
     with pytest.raises(ValueError, match="exactly one"):
-        HybridRequest(**base, ngs_flux=flux, ngs_magnitude=magnitude, ngs_magnitude_zeropoint=zeropoint)
+        HybridRequest(
+            **base,
+            ngs_flux=flux,
+            ngs_magnitude=magnitude,
+            ngs_magnitude_zeropoint=zeropoint,
+        )
     with pytest.raises(ValueError, match="requires ngs_magnitude"):
         HybridRequest(**base, ngs_flux=flux, ngs_magnitude_zeropoint=zeropoint)
     with pytest.raises((TypeError, ValueError), match="ngs_magnitude_zeropoint"):
         HybridRequest(**base, ngs_magnitude=magnitude)
     with pytest.raises(ValueError, match="ngs_magnitude_zeropoint"):
-        HybridRequest(**base, ngs_magnitude=magnitude, ngs_magnitude_zeropoint=0.0 * zeropoint)
+        HybridRequest(
+            **base, ngs_magnitude=magnitude, ngs_magnitude_zeropoint=0.0 * zeropoint
+        )
     with pytest.raises(ValueError, match="identical shapes"):
-        HybridRequest(**base, ngs_magnitude=np.array([12.0, 13.0]) * u.mag, ngs_magnitude_zeropoint=zeropoint)
+        HybridRequest(
+            **base,
+            ngs_magnitude=np.array([12.0, 13.0]) * u.mag,
+            ngs_magnitude_zeropoint=zeropoint,
+        )
 
 
 def test_provider_prediction_owns_inputs() -> None:
@@ -174,7 +227,7 @@ def test_result_validates_diagnostic_shape() -> None:
                     ctot_angle_determinant_min=0.6875 * u.mas**4,
                     ctot_angle_determinant_max=0.6875 * u.mas**4,
                     ctot_angle_determinant_mean=0.6875 * u.mas**4,
-                    pre_blur_psfs=np.ones((1, 4, 4), dtype=np.float32)
+                    pre_blur_psfs=np.ones((1, 4, 4), dtype=np.float32),
                 ),
             }
         )

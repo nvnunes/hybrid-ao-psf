@@ -33,9 +33,15 @@ def test_result_hdf5_round_trip(tmp_path: Path) -> None:
 
     actual = load_result(path)
     np.testing.assert_array_equal(actual.psfs, expected.psfs)
-    np.testing.assert_array_equal(actual.metadata.tel_pupil, expected.metadata.tel_pupil)
-    np.testing.assert_allclose(actual.ctot_wavefront.to_value(u.nm**2), expected.ctot_wavefront.value)
-    np.testing.assert_allclose(actual.ngs_metrics.fwhm.to_value(u.mas), expected.ngs_metrics.fwhm.value)
+    np.testing.assert_array_equal(
+        actual.metadata.tel_pupil, expected.metadata.tel_pupil
+    )
+    np.testing.assert_allclose(
+        actual.ctot_wavefront.to_value(u.nm**2), expected.ctot_wavefront.value
+    )
+    np.testing.assert_allclose(
+        actual.ngs_metrics.fwhm.to_value(u.mas), expected.ngs_metrics.fwhm.value
+    )
     np.testing.assert_array_equal(actual.psd_clipped, expected.psd_clipped)
     assert actual.effective_mastsel_ini == expected.effective_mastsel_ini
     assert dict(actual.provenance) == dict(expected.provenance)
@@ -60,6 +66,18 @@ def test_result_hdf5_round_trip(tmp_path: Path) -> None:
     assert not actual.psfs.flags.writeable
 
 
+def test_correction_identity_round_trips_without_runtime_state(tmp_path):
+    expected = replace(
+        make_result(),
+        provenance={"ctot_corrections": "example", "fit_path": "/fits/fit.json"},
+    )
+    path = save_result(tmp_path / "corrected.h5", expected)
+    actual = load_result(path)
+    assert dict(actual.provenance) == dict(expected.provenance)
+    with h5py.File(path) as root:
+        assert "mastsel_statistics" not in root and "ctot_correction" not in root
+
+
 def test_magnitude_provenance_round_trip(tmp_path: Path) -> None:
     expected = replace(
         make_result(),
@@ -71,7 +89,9 @@ def test_magnitude_provenance_round_trip(tmp_path: Path) -> None:
         assert "result/ngs/magnitude" in root
         assert "result/ngs/magnitude_zeropoint" in root
     actual = load_result(path)
-    np.testing.assert_array_equal(actual.ngs_magnitude.value, expected.ngs_magnitude.value)
+    np.testing.assert_array_equal(
+        actual.ngs_magnitude.value, expected.ngs_magnitude.value
+    )
     assert actual.ngs_magnitude_zeropoint == expected.ngs_magnitude_zeropoint
 
 

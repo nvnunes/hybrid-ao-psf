@@ -10,6 +10,7 @@ Hybrid AO PSF owns:
 - science-HO-PSF and NGS-HO-metric interpolation products;
 - translation of Hybrid inputs into MASTSEL configuration;
 - MASTSEL low-order execution and Ctot interpretation;
+- a downstream field-wide Ctot hook with transient runtime/statistics context;
 - finite-field Ctot blur, jitter, and engine-level diagnostics; and
 - standalone combined-INI and versioned HDF5 result contracts.
 
@@ -57,6 +58,15 @@ immutable concrete provider types are
 preparation remain outside the stateless engine operation. The combined
 configuration boundary is `HybridConfiguration` plus `load_configuration()`;
 standalone results use `save_result()` and `load_result()`.
+
+`HybridCtotCorrection` pairs a callable with immutable static provenance.
+`HybridCtotContext` borrows the live runtime and resolved inputs;
+`HybridMastselStatistics` exposes read-only mathematical baseline quantities.
+The private MASTSEL adapter owns runtime construction, instance-local capture
+and fixed-gain noise recovery. It does not modify MASTSEL itself. Correction
+models and calibration selection stay with the caller. The engine invokes the
+callback before conditioning and its single Gaussian blur; it persists only the
+supplied static provenance. See the [API guide](api.md#covariance-corrections).
 
 `simulate()` is the sole complete scientific simulation path. It is stateless,
 borrows its immutable providers, owns MASTSEL translation and execution, and

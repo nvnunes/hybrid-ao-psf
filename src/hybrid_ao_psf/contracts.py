@@ -2,15 +2,18 @@
 
 from __future__ import annotations
 
-from collections.abc import Mapping
+from collections.abc import Callable, Mapping
 from dataclasses import dataclass, field
 from enum import StrEnum
 from types import MappingProxyType
-from typing import Protocol, runtime_checkable
+from typing import TYPE_CHECKING, Protocol, runtime_checkable
 
 import numpy as np
 from ao_stats import PsfMetadata
 from astropy import units as u
+
+if TYPE_CHECKING:
+    from mastsel import MavisLO
 
 # Calibrated against released MASTSEL output. Negative eigenvalues at or below
 # this magnitude represent a material covariance failure in nm^2.
@@ -238,6 +241,165 @@ class HybridRequest:
 
 
 @dataclass(frozen=True)
+class HybridMastselStatistics:
+    """Read-only snapshots of the baseline's mathematical LO quantities.
+
+    Covariances use nm² and interleaved NGS x/y ordering. No sensor or symbolic
+    implementation objects are exposed. This record is transient, not persisted.
+
+    Attributes:
+        ngs_covariance: Css, shape ``(2*NGS, 2*NGS)``.
+        science_ngs_covariance: Cas, shape ``(Nscience, 2, 2*NGS)``.
+        centre_ngs_covariance: Centre Cas, shape ``(2, 2*NGS)``; may be
+            absent for one NGS when the science field omits the centre.
+        reconstructor: Exact baseline R blocks, dimensionless, shape
+            ``(Nscience, 2, 2*NGS)``.
+        measurement_noise: Filtered NGS noise-only covariance, shape
+            ``(2*NGS, 2*NGS)``; absent for non-fixed controller gain.
+    """
+
+    ngs_covariance: u.Quantity
+    science_ngs_covariance: u.Quantity
+    centre_ngs_covariance: u.Quantity | None
+    reconstructor: np.ndarray
+    measurement_noise: u.Quantity | None
+
+    def __post_init__(self) -> None:
+        css = _readonly_quantity(self.ngs_covariance, u.nm**2, "ngs_covariance", ndim=2)
+        cas = _readonly_quantity(
+            self.science_ngs_covariance, u.nm**2, "science_ngs_covariance", ndim=3
+        )
+        r = _readonly_array(
+            self.reconstructor, dtype=float, label="reconstructor", ndim=3
+        )
+        size = css.shape[0]
+        if size % 2 or css.shape != (size, size) or cas.shape[1:] != (2, size):
+            raise ValueError("MASTSEL covariances require interleaved NGS x/y axes.")
+        if r.shape != cas.shape:
+            raise ValueError(
+                "Reconstructor blocks must match science/NGS covariance shape."
+            )
+        object.__setattr__(self, "ngs_covariance", css)
+        object.__setattr__(self, "science_ngs_covariance", cas)
+        object.__setattr__(self, "reconstructor", r)
+        for name, expected in (
+            ("centre_ngs_covariance", (2, size)),
+            ("measurement_noise", (size, size)),
+        ):
+            value = getattr(self, name)
+            if value is not None:
+                value = _readonly_quantity(value, u.nm**2, name, ndim=2)
+                if value.shape != expected:
+                    raise ValueError(f"{name} must have shape {expected}.")
+                object.__setattr__(self, name, value)
+
+
+@dataclass(frozen=True)
+class HybridCtotContext:
+    """Borrowed runtime context valid only during a Ctot correction call.
+
+    Do not retain, serialize or mutate the runtime or its resolved inputs.
+    Hybrid AO PSF owns MASTSEL internals; downstream code should consume the
+    mathematical statistics rather than re-evaluating the baseline.
+
+    Attributes:
+        mastsel: Live MavisLO instance that calculated baseline Ctot.
+        mastsel_statistics: Captured baseline statistics; absent during private
+            preparation or when no correction definition is supplied.
+        angle_to_wavefront_scale: Positive scalar conversion in nm/mas.
+        request: Immutable request with active NGS and science coordinates.
+        ngs_metrics: The interpolated metrics supplied to baseline MASTSEL.
+        ngs_flux: Effective per-NGS photon rates, in photon/s.
+        ngs_frame_rate: Resolved per-NGS frame rates, in Hz.
+        effective_mastsel_ini: Complete configuration used by the live runtime.
+    """
+
+    mastsel: MavisLO
+    mastsel_statistics: HybridMastselStatistics | None
+    angle_to_wavefront_scale: u.Quantity
+    request: HybridRequest
+    ngs_metrics: NgsHoMetricPrediction
+    ngs_flux: u.Quantity
+    ngs_frame_rate: u.Quantity
+    effective_mastsel_ini: str
+
+    def __post_init__(self) -> None:
+        if not isinstance(self.request, HybridRequest):
+            raise TypeError("request must be a HybridRequest.")
+        if not isinstance(self.ngs_metrics, NgsHoMetricPrediction):
+            raise TypeError("ngs_metrics must be an NgsHoMetricPrediction.")
+        size = self.request.ngs_x.size
+        if self.ngs_metrics.ee.size != size:
+            raise ValueError("NGS metrics must match the request's active NGS.")
+        object.__setattr__(
+            self,
+            "angle_to_wavefront_scale",
+            _positive_scalar(
+                self.angle_to_wavefront_scale, u.nm / u.mas, "angle_to_wavefront_scale"
+            ),
+        )
+        for name, unit in (("ngs_flux", u.photon / u.s), ("ngs_frame_rate", u.Hz)):
+            object.__setattr__(
+                self,
+                name,
+                _vector_with_length(
+                    getattr(self, name), unit, name, size, positive=True
+                ),
+            )
+        if (
+            not isinstance(self.effective_mastsel_ini, str)
+            or not self.effective_mastsel_ini.strip()
+        ):
+            raise ValueError(
+                "effective_mastsel_ini must be nonempty configuration text."
+            )
+        statistics = self.mastsel_statistics
+        if statistics is not None:
+            if not isinstance(statistics, HybridMastselStatistics):
+                raise TypeError(
+                    "mastsel_statistics must be HybridMastselStatistics or None."
+                )
+            if statistics.science_ngs_covariance.shape != (
+                self.request.science_x.size,
+                2,
+                2 * size,
+            ):
+                raise ValueError(
+                    "MASTSEL statistics must match the request's field and NGS."
+                )
+
+
+@dataclass(frozen=True)
+class HybridCtotCorrection:
+    """A field-wide covariance callback paired with its static provenance.
+
+    Attributes:
+        apply: Callable ``apply(ctot, context)`` receiving unconditioned
+            ``(Nscience, 2, 2)`` baseline Ctot in nm² and a borrowed live context.
+            Return a replacement Quantity convertible to nm² with identical
+            shape/order, or None for no change. Do not mutate borrowed inputs.
+            Exceptions propagate; conditioning and the single blur stay in
+            the engine.
+        provenance: String-to-string mapping copied and frozen at construction.
+            Describes configured identity even if apply returns None; keys must
+            not collide with engine provenance. Not computed per science point.
+    """
+
+    apply: Callable[[u.Quantity, HybridCtotContext], u.Quantity | None]
+    provenance: Mapping[str, str] = field(default_factory=dict)
+
+    def __post_init__(self) -> None:
+        if not callable(self.apply):
+            raise TypeError("apply must be callable.")
+        if not isinstance(self.provenance, Mapping) or any(
+            not isinstance(key, str) or not isinstance(value, str)
+            for key, value in self.provenance.items()
+        ):
+            raise TypeError("Correction provenance must be a string-to-string mapping.")
+        object.__setattr__(self, "provenance", MappingProxyType(dict(self.provenance)))
+
+
+@dataclass(frozen=True)
 class HybridDiagnostics:
     """Optional scientific validation summaries and debug products.
 
@@ -268,12 +430,8 @@ class HybridDiagnostics:
             label="psd_valid_mask",
             ndim=1,
         )
-        trace_min = _scalar(
-            self.ctot_angle_trace_min, u.mas**2, "ctot_angle_trace_min"
-        )
-        trace_max = _scalar(
-            self.ctot_angle_trace_max, u.mas**2, "ctot_angle_trace_max"
-        )
+        trace_min = _scalar(self.ctot_angle_trace_min, u.mas**2, "ctot_angle_trace_min")
+        trace_max = _scalar(self.ctot_angle_trace_max, u.mas**2, "ctot_angle_trace_max")
         trace_mean = _scalar(
             self.ctot_angle_trace_mean, u.mas**2, "ctot_angle_trace_mean"
         )
@@ -421,7 +579,9 @@ class HybridResult:
             self.ngs_flux, u.photon / u.s, "ngs_flux", num_ngs, positive=True
         )
         if (self.ngs_magnitude is None) != (self.ngs_magnitude_zeropoint is None):
-            raise ValueError("ngs_magnitude and ngs_magnitude_zeropoint must be paired.")
+            raise ValueError(
+                "ngs_magnitude and ngs_magnitude_zeropoint must be paired."
+            )
         ngs_magnitude = None
         zeropoint = None
         if self.ngs_magnitude is not None:
@@ -448,7 +608,9 @@ class HybridResult:
             rtol=1.0e-6,
             atol=1.0e-6,
         ):
-            raise ValueError("jitter must equal the radial jitter derived from ctot_angle.")
+            raise ValueError(
+                "jitter must equal the radial jitter derived from ctot_angle."
+            )
         psd_clipped = _readonly_array(
             self.psd_clipped, dtype=bool, label="psd_clipped", ndim=1
         )
@@ -597,9 +759,9 @@ def _psd_valid_mask(ctot_wavefront: u.Quantity) -> np.ndarray:
     values = ctot_wavefront.to_value(u.nm**2)
     symmetric = 0.5 * (values + np.swapaxes(values, -1, -2))
     eigenvalues = np.linalg.eigvalsh(symmetric)
-    return np.all(
-        eigenvalues >= -CTOT_PSD_TOLERANCE_NM2, axis=1
-    ) & np.any(eigenvalues > 1.0e-12, axis=1)
+    return np.all(eigenvalues >= -CTOT_PSD_TOLERANCE_NM2, axis=1) & np.any(
+        eigenvalues > 1.0e-12, axis=1
+    )
 
 
 def _ctot_angle_summaries(ctot_angle: u.Quantity) -> dict[str, u.Quantity]:
@@ -626,9 +788,7 @@ def _readonly_metadata(metadata: PsfMetadata, *, num_psfs: int) -> PsfMetadata:
     pixel_scale = _shared_or_vector(
         metadata.pixel_scale, u.mas, "metadata.pixel_scale", num_psfs
     )
-    tel_diameter = _positive_scalar(
-        metadata.tel_diameter, u.m, "metadata.tel_diameter"
-    )
+    tel_diameter = _positive_scalar(metadata.tel_diameter, u.m, "metadata.tel_diameter")
     tel_pupil = _readonly_quantity(
         metadata.tel_pupil,
         u.dimensionless_unscaled,
@@ -676,7 +836,9 @@ def _quantity_mapping(
     for raw_name, raw_value in value.items():
         name = str(raw_name).strip()
         if not name or "/" in name:
-            raise ValueError(f"{label} names must be non-empty and must not contain '/'.")
+            raise ValueError(
+                f"{label} names must be non-empty and must not contain '/'."
+            )
         if not isinstance(raw_value, u.Quantity):
             raise TypeError(f"{label}[{name!r}] must be an Astropy Quantity.")
         array = np.array(raw_value.value, copy=True)
@@ -691,7 +853,10 @@ def _quantity_mapping(
 
 __all__ = [
     "DiagnosticsLevel",
+    "HybridCtotContext",
+    "HybridCtotCorrection",
     "HybridDiagnostics",
+    "HybridMastselStatistics",
     "HybridRequest",
     "HybridResult",
     "NgsHoMetricPrediction",

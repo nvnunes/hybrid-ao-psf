@@ -49,12 +49,66 @@ contract described in [Result files](results.md).
 
 ## Simulation
 
-`simulate(request, science_provider, ngs_provider)` is the one stateless
+`simulate(request, science_provider, ngs_provider, *, ctot_correction=None)` is the one stateless
 scientific operation. It evaluates both loaded providers, creates the effective
 MASTSEL configuration, computes and validates Ctot, applies the finite-field
 blur, derives jitter, and returns `HybridResult`. Providers are borrowed and
 may be reused across calls. See [Engine](engine.md) for the Ctot and diagnostic
 policies.
+
+### Covariance Corrections
+
+Supply a `HybridCtotCorrection` to replace the field-wide baseline covariance
+before conditioning and the existing single Gaussian blur. The callable receives
+`(Nscience, 2, 2)` unconditioned Ctot in `nm2` and a `HybridCtotContext`.
+Return a new Quantity convertible to `nm2` with the same shape/order, or `None`
+for no change. Do not mutate inputs. Exceptions propagate; the engine still owns
+PSD conditioning, convolution and all result diagnostics.
+
+The context borrows the live MASTSEL runtime until the callback returns. It
+contains the resolved request, interpolated NGS metrics, effective flux and
+frame rates, effective INI, and angular-to-wavefront scale. Its
+`HybridMastselStatistics` contains read-only Css, Cas, centre Cas, exact
+science-position reconstructor blocks and filtered NGS measurement-noise
+covariance. Covariances are in `nm2`, axes are interleaved NGS `(x, y)`, and
+reconstructors are dimensionless. Noise is available for fixed controller gain;
+otherwise it is `None`. These snapshots and the live runtime are not persisted.
+Do not retain the context or re-evaluate baseline MASTSEL from the callback.
+
+This example doubles Ctot using the providers and request from a combined INI.
+First build the sample products from the project root:
+
+```bash
+./.conda/bin/python examples/build_sample_artifacts.py
+```
+
+```python
+from hybrid_ao_psf import (
+    HybridCtotCorrection,
+    load_configuration,
+    load_ngs_ho_metric_interpolator,
+    load_science_ho_psf_interpolator,
+    simulate,
+)
+
+configuration = load_configuration("examples/hybrid.ini")
+correction = HybridCtotCorrection(
+    apply=lambda ctot, context: 2 * ctot,
+    provenance={"ctot_scale": "2"},
+)
+result = simulate(
+    configuration.request,
+    load_science_ho_psf_interpolator(configuration.science_psf_artifact),
+    load_ngs_ho_metric_interpolator(configuration.ngs_metric_artifact),
+    ctot_correction=correction,
+)
+```
+
+The definition copies/freezes its string-to-string provenance. The engine
+merges it into result provenance even when the callback returns `None`, and
+rejects collisions with engine-owned keys. `save_result()` and `load_result()`
+preserve this metadata, not the callable or runtime. No correction is enabled
+by default, and the INI/CLI does not select one.
 
 `blur_psfs_with_ctot(psfs, ctot_wavefront, *, pixel_scale,
 angle_to_wavefront_scale)` is a narrower public operation for externally

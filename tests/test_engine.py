@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, replace
+from pathlib import Path
 
 import numpy as np
 import pytest
@@ -13,10 +14,12 @@ from ngs_photometry import (
 
 from hybrid_ao_psf import (
     DiagnosticsLevel,
+    HybridCtotCorrection,
     HybridRequest,
     NgsHoMetricPrediction,
     NonPsdPolicy,
     ScienceHoPsfPrediction,
+    _mastsel,
     apply_finite_fov_otfs,
     blur_psfs_with_ctot,
     engine,
@@ -105,6 +108,237 @@ def _providers() -> tuple[_ScienceProvider, _NgsProvider]:
     return science, ngs
 
 
+@pytest.fixture
+def hook_runtime(monkeypatch):
+    """A deterministic runtime exposing the same baseline method boundaries."""
+    instances = []
+
+    class Runtime:
+        error = False
+        mas2nm = 2.0
+        LoopGain_LO = 0.3
+        loopDelaySteps_LO = 2
+        noNoise = False
+        NumberLenslets = (1, 1)
+        PixelScale_LO = (270.0, 280.0)
+        N_sa_tot_LO = (1, 1)
+
+        def __init__(self, directory, name, **kwargs):
+            self.path = Path(directory) / f"{name}.ini"
+            self.calls = {"total": 0, "covariance": 0, "reconstructor": 0}
+            self.bias = [0.7, 0.8]
+            self.avar = [(0.01, 0.02), (0.02, 0.03)]
+            instances.append(self)
+
+        def computeCovMatrices(self, science, ngs):
+            self.calls["covariance"] += 1
+            cas = np.tile(np.arange(2 * len(ngs)), (2 * len(science), 1)) + 10
+            return np.eye(2), cas, np.eye(2 * len(ngs)) * 100
+
+        def buildReconstuctor2(self, science, ngs, **kwargs):
+            self.calls["reconstructor"] += 1
+            r = (
+                np.arange(4 * len(science) * len(ngs)).reshape(
+                    2 * len(science), 2 * len(ngs)
+                )
+                / 100
+            )
+            return r, r.T
+
+        def computeTotalResidualMatrix(self, science, ngs, *args, **kwargs):
+            self.calls["total"] += 1
+            assert self.path.exists()
+            self.computeCovMatrices(science, ngs)
+            self.buildReconstuctor2(science, ngs)
+            return np.array([[[100, 20], [20, 400]], [[200, -30], [-30, 500]]])
+
+    monkeypatch.setattr(_mastsel, "_load_mavis_lo", lambda: Runtime)
+    return Runtime, instances
+
+
+def test_noop_preserves_complete_result_and_runtime_lifetime(hook_runtime):
+    _, instances = hook_runtime
+    science, ngs = _providers()
+    baseline = engine.simulate(_request(), science, ngs)
+    calls = []
+
+    def noop(ctot, context):
+        calls.append(context)
+        assert context.mastsel is instances[-1]
+        assert context.mastsel.path.read_text() == context.effective_mastsel_ini
+        assert not ctot.flags.writeable
+        statistics = context.mastsel_statistics
+        np.testing.assert_array_equal(
+            statistics.reconstructor, np.arange(16).reshape(2, 2, 4) / 100
+        )
+        np.testing.assert_array_equal(
+            statistics.centre_ngs_covariance, statistics.science_ngs_covariance[0]
+        )
+        assert statistics.measurement_noise.shape == (4, 4)
+        assert "computeCovMatrices" not in context.mastsel.__dict__
+
+    actual = engine.simulate(
+        _request(),
+        science,
+        ngs,
+        ctot_correction=HybridCtotCorrection(noop, {"fit": "fit.json"}),
+    )
+    assert len(calls) == 1 and len(instances) == 2
+    for name in ("psfs", "ctot_wavefront", "ctot_angle", "jitter", "psd_clipped"):
+        np.testing.assert_array_equal(getattr(actual, name), getattr(baseline, name))
+    assert actual.provenance["fit"] == "fit.json"
+    assert instances[-1].calls == {"total": 1, "covariance": 1, "reconstructor": 1}
+    assert not instances[-1].path.exists()
+
+
+def test_doubling_uses_one_effective_covariance_for_blur_and_diagnostics(hook_runtime):
+    _, instances = hook_runtime
+    science, ngs = _providers()
+    baseline = engine.simulate(_request(), science, ngs)
+    actual = engine.simulate(
+        _request(),
+        science,
+        ngs,
+        ctot_correction=HybridCtotCorrection(
+            lambda ctot, context: (2 * ctot).to(u.um**2)
+        ),
+    )
+    np.testing.assert_allclose(actual.ctot_wavefront, 2 * baseline.ctot_wavefront)
+    np.testing.assert_allclose(actual.jitter, np.sqrt(2) * baseline.jitter)
+    np.testing.assert_allclose(
+        actual.ctot_angle.to_value(u.mas**2).trace(axis1=1, axis2=2), [250, 350]
+    )
+    expected = blur_psfs_with_ctot(
+        science.prediction.psfs,
+        2 * baseline.ctot_wavefront,
+        pixel_scale=science.prediction.pixel_scale,
+        angle_to_wavefront_scale=baseline.angle_to_wavefront_scale,
+    )
+    np.testing.assert_array_equal(actual.psfs, expected)
+    assert actual.diagnostics.ctot_angle_trace_mean == 300 * u.mas**2
+    assert instances[-1].calls["total"] == 1
+
+
+@pytest.mark.parametrize(
+    "replacement, error",
+    [
+        (np.eye(2), TypeError),
+        (np.zeros((1, 2, 2)) * u.nm**2, ValueError),
+        (np.zeros((2, 2, 2)) * u.mas**2, u.UnitConversionError),
+        (np.full((2, 2, 2), np.nan) * u.nm**2, ValueError),
+    ],
+)
+def test_invalid_correction_rejects_and_cleans_up(hook_runtime, replacement, error):
+    _, instances = hook_runtime
+    with pytest.raises(error):
+        engine.simulate(
+            _request(),
+            *_providers(),
+            ctot_correction=HybridCtotCorrection(lambda ctot, context: replacement),
+        )
+    assert not instances[-1].path.exists()
+    assert "computeCovMatrices" not in instances[-1].__dict__
+
+
+@pytest.mark.parametrize("policy", [NonPsdPolicy.ERROR, NonPsdPolicy.CLIP])
+def test_corrected_covariance_obeys_existing_psd_policy(hook_runtime, policy):
+    corrected = np.array([[[-1, 0], [0, 100]]] * 2) * u.nm**2
+    kwargs = {"ctot_correction": HybridCtotCorrection(lambda ctot, context: corrected)}
+    if policy is NonPsdPolicy.ERROR:
+        with pytest.raises(ValueError, match="materially"):
+            engine.simulate(_request(policy=policy), *_providers(), **kwargs)
+    else:
+        result = engine.simulate(_request(policy=policy), *_providers(), **kwargs)
+        np.testing.assert_array_equal(result.psd_clipped, [True, True])
+        np.testing.assert_array_equal(result.ctot_wavefront.value[:, 0, 0], [0, 0])
+
+
+@pytest.mark.parametrize("stage", ["baseline", "correction"])
+def test_failures_restore_instance_bindings_and_configuration(hook_runtime, stage):
+    runtime, instances = hook_runtime
+    original_init = runtime.__init__
+
+    def initialize(self, *args, **kwargs):
+        original_init(self, *args, **kwargs)
+        self.computeCovMatrices = self.computeCovMatrices
+        self.original_covariance = self.computeCovMatrices
+
+    runtime.__init__ = initialize
+
+    def fail(*args, **kwargs):
+        raise RuntimeError("intentional failure")
+
+    if stage == "baseline":
+        runtime.computeTotalResidualMatrix = fail
+    with pytest.raises(RuntimeError, match="intentional"):
+        engine.simulate(
+            _request(), *_providers(), ctot_correction=HybridCtotCorrection(fail)
+        )
+    model = instances[-1]
+    assert model.computeCovMatrices is model.original_covariance
+    assert "buildReconstuctor2" not in model.__dict__
+    assert not model.path.exists()
+
+
+@pytest.mark.parametrize("count", [1, 2])
+def test_centre_missing_adds_only_required_covariance(hook_runtime, count):
+    _, instances = hook_runtime
+    request = replace(
+        _request(),
+        science_x=np.array([3, 4]) * u.arcsec,
+        ngs_x=_request().ngs_x[:count],
+        ngs_y=_request().ngs_y[:count],
+        ngs_flux=_request().ngs_flux[:count],
+    )
+    science, ngs = _providers()
+    ngs = _NgsProvider(
+        NgsHoMetricPrediction(
+            ngs.prediction.ee[:count],
+            ngs.prediction.fwhm[:count],
+            ngs.prediction.sr[:count],
+        )
+    )
+
+    def noop(ctot, context):
+        assert (context.mastsel_statistics.centre_ngs_covariance is None) == (
+            count == 1
+        )
+
+    engine.simulate(request, science, ngs, ctot_correction=HybridCtotCorrection(noop))
+    assert instances[-1].calls == {"total": 1, "covariance": count, "reconstructor": 1}
+
+
+def test_nonfixed_gain_does_not_disable_generic_hook(hook_runtime):
+    runtime, _ = hook_runtime
+    runtime.LoopGain_LO = "optimize"
+
+    def double(ctot, context):
+        assert context.mastsel_statistics.measurement_noise is None
+        return 2 * ctot
+
+    result = engine.simulate(
+        _request(), *_providers(), ctot_correction=HybridCtotCorrection(double)
+    )
+    np.testing.assert_array_equal(result.ctot_wavefront.value[:, 0, 0], [200, 400])
+
+
+def test_provenance_collision_and_invalid_hook_fail_before_runtime(hook_runtime):
+    _, instances = hook_runtime
+    with pytest.raises(ValueError, match="collides"):
+        engine.simulate(
+            _request(),
+            *_providers(),
+            ctot_correction=HybridCtotCorrection(
+                lambda ctot, context: None, {"science_provider": "other"}
+            ),
+        )
+    with pytest.raises(TypeError, match="ctot_correction"):
+        engine.simulate(
+            _request(), *_providers(), ctot_correction=lambda ctot, context: None
+        )
+    assert not instances
+
+
 def test_simulate_builds_owned_result_and_passes_resolved_mastsel_inputs(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -117,12 +351,14 @@ def test_simulate_builds_owned_result_and_passes_resolved_mastsel_inputs(
         def __init__(self, path: str, name: str, *, verbose: bool) -> None:
             calls["constructor"] = (path, name, verbose)
 
-        def computeTotalResidualMatrix(self, *args: object, **kwargs: object) -> np.ndarray:
+        def computeTotalResidualMatrix(
+            self, *args: object, **kwargs: object
+        ) -> np.ndarray:
             calls["args"] = args
             calls["kwargs"] = kwargs
             return np.stack([400.0 * np.eye(2), 800.0 * np.eye(2)])
 
-    monkeypatch.setattr(engine, "_load_mavis_lo", lambda: FakeMavisLO)
+    monkeypatch.setattr(_mastsel, "_load_mavis_lo", lambda: FakeMavisLO)
     science, ngs = _providers()
     result = engine.simulate(_request(), science, ngs)
 
@@ -148,7 +384,9 @@ def test_simulate_builds_owned_result_and_passes_resolved_mastsel_inputs(
     assert result.metadata.pixel_scale == 8.0 * u.mas
     np.testing.assert_allclose(result.jitter.to_value(u.mas), [np.sqrt(200.0), 20.0])
     assert result.diagnostics is not None
-    np.testing.assert_array_equal(result.diagnostics.pre_blur_psfs, science.prediction.psfs)
+    np.testing.assert_array_equal(
+        result.diagnostics.pre_blur_psfs, science.prediction.psfs
+    )
     np.testing.assert_array_equal(result.diagnostics.psd_valid_mask, [True, True])
     assert result.diagnostics.psd_valid_count == 2
     assert result.diagnostics.ctot_angle_trace_min == 200.0 * u.mas**2
@@ -176,11 +414,13 @@ def test_magnitude_request_resolves_the_same_flux_and_psf_as_direct_flux(
         def __init__(self, path: str, name: str, *, verbose: bool) -> None:
             pass
 
-        def computeTotalResidualMatrix(self, *args: object, **kwargs: object) -> np.ndarray:
+        def computeTotalResidualMatrix(
+            self, *args: object, **kwargs: object
+        ) -> np.ndarray:
             calls.append(np.asarray(args[2]))
             return np.stack([400.0 * np.eye(2), 800.0 * np.eye(2)])
 
-    monkeypatch.setattr(engine, "_load_mavis_lo", lambda: FakeMavisLO)
+    monkeypatch.setattr(_mastsel, "_load_mavis_lo", lambda: FakeMavisLO)
     zeropoint = 6_277_173_913.043478 * u.photon / (u.m**2 * u.s)
     magnitudes = np.array([12.0, 15.0]) * u.mag
     photometry = WFSPhotometryConfig(
@@ -191,7 +431,9 @@ def test_magnitude_request_resolves_the_same_flux_and_psf_as_direct_flux(
     )
     expected_flux = magnitudes_to_effective_photons_per_second(magnitudes, photometry)
     base = _request()
-    ini = base.mastsel_ini.replace("ZenithAngle = 0.0", "ZenithAngle = 0.0\nTelescopeDiameter = 8.0")
+    ini = base.mastsel_ini.replace(
+        "ZenithAngle = 0.0", "ZenithAngle = 0.0\nTelescopeDiameter = 8.0"
+    )
     magnitude_request = replace(
         base,
         mastsel_ini=ini,
@@ -201,13 +443,19 @@ def test_magnitude_request_resolves_the_same_flux_and_psf_as_direct_flux(
     )
     science, ngs = _providers()
     magnitude_result = engine.simulate(magnitude_request, science, ngs)
-    direct_result = engine.simulate(replace(base, mastsel_ini=ini, ngs_flux=expected_flux), science, ngs)
+    direct_result = engine.simulate(
+        replace(base, mastsel_ini=ini, ngs_flux=expected_flux), science, ngs
+    )
     np.testing.assert_allclose(calls[0], expected_flux.to_value(u.photon / u.s))
     np.testing.assert_array_equal(calls[0], calls[1])
-    np.testing.assert_array_equal(magnitude_result.ctot_wavefront.value, direct_result.ctot_wavefront.value)
+    np.testing.assert_array_equal(
+        magnitude_result.ctot_wavefront.value, direct_result.ctot_wavefront.value
+    )
     np.testing.assert_array_equal(magnitude_result.psfs, direct_result.psfs)
     assert magnitude_result.ngs_magnitude is not None
-    np.testing.assert_array_equal(magnitude_result.ngs_magnitude.value, magnitudes.value)
+    np.testing.assert_array_equal(
+        magnitude_result.ngs_magnitude.value, magnitudes.value
+    )
     assert magnitude_result.ngs_magnitude_zeropoint == zeropoint
     assert direct_result.ngs_magnitude is None
 
@@ -230,12 +478,14 @@ def test_directional_field_pairs_and_covariance_axes_reach_mastsel(
         def __init__(self, *_: object, **__: object) -> None:
             pass
 
-        def computeTotalResidualMatrix(self, science, ngs, *_: object, **__: object) -> np.ndarray:
+        def computeTotalResidualMatrix(
+            self, science, ngs, *_: object, **__: object
+        ) -> np.ndarray:
             calls["science"] = np.asarray(science)
             calls["ngs"] = np.asarray(ngs)
             return ctot
 
-    monkeypatch.setattr(engine, "_load_mavis_lo", lambda: FakeMavisLO)
+    monkeypatch.setattr(_mastsel, "_load_mavis_lo", lambda: FakeMavisLO)
     request = replace(
         _request(),
         science_x=np.array([12.0, -4.0]) * u.arcsec,
@@ -277,7 +527,7 @@ def test_simulate_uses_frame_rate_from_ini(monkeypatch: pytest.MonkeyPatch) -> N
             calls["frame_rate"] = np.asarray(args[3], dtype=float)
             return np.stack([400.0 * np.eye(2), 800.0 * np.eye(2)])
 
-    monkeypatch.setattr(engine, "_load_mavis_lo", lambda: FakeMavisLO)
+    monkeypatch.setattr(_mastsel, "_load_mavis_lo", lambda: FakeMavisLO)
     science, ngs = _providers()
     result = engine.simulate(_request(frame_rate="250.0"), science, ngs)
 
@@ -316,7 +566,7 @@ def test_validation_diagnostics_omit_pre_blur_psfs(
         def computeTotalResidualMatrix(self, *_: object, **__: object) -> np.ndarray:
             return np.stack([400.0 * np.eye(2), 800.0 * np.eye(2)])
 
-    monkeypatch.setattr(engine, "_load_mavis_lo", lambda: FakeMavisLO)
+    monkeypatch.setattr(_mastsel, "_load_mavis_lo", lambda: FakeMavisLO)
     science, ngs = _providers()
 
     result = engine.simulate(
@@ -341,12 +591,10 @@ def test_none_diagnostics_omits_diagnostics(
         def computeTotalResidualMatrix(self, *_: object, **__: object) -> np.ndarray:
             return np.stack([400.0 * np.eye(2), 800.0 * np.eye(2)])
 
-    monkeypatch.setattr(engine, "_load_mavis_lo", lambda: FakeMavisLO)
+    monkeypatch.setattr(_mastsel, "_load_mavis_lo", lambda: FakeMavisLO)
     science, ngs = _providers()
 
-    result = engine.simulate(
-        _request(diagnostics=DiagnosticsLevel.NONE), science, ngs
-    )
+    result = engine.simulate(_request(diagnostics=DiagnosticsLevel.NONE), science, ngs)
 
     assert result.diagnostics is None
 
@@ -373,7 +621,7 @@ def test_rotated_roundoff_ctot_remains_active_after_conditioning(
         def computeTotalResidualMatrix(self, *_: object, **__: object) -> np.ndarray:
             return np.stack([raw_ctot, raw_ctot])
 
-    monkeypatch.setattr(engine, "_load_mavis_lo", lambda: FakeMavisLO)
+    monkeypatch.setattr(_mastsel, "_load_mavis_lo", lambda: FakeMavisLO)
     science, ngs = _providers()
 
     result = engine.simulate(
@@ -386,17 +634,23 @@ def test_rotated_roundoff_ctot_remains_active_after_conditioning(
     assert not np.array_equal(result.psfs, science.prediction.psfs)
 
 
-def test_condition_ctot_distinguishes_numerical_and_material_negative_eigenvalues() -> None:
+def test_condition_ctot_distinguishes_numerical_and_material_negative_eigenvalues() -> (
+    None
+):
     numerical = np.array([[[-0.5e-9, 0.0], [0.0, 2.0]]]) * u.nm**2
     conditioned, clipped = engine.condition_ctot(numerical)
-    np.testing.assert_allclose(conditioned.to_value(u.nm**2), [[[0.0, 0.0], [0.0, 2.0]]])
+    np.testing.assert_allclose(
+        conditioned.to_value(u.nm**2), [[[0.0, 0.0], [0.0, 2.0]]]
+    )
     np.testing.assert_array_equal(clipped, [True])
 
     material = np.array([[[-1.0, 0.0], [0.0, 2.0]]]) * u.nm**2
     with pytest.raises(ValueError, match="materially non-positive-semidefinite"):
         engine.condition_ctot(material, policy="error")
     conditioned, clipped = engine.condition_ctot(material, policy="clip")
-    np.testing.assert_allclose(conditioned.to_value(u.nm**2), [[[0.0, 0.0], [0.0, 2.0]]])
+    np.testing.assert_allclose(
+        conditioned.to_value(u.nm**2), [[[0.0, 0.0], [0.0, 2.0]]]
+    )
     np.testing.assert_array_equal(clipped, [True])
 
 
@@ -488,10 +742,9 @@ def test_finite_field_otf_applies_mean_shift_without_renormalizing() -> None:
 def test_directional_covariance_blurs_x_columns_and_y_rows() -> None:
     yy, xx = np.indices((65, 65), dtype=float)
     psfs = np.zeros((1, 65, 65), dtype=np.float32)
-    psfs[0] = (
-        np.exp(-((xx - 34.0) ** 2 + (yy - 29.0) ** 2) / (2.0 * 1.7**2))
-        + 0.2 * np.exp(-((xx - 28.0) ** 2 + (yy - 36.0) ** 2) / (2.0 * 1.7**2))
-    )
+    psfs[0] = np.exp(
+        -((xx - 34.0) ** 2 + (yy - 29.0) ** 2) / (2.0 * 1.7**2)
+    ) + 0.2 * np.exp(-((xx - 28.0) ** 2 + (yy - 36.0) ** 2) / (2.0 * 1.7**2))
     ctot_xy = np.array([[[4.0, 1.2], [1.2, 1.0]]])
 
     blurred = blur_psfs_with_ctot(
@@ -512,4 +765,6 @@ def test_directional_covariance_blurs_x_columns_and_y_rows() -> None:
             ]
         )
 
-    np.testing.assert_allclose(moments(blurred[0]) - moments(psfs[0]), ctot_xy[0], atol=2.0e-4)
+    np.testing.assert_allclose(
+        moments(blurred[0]) - moments(psfs[0]), ctot_xy[0], atol=2.0e-4
+    )

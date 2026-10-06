@@ -11,9 +11,13 @@ from astropy import units as u
 from ngs_photometry import WFSPhotometryConfig, photons_per_frame_to_magnitudes
 
 from hybrid_ao_psf import (
+    HybridCtotCorrection,
+    HybridRequest,
+    NgsHoMetricPrediction,
     NgsHoMetricSamples,
     RbfInterpolationConfig,
     ScienceHoPsfSamples,
+    _mastsel,
     build_ngs_ho_metric_interpolator,
     build_science_ho_psf_interpolator,
     cli,
@@ -137,9 +141,88 @@ def test_real_mastsel_engine_matches_retained_hybrid_golden(tmp_path: Path) -> N
         load_science_ho_psf_interpolator(science_path),
         load_ngs_ho_metric_interpolator(ngs_path),
     )
-    np.testing.assert_allclose(magnitude_result.ngs_flux.value, result.ngs_flux.value, rtol=1e-14)
-    np.testing.assert_allclose(magnitude_result.ctot_wavefront.value, result.ctot_wavefront.value, rtol=1e-12)
+    np.testing.assert_allclose(
+        magnitude_result.ngs_flux.value, result.ngs_flux.value, rtol=1e-14
+    )
+    np.testing.assert_allclose(
+        magnitude_result.ctot_wavefront.value, result.ctot_wavefront.value, rtol=1e-12
+    )
     np.testing.assert_allclose(magnitude_result.psfs, result.psfs, rtol=1e-6, atol=1e-7)
+
+    observed = []
+
+    def noop(ctot, context):
+        observed.append(context.mastsel_statistics)
+
+    no_op = simulate(
+        configuration.request,
+        load_science_ho_psf_interpolator(science_path),
+        load_ngs_ho_metric_interpolator(ngs_path),
+        ctot_correction=HybridCtotCorrection(noop),
+    )
+    np.testing.assert_array_equal(no_op.ctot_wavefront, result.ctot_wavefront)
+    np.testing.assert_array_equal(no_op.psfs, result.psfs)
+    assert len(observed) == 1
+    assert observed[0].measurement_noise is not None
+
+
+@pytest.mark.slow_mastsel
+@pytest.mark.parametrize("count", [1, 2, 3])
+def test_capture_noise_matches_native_fixed_gain_expression(tmp_path, count):
+    """Compare recovered noise with native zero-atmosphere expressions per NGS."""
+    ngs_x, ngs_y = _ngs_cartesian()
+    rates = np.array([500, 450, 400])[:count] * u.Hz
+    flux = np.array([25000, 16000, 10000])[:count] * u.photon / u.s
+    request = HybridRequest(
+        science_x=np.array([0, 30, 0]) * u.arcsec,
+        science_y=np.array([0, 0, 30]) * u.arcsec,
+        ngs_x=ngs_x[:count] * u.arcsec,
+        ngs_y=ngs_y[:count] * u.arcsec,
+        ngs_flux=flux,
+        wavelength=WAVELENGTH_UM * u.um,
+        zenith_angle=20 * u.deg,
+        mastsel_ini=EXAMPLE.read_text(),
+    )
+    metrics = NgsHoMetricPrediction(
+        np.array([0.42, 0.40, 0.38])[:count] * u.one,
+        np.array([76, 80, 84])[:count] * u.mas,
+        np.full(count, 0.24) * u.one,
+    )
+    context = _mastsel._prepare_mastsel_context(
+        str(tmp_path), request, metrics, request.mastsel_ini, rates, flux
+    )
+    model = context.mastsel
+    native = model.computeNoiseResidual
+    expected = []
+
+    def record_native(fmin, fmax, samples, variance, bias):
+        result = native(fmin, fmax, samples, variance, bias)
+        f = np.linspace(fmin, fmax, samples)
+        gain = bias * model.LoopGain_LO
+        expected.extend(
+            (
+                float(abs(np.sum(model.fTipS_lambda1(gain, f, np.zeros(samples))))),
+                float(abs(np.sum(model.fTiltS_lambda1(gain, f, np.zeros(samples))))),
+            )
+        )
+        return result
+
+    model.computeNoiseResidual = record_native
+    baseline = _mastsel._compute_mastsel_ctot(context)
+    expected.clear()
+    with _mastsel._capture_mastsel(context) as captured:
+        replay = _mastsel._compute_mastsel_ctot(context)
+    completed = _mastsel._complete_mastsel_context(context, captured)
+    np.testing.assert_array_equal(replay, baseline)
+    np.testing.assert_allclose(
+        np.diag(completed.mastsel_statistics.measurement_noise.value),
+        expected,
+        rtol=2e-13,
+        atol=1e-13,
+    )
+    assert completed.mastsel is model
+    assert "computeCovMatrices" not in model.__dict__
+    assert "buildReconstuctor2" not in model.__dict__
 
 
 def _ngs_cartesian() -> tuple[np.ndarray, np.ndarray]:

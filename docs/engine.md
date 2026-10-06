@@ -16,7 +16,8 @@ One call:
 3. uses supplied effective NGS flux, or converts magnitudes with the
    caller-supplied zeropoint and MASTSEL telescope/WFS geometry;
 4. calls MASTSEL for Ctot and its angular conversion;
-5. validates and, where permitted, conditions Ctot;
+5. invokes an optional field-wide covariance correction, then validates and,
+   where permitted, conditions Ctot;
 6. applies the image-plane Gaussian OTF to a private `float32` PSF copy using
    the provider-owned pixel scale and finite-field convention; and
 7. constructs the standard result, jitter, PSD facts, effective configuration,
@@ -24,6 +25,24 @@ One call:
 
 The finite-field crop is not renormalized. Energy blurred beyond the retained
 PSF support remains absent from the result.
+
+The optional `ctot_correction` receives baseline Ctot and a transient context
+with the same live MASTSEL instance. The engine owns the temporary configuration
+through calculation and correction, with unconditional cleanup. Its private
+MASTSEL adapter captures covariance/reconstructor returns during the baseline
+using instance-local wrappers restored before the callback. Capture is omitted
+without a correction definition. Fixed-gain noise is recovered from retained
+sensor response/variance using the native sampled transfer function; no detector
+moments or atmospheric spectra are recalculated. A missing centre in a multi-NGS
+field requires only one additional centre covariance calculation. One NGS needs
+no such calculation. See [Covariance corrections](api.md#covariance-corrections)
+for the public callback and statistics contracts.
+
+Absent or no-op corrections preserve baseline Ctot. A replacement follows the
+same conditioning and single-Gaussian path; Ctot, jitter, PSD facts and diagnostic
+summaries all describe that final covariance. The hook returns neither kernels
+nor PSFs and adds no second convolution. Static metadata describes the configured
+correction, not whether a particular call changed Ctot.
 
 For comparisons that supply their own PSFs and conditioned Ctot,
 `blur_psfs_with_ctot()` exposes this same finite-field blur without running the
