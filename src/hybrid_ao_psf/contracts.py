@@ -11,6 +11,9 @@ from typing import TYPE_CHECKING, Protocol, runtime_checkable
 import numpy as np
 from ao_stats import PsfMetadata
 from astropy import units as u
+from numpy.typing import DTypeLike
+
+from ._validation import validate_psf_dtype
 
 if TYPE_CHECKING:
     from mastsel import MavisLO
@@ -46,15 +49,20 @@ class ScienceHoPsfPrediction:
         pixel_scale: Scalar angular pixel scale shared by the returned PSFs.
         metadata: Physical PSF metadata compatible with AO Stats.
         meta: Optional scalar physical metadata propagated from the source.
+        dtype: PSF pixel precision, float32 by default. Explicit float64 retains
+            double-precision source pixels; other precisions are rejected.
     """
 
     psfs: np.ndarray
     pixel_scale: u.Quantity
     metadata: PsfMetadata
     meta: Mapping[str, u.Quantity] = field(default_factory=dict)
+    dtype: DTypeLike = field(default=np.float32, kw_only=True)
 
     def __post_init__(self) -> None:
-        psfs = _readonly_array(self.psfs, dtype=np.float32, label="psfs", ndim=3)
+        dtype = validate_psf_dtype(self.dtype)
+        psfs = _readonly_array(self.psfs, dtype=dtype, label="psfs", ndim=3)
+        object.__setattr__(self, "dtype", dtype)
         if np.any(psfs < 0.0):
             raise ValueError("psfs must be non-negative.")
         flux = np.sum(psfs, axis=(-2, -1), dtype=np.float64)

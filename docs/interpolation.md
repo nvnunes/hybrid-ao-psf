@@ -17,6 +17,15 @@ metadata, provenance, and a prepared SciPy regular-grid interpolator.
 `save_science_ho_psf_interpolator()` writes a version-2 pickle with identity
 `hybrid_ao_psf_science_ho_psf_interpolator`. Loading returns ready-to-evaluate
 read-only state without preparing the interpolator again.
+PSF pixels use float32 by default. Pass `dtype=np.float64` to
+`build_science_ho_psf_interpolator()` when source precision must be retained,
+for example for fixed-spot WFS calibration. Both stored grids and provider
+predictions preserve the chosen precision; no flux normalization is applied.
+The loader accepts existing float32 version-2 artifacts and optional float64
+values in the same prepared-array contract. Other pixel precisions are rejected.
+`ScienceHoPsfPrediction` also accepts an explicit `dtype` for custom providers.
+The simulation engine continues to produce float32 PSF results.
+
 Source images must follow the [coordinate and image orientation contract](architecture.md#coordinate-and-image-orientation);
 interpolation does not rotate or flip their pixels.
 

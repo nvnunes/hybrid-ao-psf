@@ -31,14 +31,15 @@ sample, configuration, build, validation, evaluation, replay, save, and load
 surface is exported from both `hybrid_ao_psf` and
 `hybrid_ao_psf.interpolation`; see [Interpolation products](interpolation.md).
 
-## Calibration Inputs
+## E2E Calibration
 
-The package root exports `E2ECalibration`, the family-specific physical sample
-and settings types, `load_e2e_calibration_configuration()`,
-`save_calibration_samples()`, `load_calibration_samples()` and fitted-product
-identity operations. See [Calibration inputs](calibration.md) for hook ownership,
-physical conventions and configuration. These operations do not invoke the
-scientific simulation engine or require native software.
+The package root exports `E2ECalibration`, physical sample/settings/result types,
+family-specific measure/build/save/load operations and fitted-product identities.
+The four model types are `ReconstructorNoiseModel`, `CovarianceFunctions`,
+`ComaResponseModel` and `SensingCalibration`. The configured subclass supplies
+native observations; standalone builders, numerical replay and loaded model
+evaluation need no native software. See [Calibration](calibration.md) for
+stages, physical conventions, configuration and product contracts.
 
 ## Results
 

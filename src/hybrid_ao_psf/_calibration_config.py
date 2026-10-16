@@ -219,6 +219,9 @@ class E2ECalibrationConfiguration:
             if not path.is_absolute():
                 path = self.source.parent / path
             object.__setattr__(self, name, path.resolve())
+        targets = [getattr(self, family + "_model") for family in _SETTINGS]
+        if len(set(targets)) != len(targets):
+            raise ValueError("calibration model destinations must be distinct")
         for name, cls in _SETTINGS.items():
             if not isinstance(getattr(self, name), cls):
                 raise TypeError(f"{name} must be {cls.__name__}")

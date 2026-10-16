@@ -17,10 +17,11 @@ from ao_stats import (
     compute_psf_fwhm,
 )
 from astropy import units as u
+from numpy.typing import DTypeLike
 from scipy.interpolate import RegularGridInterpolator
 
 from .._units import quantity_value, require_quantity
-from .._validation import validate_meta_field_name
+from .._validation import validate_meta_field_name, validate_psf_dtype
 from ..contracts import ScienceHoPsfPrediction
 from ._core import (
     axis_index,
@@ -124,6 +125,8 @@ class ScienceHoPsfInterpolator:
     wavelength and fixed zenith values remain in their metadata axes but are not
     included in ``coordinate_order``. The persisted provider contains a
     prepared SciPy interpolator and is ready to evaluate after loading.
+    ``dtype`` selects float32 pixels by default or explicit float64; storage
+    and predictions preserve this precision without changing source flux.
     """
 
     coordinate_order: tuple[str, ...]
@@ -140,6 +143,7 @@ class ScienceHoPsfInterpolator:
     meta: Mapping[str, Any] = field(default_factory=dict)
     provenance: tuple[str, ...] = ()
     builder: Mapping[str, Any] = field(default_factory=dict)
+    dtype: DTypeLike = field(default=np.float32, kw_only=True)
     _prepared_psf_interpolator: RegularGridInterpolator | None = field(
         default=None, init=False, repr=False, compare=False
     )
@@ -155,7 +159,9 @@ class ScienceHoPsfInterpolator:
         object.__setattr__(self, "pixel_scale_grid", freeze_artifact_value(self.pixel_scale_grid))
         object.__setattr__(self, "tel_diameter", freeze_artifact_value(self.tel_diameter))
         object.__setattr__(self, "tel_pupil", freeze_artifact_value(self.tel_pupil))
-        object.__setattr__(self, "psf_grid", freeze_artifact_value(np.asarray(self.psf_grid, dtype=np.float32)))
+        dtype = validate_psf_dtype(self.dtype)
+        object.__setattr__(self, "dtype", dtype)
+        object.__setattr__(self, "psf_grid", freeze_artifact_value(np.asarray(self.psf_grid, dtype=dtype)))
         object.__setattr__(self, "meta", freeze_artifact_value(self.meta))
         object.__setattr__(self, "provenance", tuple(str(value) for value in self.provenance))
         object.__setattr__(self, "builder", freeze_artifact_value(self.builder))
@@ -194,14 +200,21 @@ class _ScienceHoPsfRuntimeInterpolator:
     psf_interpolator: RegularGridInterpolator
 
 
-def build_science_ho_psf_interpolator(samples: ScienceHoPsfSamples) -> ScienceHoPsfInterpolator:
+def build_science_ho_psf_interpolator(
+    samples: ScienceHoPsfSamples,
+    *,
+    dtype: DTypeLike = np.float32,
+) -> ScienceHoPsfInterpolator:
     """Build a science high-order PSF interpolation artifact.
 
     Active physical axes are inferred from supplied sample diversity. Field
-    coordinates must form a complete rectangular ``y x x`` grid.
+    coordinates must form a complete rectangular ``y x x`` grid. ``dtype``
+    accepts float32 (the default) or float64 and applies to stored and returned
+    pixels. Source flux and image orientation are preserved in either case.
     """
 
-    prepared = _prepare_samples(samples)
+    dtype = validate_psf_dtype(dtype)
+    prepared = _prepare_samples(samples, dtype=dtype)
     field_x_axis, field_y_axis = rectangular_field_axes(
         prepared.x,
         prepared.y,
@@ -219,7 +232,7 @@ def build_science_ho_psf_interpolator(samples: ScienceHoPsfSamples) -> ScienceHo
     psf_grid = np.full(
         (*active_shape, field_y_axis.size, field_x_axis.size, *prepared.psfs.shape[2:]),
         np.nan,
-        dtype=np.float32,
+        dtype=dtype,
     )
 
     for plane_index in range(prepared.psfs.shape[0]):
@@ -240,7 +253,7 @@ def build_science_ho_psf_interpolator(samples: ScienceHoPsfSamples) -> ScienceHo
             field_x_axis,
             field_y_axis,
             label="Science HO PSF sample",
-            dtype=np.float32,
+            dtype=dtype,
         )
 
     if np.any(plane_indices < 0):
@@ -271,6 +284,7 @@ def build_science_ho_psf_interpolator(samples: ScienceHoPsfSamples) -> ScienceHo
         tel_pupil=prepared.tel_pupil,
         meta=meta,
         psf_grid=psf_grid,
+        dtype=dtype,
         provenance=tuple(prepared.provenance),
         builder={
             "name": "hybrid_ao_psf.interpolation.science_ho_psf",
@@ -290,7 +304,7 @@ def _prepare_science_ho_psf_runtime_interpolator(
         artifact=interpolator,
         psf_interpolator=RegularGridInterpolator(
             _interpolation_axes(interpolator),
-            np.asarray(interpolator.psf_grid, dtype=np.float32),
+            np.asarray(interpolator.psf_grid),
             method="linear",
             bounds_error=True,
         ),
@@ -319,7 +333,7 @@ def _evaluate_science_ho_psf_runtime_interpolator(
         wavelength=wavelength,
     )
     points = _query_points(interpolator, physical_values, coordinates)
-    psfs = np.asarray(runtime_interpolator.psf_interpolator(points), dtype=np.float32).reshape(
+    psfs = np.asarray(runtime_interpolator.psf_interpolator(points), dtype=interpolator.dtype).reshape(
         coordinates.shape[0],
         *interpolator.psf_shape,
     )
@@ -334,6 +348,7 @@ def _evaluate_science_ho_psf_runtime_interpolator(
     pixel_scale = float(pixel_scale)
     return ScienceHoPsfPrediction(
         psfs=psfs,
+        dtype=interpolator.dtype,
         pixel_scale=pixel_scale * u.mas,
         metadata=PsfMetadata(
             wavelength=wavelength_value * u.um,
@@ -405,7 +420,7 @@ def replay_science_ho_psf_interpolator(
 ) -> ScienceHoPsfReplaySummary:
     """Replay a science-HO-PSF artifact at source sample nodes."""
 
-    prepared = _prepare_samples(samples)
+    prepared = _prepare_samples(samples, dtype=interpolator.dtype)
     residuals: list[np.ndarray] = []
     pixel_scale_errors: list[float] = []
     metric_errors: dict[str, list[np.ndarray]] = {"fwhm": [], "ee": []}
@@ -418,7 +433,7 @@ def replay_science_ho_psf_interpolator(
             x=prepared.x,
             y=prepared.y,
         )
-        reference = np.asarray(prepared.psfs[index], dtype=np.float32)
+        reference = prepared.psfs[index]
         residuals.append(_psf_nrms(reference, prediction.psfs))
         pixel_scale_errors.append(abs(float(prepared.pixel_scale[index].to_value(u.mas)) - prediction.pixel_scale.to_value(u.mas)))
         plane_metric_errors = _science_metric_errors(
@@ -475,11 +490,11 @@ def load_science_ho_psf_interpolator(path: Path) -> ScienceHoPsfInterpolator:
 # Sample preparation and grid construction
 
 
-def _prepare_samples(samples: ScienceHoPsfSamples) -> ScienceHoPsfSamples:
+def _prepare_samples(samples: ScienceHoPsfSamples, *, dtype: np.dtype) -> ScienceHoPsfSamples:
     if not isinstance(samples, ScienceHoPsfSamples):
         raise TypeError("samples must be a ScienceHoPsfSamples instance.")
     coordinates = field_coordinates(samples.x, samples.y)
-    psfs = _validate_source_psfs(samples.psfs, label="psfs", num_points=coordinates.shape[0])
+    psfs = _validate_source_psfs(samples.psfs, label="psfs", num_points=coordinates.shape[0], dtype=dtype)
     num_planes = psfs.shape[0]
     wavelength = _prepare_required_plane_values(
         samples.wavelength,
@@ -514,8 +529,8 @@ def _prepare_samples(samples: ScienceHoPsfSamples) -> ScienceHoPsfSamples:
     )
 
 
-def _validate_source_psfs(psfs: Any, *, label: str, num_points: int) -> np.ndarray:
-    array = np.asarray(psfs, dtype=np.float32)
+def _validate_source_psfs(psfs: Any, *, label: str, num_points: int, dtype: np.dtype) -> np.ndarray:
+    array = np.asarray(psfs, dtype=dtype)
     if array.ndim == 3:
         array = array[np.newaxis, ...]
     if array.ndim != 4:
@@ -986,8 +1001,7 @@ def _science_from_payload(payload: Mapping[str, Any]) -> ScienceHoPsfInterpolato
     if not isinstance(prepared, RegularGridInterpolator):
         raise TypeError("Science-HO-PSF artifact requires a prepared RegularGridInterpolator.")
     psf_grid = np.asarray(prepared.values)
-    if psf_grid.dtype != np.float32:
-        raise ValueError("Science-HO-PSF prepared interpolator values must be float32.")
+    dtype = validate_psf_dtype(psf_grid.dtype)
     metadata = dict(payload.get("metadata", {}))
     interpolator = ScienceHoPsfInterpolator(
         coordinate_order=coordinate_order,
@@ -1002,6 +1016,7 @@ def _science_from_payload(payload: Mapping[str, Any]) -> ScienceHoPsfInterpolato
         tel_pupil=require_quantity(metadata.get("tel_pupil"), u.one, label="metadata.tel_pupil"),
         meta=dict(metadata.get("meta", {})),
         psf_grid=psf_grid,
+        dtype=dtype,
         provenance=tuple(str(value) for value in metadata.get("provenance", ())),
         builder=dict(payload.get("builder", {})),
     )
@@ -1057,7 +1072,9 @@ def _validate_interpolator(interpolator: ScienceHoPsfInterpolator) -> None:
         raise ValueError("pixel_scale_grid must contain only finite values.")
     _validate_artifact_meta(interpolator.meta, grid_shape=active_shape)
     expected_psf_grid_shape = _expected_model_grid_shape(interpolator)
-    psf_grid = np.asarray(interpolator.psf_grid, dtype=np.float32)
+    psf_grid = np.asarray(interpolator.psf_grid)
+    if psf_grid.dtype != validate_psf_dtype(interpolator.dtype):
+        raise ValueError("psf_grid precision must match dtype.")
     if psf_grid.shape != expected_psf_grid_shape:
         raise ValueError(f"psf_grid shape must be {expected_psf_grid_shape}; got {psf_grid.shape}.")
     if not np.all(np.isfinite(psf_grid)):

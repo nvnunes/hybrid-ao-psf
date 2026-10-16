@@ -10,7 +10,7 @@ nav:
   - API Guide: api.md
   - Configuration: configuration.md
   - Interpolation Products: interpolation.md
-  - Calibration Inputs: calibration.md
+  - Calibration: calibration.md
   - Engine: engine.md
   - Result Files: results.md
   - Architecture: architecture.md

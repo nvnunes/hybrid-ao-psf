@@ -11,8 +11,10 @@ Hybrid AO PSF owns:
 - translation of Hybrid inputs into MASTSEL configuration;
 - MASTSEL low-order execution and Ctot interpretation;
 - a downstream field-wide Ctot hook with transient runtime/statistics context;
-- finite-field Ctot blur, jitter, and engine-level diagnostics; and
-- standalone combined-INI and versioned HDF5 result contracts.
+- finite-field Ctot blur, jitter, and engine-level diagnostics;
+- standalone combined-INI and versioned HDF5 result contracts; and
+- common E2E calibration, fixed-integrator/reconstruction/noise-blur kernels and
+  immutable calibrated products.
 
 Hybrid AO PSF does not own batch simulation orchestration, external dataset
 schemas, instrument calibration selection, instrument-specific policy, or
@@ -88,13 +90,20 @@ provide pixel-space covariance or precomputed OTFs directly.
 
 ## E2E Calibration Boundary
 
-Hybrid AO PSF owns physical calibration input/observation contracts, their
-persistence, common configuration and fitted-product content identities.
-`E2ECalibration` defines distinct native reading/measurement hooks; downstream
-subclasses own E2E setup knowledge, source conversion and native execution.
-Native metadata and process controls are not shared numerical inputs. Calibration
-objects are separate from runtime simulation providers. See
-[Calibration inputs](calibration.md) for the current boundary and INI contract.
+Hybrid AO PSF owns physical calibration contracts, common configuration,
+measurement/build/replay operations, numerical diagnostics, model persistence
+and fitted-product identities. `E2ECalibration` supplies common workflows with
+distinct native reading/measurement hooks. Downstream subclasses own E2E setup,
+source compatibility/conversion, normalization, native execution and reuse
+checks. No opaque native metadata exchange or adapter registry is required.
+
+Reusable observations, standalone builders, explicit save/load operations and
+configured publication remain separate. Common code is shared by Python and
+native CLI workflows. Loaded calibrated products and offline builders require
+neither a native subclass nor native files/software. Numerical kernels have one
+upstream owner; calibration does not depend on downstream correction modules.
+The four calibration products are separate from the scientific simulation
+engine. See [Calibration](calibration.md) for lifecycle and scientific contracts.
 
 ## Coordinate And Image Orientation
 
@@ -121,7 +130,9 @@ the canonical loaders.
 
 Science-HO-PSF fitted state uses a version-2 pickle with identity
 `hybrid_ao_psf_science_ho_psf_interpolator` and a prepared SciPy regular-grid
-interpolator. NGS-HO-metric state may contain ready-to-evaluate SciPy RBF
+interpolator. Its prepared pixel arrays retain float32 by default or explicit
+float64; loading validates and preserves that stored precision. NGS-HO-metric
+state may contain ready-to-evaluate SciPy RBF
 objects and uses a version-1 pickle with identity
 `hybrid_ao_psf_ngs_ho_metric_interpolator`. Pickle-owned classes resolve only
 through stable `hybrid_ao_psf` module paths; persisted interpolation

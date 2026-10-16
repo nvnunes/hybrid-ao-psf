@@ -41,6 +41,13 @@ Targeted checks are appropriate during iteration. Complete substantial work
 with every canonical command plus the regression checks for the affected
 surface.
 
+## PSF Precision Coverage
+
+`test_psf_precision.py` checks explicit float64 source-node pixels, flux,
+off-node interpolation and replay through save/load and prediction, while
+preserving existing float32 defaults and rejecting unsupported precisions.
+The engine and result contract remain float32.
+
 ## Calibration Input Coverage
 
 `tests/test_calibration_boundary.py` uses independent synthetic records for
@@ -48,3 +55,16 @@ physical units, pooled-mean input preservation, immutable values/unit metadata,
 configuration precedence, schema rejection, atomic sample round trips and
 manifest/payload content binding. Native conversion tests belong downstream;
 common tests require no native E2E files or software.
+
+## Calibration Pipeline Coverage
+
+`test_calibration_kernels.py` and `test_controller_noise_contracts.py` compare
+physical controller/filtering, reconstruction and blur operations with
+independent recurrences, impulse sums and closed forms. The four family suites
+cover retained observations, offline building, support/units/settings rejection,
+immutable model state and numerical persistence. `test_calibration_workflows.py`
+exercises all four configured workflows with a synthetic subclass, including
+configured spot loading, calibrated reconstruction validation, noise-only replay
+and complete shape fitting without native files. Publication tests interrupt
+payload writes and manifest replacement and verify complete usable products and
+preserved permissions. Native conversion and source/reuse tests belong downstream.

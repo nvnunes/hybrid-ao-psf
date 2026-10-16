@@ -74,6 +74,78 @@ class FixedGainIntegrator(_PhysicalRecord):
         object.__setattr__(self, "gain", float(self.gain))
         object.__setattr__(self, "frame_rate", rate)
 
+    def transition(self, response: np.ndarray) -> np.ndarray:
+        """Return the stable two-axis delayed-command transition matrix.
+
+        response is the finite dimensionless 2-by-2 reconstructed sensing
+        matrix. History blocks run newest to oldest. Unstable loops raise
+        ValueError; the returned array is newly owned by the caller.
+        """
+        from ._calibration_numerics import integrator_transition
+
+        return integrator_transition(response, self.gain, self.delay)
+
+    def filter(
+        self, history: u.Quantity, response: np.ndarray, *, equilibrium: bool = False
+    ) -> u.Quantity:
+        """Replay delayed inputs independently across realizations.
+
+        history has shape (realizations,frames,2), angular or OPD units.
+        response is the dimensionless 2-by-2 feedback matrix. Return commands
+        in the same units and shape. The default has zero command/input prehistory;
+        equilibrium=True instead
+        holds each first input constant before the first frame. No centring or
+        settling cut is applied. Coupled responses are retained exactly, including
+        nonsymmetric terms.
+        """
+        from ._calibration_numerics import filter_input
+
+        if not isinstance(history, u.Quantity):
+            raise TypeError("history must be an Astropy quantity")
+        values = np.asarray(history.value)
+        if (
+            values.ndim != 3
+            or values.shape[-1] != 2
+            or not np.isfinite(values).all()
+            or not values.size
+        ):
+            raise ValueError("history must be finite nonempty (realizations,frames,2)")
+        if not (history.unit.is_equivalent(u.rad) or history.unit.is_equivalent(u.m)):
+            raise ValueError("history must have angular or OPD units")
+        if values.dtype.kind not in "fiu" or type(equilibrium) is not bool:
+            raise ValueError("history must be real and equilibrium must be boolean")
+        initial = (
+            np.linalg.solve(response, values[:, 0, :].T).T
+            if equilibrium
+            else np.zeros((len(values), 2))
+        )
+        inputs = values - values[:, :1, :] if equilibrium else values
+        result = filter_input(
+            inputs.transpose(2, 0, 1), response, self.gain, self.delay
+        )
+        result = result + initial.T[:, :, None]
+        return result.transpose(1, 2, 0) * history.unit
+
+    def noise_covariance(
+        self, response: np.ndarray, reconstructed_noise: u.Quantity
+    ) -> u.Quantity:
+        """Solve the stationary Lyapunov command covariance for white input noise.
+
+        reconstructed_noise is a finite symmetric PSD 2-by-2 angular-squared
+        quantity, independent between frames. Return command covariance in
+        mas squared. The supplied response is the actual feedback matrix.
+        """
+        from ._calibration_numerics import integrator_noise_covariance
+
+        if not isinstance(reconstructed_noise, u.Quantity):
+            raise TypeError("reconstructed_noise must be an Astropy quantity")
+        return (
+            integrator_noise_covariance(
+                response, reconstructed_noise.to_value(u.mas**2), self.gain, self.delay
+            )
+            * u.mas**2
+        )
+
 
 @dataclass(frozen=True, kw_only=True, eq=False)
 class CalibrationPhotometry(_PhysicalRecord):
