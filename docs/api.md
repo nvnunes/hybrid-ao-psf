@@ -31,6 +31,15 @@ sample, configuration, build, validation, evaluation, replay, save, and load
 surface is exported from both `hybrid_ao_psf` and
 `hybrid_ao_psf.interpolation`; see [Interpolation products](interpolation.md).
 
+## Calibration Inputs
+
+The package root exports `E2ECalibration`, the family-specific physical sample
+and settings types, `load_e2e_calibration_configuration()`,
+`save_calibration_samples()`, `load_calibration_samples()` and fitted-product
+identity operations. See [Calibration inputs](calibration.md) for hook ownership,
+physical conventions and configuration. These operations do not invoke the
+scientific simulation engine or require native software.
+
 ## Results
 
 `HybridResult` is the immutable standard result. It carries the final

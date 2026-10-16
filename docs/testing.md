@@ -40,3 +40,11 @@ current selected releases.
 Targeted checks are appropriate during iteration. Complete substantial work
 with every canonical command plus the regression checks for the affected
 surface.
+
+## Calibration Input Coverage
+
+`tests/test_calibration_boundary.py` uses independent synthetic records for
+physical units, pooled-mean input preservation, immutable values/unit metadata,
+configuration precedence, schema rejection, atomic sample round trips and
+manifest/payload content binding. Native conversion tests belong downstream;
+common tests require no native E2E files or software.

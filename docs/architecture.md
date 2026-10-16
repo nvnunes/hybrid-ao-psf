@@ -86,6 +86,16 @@ running MASTSEL or producing a complete simulation result.
 Gaussian OTF construction and in-place finite-field application when callers
 provide pixel-space covariance or precomputed OTFs directly.
 
+## E2E Calibration Boundary
+
+Hybrid AO PSF owns physical calibration input/observation contracts, their
+persistence, common configuration and fitted-product content identities.
+`E2ECalibration` defines distinct native reading/measurement hooks; downstream
+subclasses own E2E setup knowledge, source conversion and native execution.
+Native metadata and process controls are not shared numerical inputs. Calibration
+objects are separate from runtime simulation providers. See
+[Calibration inputs](calibration.md) for the current boundary and INI contract.
+
 ## Coordinate And Image Orientation
 
 Request and field coordinates are Cartesian `(x, y)` pairs in arcseconds.

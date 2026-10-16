@@ -39,7 +39,35 @@ def test_package_root_exports_supported_contracts() -> None:
         "simulate",
         "simulate_configuration",
     }
-    assert set(hybrid_ao_psf.__all__) == core_names | set(interpolation.__all__)
+    calibration_names = {
+        "E2ECalibration",
+        "FixedGainIntegrator",
+        "CalibrationPhotometry",
+        "CovarianceTelemetry",
+        "ComaWavefronts",
+        "ComaWfsSampling",
+        "ComaWfsMeasurements",
+        "ComaResponseMeasurements",
+        "SensingSpot",
+        "SensingWfsSampling",
+        "SensingWfsMeasurements",
+        "ReconstructorNoiseInputs",
+        "ReconstructorNoiseMeasurements",
+        "CovarianceCalibrationSettings",
+        "ComaCalibrationSettings",
+        "SensingCalibrationSettings",
+        "ReconstructorCalibrationSettings",
+        "E2ECalibrationConfiguration",
+        "load_e2e_calibration_configuration",
+        "CalibrationFileIdentity",
+        "CalibrationArtifactIdentity",
+        "save_calibration_samples",
+        "load_calibration_samples",
+        "read_calibration_artifact_identity",
+    }
+    assert set(hybrid_ao_psf.__all__) == core_names | calibration_names | set(
+        interpolation.__all__
+    )
 
 
 def test_required_dependencies_are_available() -> None:
