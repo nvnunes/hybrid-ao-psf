@@ -311,3 +311,31 @@ def test_diagnostics_exposes_psd_summary_properties() -> None:
     assert diagnostics is not None
     assert diagnostics.psd_valid_count == 2
     assert diagnostics.psd_valid_fraction == 1.0
+
+
+@pytest.mark.parametrize("dtype", [np.float32, np.float64, None])
+def test_ngs_metrics_own_immutable_values_and_unit_metadata(dtype):
+    source = {
+        "ee": np.array([0.4, 0.5], dtype=np.float64) * u.one,
+        "fwhm": np.array([100, 110], dtype=np.float32) * u.mas,
+        "sr": np.array([0.1, 0.2], dtype=np.float64) * u.one,
+    }
+    metrics = NgsHoMetricPrediction(**source, dtype=dtype)
+    for name, supplied in source.items():
+        expected = supplied.astype(dtype) if dtype is not None else supplied.copy()
+        supplied[0] = 0 * supplied.unit
+        value = getattr(metrics, name)
+        np.testing.assert_array_equal(value, expected)
+        assert value.dtype == expected.dtype
+        # Re-enabling writes on a backing array must not unlock the result.
+        backing = value
+        while isinstance(backing, np.ndarray):
+            with pytest.raises(ValueError):
+                backing.flags.writeable = True
+            if isinstance(backing, u.Quantity):
+                backing *= u.s
+                assert getattr(metrics, name).unit == expected.unit
+            backing = backing.base
+        value *= u.s
+        assert getattr(metrics, name).unit == expected.unit
+        np.testing.assert_array_equal(getattr(metrics, name), expected)

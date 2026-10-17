@@ -104,8 +104,13 @@ configured publication remain separate. Common code is shared by Python and
 native CLI workflows. Loaded calibrated products and offline builders require
 neither a native subclass nor native files/software. Numerical kernels have one
 upstream owner; calibration does not depend on downstream correction modules.
-The four calibration products are separate from the scientific simulation
-engine. See [Calibration](calibration.md) for lifecycle and scientific contracts.
+The four calibration products feed the separate concrete `E2ECalibratedModel`.
+It owns immutable prepared providers and standalone scientific LO composition,
+including reconstructor weights, scalar-bank assembly, actual-feedback noise
+propagation and displacement-mixture parameters. Its INI loader exposes
+validated product-content identities without acquisition metadata. It does not
+construct science PSFs or alter the MASTSEL-backed engine. See
+[Calibrated LO prediction](e2e-model.md) for this runtime boundary. See [Calibration](calibration.md) for lifecycle and scientific contracts.
 
 ## Coordinate And Image Orientation
 

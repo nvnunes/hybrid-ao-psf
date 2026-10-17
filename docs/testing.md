@@ -71,3 +71,16 @@ configured spot loading, calibrated reconstruction validation, noise-only replay
 and complete shape fitting without native files. Publication tests interrupt
 payload writes and manifest replacement and verify complete usable products and
 preserved permissions. Native conversion and source/reuse tests belong downstream.
+
+## Calibrated LO Composition Coverage
+
+`test_e2e_model.py` compares complete one-, two- and three-NGS covariance
+composition with an independent matrix recurrence, including noncommuting
+reconstructor blocks, unequal gains, correlated tilt/coma and different
+realization means. It checks independent noise impulse sums, real/scalar and
+complex-feedback behavior, both precisions, prepared-result immutability, complete
+preparation of mixed-precision providers, rounding-time validation, content-bound
+INI loading without native imports, missing products, numerical conflicts and
+support rejection. `test_contracts.py` additionally checks shared metric numeric
+backing and unit metadata throughout the backing chain, including preserved
+legacy precision. PSF construction remains an engine concern.

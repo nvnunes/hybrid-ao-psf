@@ -69,11 +69,13 @@ def coordinate_support_dtype(dtype, *coordinates):
 def clip_support(value, axis, *, dtype, label):
     """Snap representational endpoint roundoff, rejecting extrapolation."""
     axis = np.asarray(axis)
-    bound = (
-        2 * np.finfo(dtype).eps * max(1.0, abs(float(axis[0])), abs(float(axis[-1])))
-    )
-    if np.any(value < axis[0] - bound) or np.any(value > axis[-1] + bound):
+    epsilon = 2 * np.finfo(dtype).eps
+    lower = epsilon * max(1.0, abs(float(axis[0])))
+    upper = epsilon * max(1.0, abs(float(axis[-1])))
+    if np.any(value < axis[0] - lower) or np.any(value > axis[-1] + upper):
         raise ValueError(f"query outside calibrated {label} support")
     result = np.clip(value, axis[0], axis[-1])
     nearest = np.argmin(np.abs(np.asarray(result)[..., None] - axis), axis=-1)
-    return np.where(np.abs(result - axis[nearest]) <= bound, axis[nearest], result)
+    # Node roundoff scales locally, including axes spanning orders of magnitude.
+    tolerance = epsilon * np.maximum(1.0, np.abs(axis[nearest]))
+    return np.where(np.abs(result - axis[nearest]) <= tolerance, axis[nearest], result)

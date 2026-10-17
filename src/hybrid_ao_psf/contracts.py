@@ -13,6 +13,7 @@ from ao_stats import PsfMetadata
 from astropy import units as u
 from numpy.typing import DTypeLike
 
+from ._units import _PhysicalRecord
 from ._validation import validate_psf_dtype
 
 if TYPE_CHECKING:
@@ -86,8 +87,11 @@ class ScienceHoPsfPrediction:
 
 
 @dataclass(frozen=True)
-class NgsHoMetricPrediction:
-    """NGS high-order metrics returned by a loaded provider.
+class NgsHoMetricPrediction(_PhysicalRecord):
+    """NGS high-order metrics with immutable values and protected unit metadata.
+
+    Quantity access returns a view; changing its unit does not alter the
+    record. Numeric storage cannot become writable through NumPy flags.
 
     Attributes:
         dtype: float32 by default or explicit float64. None preserves individual
@@ -782,8 +786,8 @@ def _readonly_quantity(
         raise ValueError(f"{label} must be a non-empty {ndim}D quantity.")
     if not np.all(np.isfinite(array)):
         raise ValueError(f"{label} must contain only finite values.")
-    array.flags.writeable = False
-    return u.Quantity(array, unit, copy=False)
+    immutable = np.frombuffer(array.tobytes(), dtype=array.dtype).reshape(array.shape)
+    return u.Quantity(immutable, unit, copy=False)
 
 
 def _scalar(value: object, unit: u.UnitBase, label: str, *, dtype=float) -> u.Quantity:

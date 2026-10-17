@@ -67,3 +67,20 @@ def freeze_quantity(value: u.Quantity) -> u.Quantity:
     quantity = u.Quantity(value, copy=False)
     quantity.setflags(write=False)
     return quantity
+
+
+class _PhysicalRecord:
+    """Give callers quantity views, protecting owned unit metadata and values.
+
+    Stored arrays have immutable byte backing. Each public quantity access
+    returns a lightweight view: changing that view's unit cannot alter the
+    record, and values cannot become writable through a NumPy flag change.
+    """
+
+    def __getattribute__(self, name):
+        value = object.__getattribute__(self, name)
+        return (
+            u.Quantity(np.asarray(value), value.unit, dtype=value.dtype, copy=False)
+            if isinstance(value, u.Quantity)
+            else value
+        )

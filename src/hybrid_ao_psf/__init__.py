@@ -53,6 +53,11 @@ from ._covariance_calibration import (
     save_covariance_calibration,
     save_covariance_measurements,
 )
+from ._e2e_model import (
+    E2ECalibratedModel,
+    E2ELowOrderPrediction,
+    load_e2e_calibrated_model,
+)
 from ._noise_blur import NoiseBlurModel
 from ._reconstructor_calibration import (
     ReconstructorCalibrationMeasurements,
@@ -174,8 +179,10 @@ __all__ = [
     "CovarianceFunctions",
     "CovarianceTelemetry",
     "DiagnosticsLevel",
+    "E2ECalibratedModel",
     "E2ECalibration",
     "E2ECalibrationConfiguration",
+    "E2ELowOrderPrediction",
     "FixedGainIntegrator",
     "HybridConfiguration",
     "HybridCtotContext",
@@ -241,6 +248,7 @@ __all__ = [
     "load_configuration",
     "load_covariance_calibration",
     "load_covariance_measurements",
+    "load_e2e_calibrated_model",
     "load_e2e_calibration_configuration",
     "load_ngs_ho_metric_interpolator",
     "load_reconstructor_calibration",

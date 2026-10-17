@@ -260,3 +260,24 @@ def test_science_build_retains_source_physical_axis_precision(integer_axes):
         y=[0.0] * u.arcsec,
     )
     assert result.psfs.dtype == np.float64
+
+
+@pytest.mark.parametrize("dtype", [np.float32, np.float64])
+def test_noise_prior_wide_count_axis_does_not_snap_interior_queries(dtype):
+    """A large upper support limit must not change faint-star photon counts."""
+    model = ReconstructorNoiseModel(
+        photons_per_frame=[1, 10, 1e8] * u.photon,
+        fwhm=[10, 20] * u.mas,
+        variance=np.array([[100, 400], [10, 40], [1e-6, 4e-6]]) * u.mas**2,
+        dtype=dtype,
+    )
+    value = model.predict(
+        photons_per_frame=[3] * u.photon, ee=[1] * u.one, fwhm=[10] * u.mas
+    )
+    np.testing.assert_allclose(
+        value.value[0], np.eye(2) * (100 / 3), rtol=2e-6, atol=1e-10
+    )
+    with pytest.raises(ValueError, match="support"):
+        model.predict(
+            photons_per_frame=[1 - 1e-5] * u.photon, ee=[1] * u.one, fwhm=[10] * u.mas
+        )

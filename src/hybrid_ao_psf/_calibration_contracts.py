@@ -8,6 +8,7 @@ import numpy as np
 from astropy import units as u
 from numpy.typing import DTypeLike
 
+from ._units import _PhysicalRecord
 from ._validation import validate_psf_dtype
 
 
@@ -42,19 +43,6 @@ def _angle(value, *, dtype=np.float64):
     if not 0 <= angle.value < 90:
         raise ValueError("zenith_angle must lie in [0,90) degrees")
     return angle
-
-
-class _PhysicalRecord:
-    """Give callers quantity views, protecting owned unit metadata and values.
-
-    Stored arrays have immutable byte backing. Each public quantity access
-    returns a lightweight view: changing that view's unit cannot alter the
-    record, and values cannot become writable through a NumPy flag change.
-    """
-
-    def __getattribute__(self, name):
-        value = object.__getattribute__(self, name)
-        return value.view() if isinstance(value, u.Quantity) else value
 
 
 @dataclass(frozen=True, kw_only=True, eq=False)

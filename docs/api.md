@@ -41,6 +41,15 @@ native observations; standalone builders, numerical replay and loaded model
 evaluation need no native software. See [Calibration](calibration.md) for
 stages, physical conventions, configuration and product contracts.
 
+## Calibrated Low-Order Model
+
+`E2ECalibratedModel` owns prepared calibrated prediction independently of
+`E2ECalibration`. `load_e2e_calibrated_model()` loads its complete shared INI
+inputs; `model.predict()` returns an immutable `E2ELowOrderPrediction` containing
+component covariances, feedback diagnostics and displacement-mixture parameters.
+This operation calculates LO motion only. See [Calibrated LO prediction](e2e-model.md)
+for loading, support, units and the boundary with complete PSF simulation.
+
 ## Results
 
 `HybridResult` is the immutable standard result. It carries the final

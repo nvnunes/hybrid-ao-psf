@@ -5,7 +5,8 @@ operations for reconstructor, covariance, coma and sensing calibration. A
 configured downstream `E2ECalibration` subclass supplies native observations;
 the standalone builders and loaded products require no native E2E software.
 Calibration is separate from scientific simulation and never starts implicitly
-when a prediction loads its products.
+when a prediction loads its products. The separate concrete
+[E2ECalibratedModel](e2e-model.md) composes those products at prediction time.
 
 ## Native Hooks
 
