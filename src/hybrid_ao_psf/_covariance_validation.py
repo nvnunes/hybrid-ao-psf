@@ -36,6 +36,7 @@ def assembly_check(source: HistoryArrays, settings: FilterSettings) -> dict:
     or physically optimized reconstructors. All comparisons use identical PH
     centring and retained frames, including atmospheric/HO cross terms.
     """
+    dtype = source.tilt.dtype
     chosen = np.linspace(
         0, len(source.positions) - 1, min(3, len(source.positions)), dtype=int
     )
@@ -45,17 +46,20 @@ def assembly_check(source: HistoryArrays, settings: FilterSettings) -> dict:
         source.positions[chosen],
     )
     tables = covariance_tables(source, settings)
-    nodes = np.asarray(settings.strengths)
+    nodes = np.asarray(settings.strengths, dtype=dtype)
     b = nodes[[0, -1]]
-    basis = np.array([[1.0, 0.3], [0.1, 1.0]])
+    basis = np.array([[1.0, 0.3], [0.1, 1.0]], dtype=dtype)
     inverse = np.linalg.inv(basis)
     projections = [np.outer(basis[:, p], inverse[p]) for p in range(2)]
     maximum, absolute = 0.0, 0.0
     for count in range(1, len(chosen) + 1):
         feedback = basis @ np.diag(b) @ inverse
-        weights = [np.array([[0.2, 0.08], [-0.04, 0.25]]) for _ in range(count - 1)]
-        weights.append(feedback - sum(weights, np.zeros((2, 2))))
-        h = np.linspace(0.2, 0.5, count)
+        weights = [
+            np.array([[0.2, 0.08], [-0.04, 0.25]], dtype=dtype)
+            for _ in range(count - 1)
+        ]
+        weights.append(feedback - sum(weights, np.zeros((2, 2), dtype=dtype)))
+        h = np.linspace(0.2, 0.5, count, dtype=dtype)
         atmospheric = sum(
             (r @ source.tilt[i] for i, r in enumerate(weights)),
             np.zeros_like(source.tilt[0]),
@@ -79,8 +83,13 @@ def assembly_check(source: HistoryArrays, settings: FilterSettings) -> dict:
 
         ua, uc = replay(atmospheric, feedback), replay(coma, feedback)
         science = source.tilt[0, :, settings.discard :]
-        predicted_a, predicted_c, predicted_ac = [np.zeros((2, 2)) for _ in range(3)]
-        predicted_ka, predicted_kc = np.zeros((2, 2)), np.zeros((2, 2))
+        predicted_a, predicted_c, predicted_ac = [
+            np.zeros((2, 2), dtype=dtype) for _ in range(3)
+        ]
+        predicted_ka, predicted_kc = (
+            np.zeros((2, 2), dtype=dtype),
+            np.zeros((2, 2), dtype=dtype),
+        )
         for i, ri in enumerate(weights):
             for p, pp in enumerate(projections):
                 ip = 0 if p == 0 else len(nodes) - 1
@@ -129,7 +138,9 @@ def assembly_check(source: HistoryArrays, settings: FilterSettings) -> dict:
             )
             maximum = max(maximum, float(error / scale))
             absolute = max(absolute, float(error))
-    if maximum > 1e-10:
+    # Matrix reconstruction and covariance products accumulate several
+    # rounding steps; retain the original double-precision gate.
+    if maximum > max(1e-10, 64 * np.finfo(source.tilt.dtype).eps):
         raise ValueError(
             f"Independent matrix-loop covariance assembly failed: {maximum}"
         )
@@ -151,13 +162,14 @@ class InterpolationDiagnostics:
     """
 
     def __init__(self, source: HistoryArrays, settings: FilterSettings):
+        self.dtype = source.tilt.dtype
         self.settings = settings
         self.positions = source.positions
         self.indices = np.linspace(
             0, len(source.positions) - 1, min(3, len(source.positions)), dtype=int
         )
         self.midpoints = (
-            np.array(settings.strengths[:-1]) + settings.strengths[1:]
+            np.array(settings.strengths[:-1], dtype=self.dtype) + settings.strengths[1:]
         ) / 2
         self.feedback_predicted = PooledCovariances()
         self.feedback_truth = PooledCovariances()
@@ -168,7 +180,7 @@ class InterpolationDiagnostics:
         if min(len(xs), len(ys)) < 3:
             self.training = np.arange(len(self.positions))
             self.withheld = np.array([], dtype=int)
-            self.weights = np.empty((0, len(self.positions)))
+            self.weights = np.empty((0, len(self.positions)), dtype=self.dtype)
             return
         training = np.flatnonzero(
             np.isin(self.positions[:, 0], xs[::2])
@@ -177,7 +189,9 @@ class InterpolationDiagnostics:
         self.training = training
         cx, cy, mapping, _ = rectangular_mapping(self.positions[training])
         weights = RegularGridInterpolator(
-            (cx, cy), np.eye(len(training))[mapping], bounds_error=True
+            (cx, cy),
+            np.eye(len(training), dtype=self.dtype)[mapping],
+            bounds_error=True,
         )
         withheld = np.flatnonzero(~np.isin(np.arange(len(self.positions)), training))
         withheld = withheld[
@@ -193,7 +207,9 @@ class InterpolationDiagnostics:
             if len(withheld)
             else withheld
         )
-        self.weights = weights(self.positions[self.withheld])
+        self.weights = np.asarray(
+            weights(self.positions[self.withheld]), dtype=self.dtype
+        )
 
     def add(self, source: HistoryArrays) -> None:
         """Add one independent PH with the common full-grid exposure convention."""
@@ -222,7 +238,7 @@ class InterpolationDiagnostics:
                 midpoint_features(small.tilt),
                 midpoint_features(small.coma),
             )
-            b = np.array(self.settings.strengths)
+            b = np.array(self.settings.strengths, dtype=self.dtype)
 
             def interpolate(history):
                 # Covariance interpolation is the same linear map on both inputs.
@@ -321,7 +337,7 @@ def precision_report(
     scale = np.outer(rms, rms)
     correlation = np.divide(mean, scale, out=np.zeros_like(mean), where=scale > 0)
     minimum = float(np.linalg.eigvalsh(correlation).min())
-    if minimum < -1e-12:
+    if minimum < -max(1e-12, 8 * total * np.finfo(grams.dtype).eps):
         raise ValueError(f"Joint feature covariance is not PSD: {minimum}")
     rng = np.random.default_rng(seed)
     samples = np.array(
@@ -404,7 +420,7 @@ def joint_query_check(model) -> dict:
         )
         for f, g, h in [(0.18, 0.64, 0.1), (0.53, 0.39, 0.45), (0.86, 0.13, 0.9)]
     ]
-    matrix = np.empty((18, 18))
+    matrix = np.empty((18, 18), dtype=model.dtype)
     for i, (x, y, b) in enumerate(queries):
         for j, (xx, yy, bb) in enumerate(queries):
             for (left, right), name in names.items():
@@ -422,7 +438,9 @@ def joint_query_check(model) -> dict:
     scale = np.outer(rms, rms)
     correlation = np.divide(matrix, scale, out=np.zeros_like(matrix), where=scale > 0)
     minimum = float(np.linalg.eigvalsh(correlation).min())
-    if symmetry > 1e-12 or minimum < -1e-12:
+    if symmetry > max(1e-12, 16 * np.finfo(matrix.dtype).eps) or minimum < -max(
+        1e-12, 8 * len(matrix) * np.finfo(matrix.dtype).eps
+    ):
         raise ValueError(
             f"Interpolated joint covariance invalid: symmetry={symmetry}, eigenvalue={minimum}"
         )
@@ -478,7 +496,7 @@ def pilot_diagnostics(
                     )
                 scale = max(float(np.max(abs(expected))), np.finfo(float).tiny)
                 error = float(np.max(abs(expected - output)) / scale)
-                if error > 1e-10:
+                if error > max(1e-10, 64 * np.finfo(values.dtype).eps):
                     raise ValueError(
                         f"Scalar recurrence disagreement: {input_name}, b={b}, {error}"
                     )

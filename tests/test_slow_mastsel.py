@@ -77,29 +77,44 @@ def test_real_mastsel_engine_matches_retained_hybrid_golden(tmp_path: Path) -> N
                 sr=np.array([0.24, 0.22, 0.20]) * u.one,
             ),
             interpolation_config=RbfInterpolationConfig(smoothing=0.0),
+            dtype=np.float64,
         ),
         ngs_path,
     )
     configuration_path = tmp_path / "hybrid.ini"
     shutil.copyfile(EXAMPLE, configuration_path)
-    result = run_configuration(configuration_path)
+    result = run_configuration(configuration_path, dtype=np.float64)
     persisted = load_result(tmp_path / "results" / "hybrid.h5")
     cli_output = tmp_path / "results" / "cli.h5"
-    assert cli.main([str(configuration_path), "--output", str(cli_output)]) == 0
+    assert (
+        cli.main(
+            [
+                str(configuration_path),
+                "--output",
+                str(cli_output),
+                "--precision",
+                "float64",
+            ]
+        )
+        == 0
+    )
     cli_result = load_result(cli_output)
     golden = json.loads(
         (DATA / "mastsel_reference_golden.json").read_text(encoding="utf-8")
     )
 
     assert result.psfs.shape == (3, PSF_SIZE, PSF_SIZE)
-    assert result.psfs.dtype == np.float32
+    assert result.psfs.dtype == np.float64
     assert result.diagnostics is not None
     assert not np.any(result.psd_clipped)
     assert result.provenance["configuration"] == str(configuration_path)
     np.testing.assert_array_equal(persisted.psfs, result.psfs)
     np.testing.assert_array_equal(cli_result.psfs, result.psfs)
     np.testing.assert_allclose(
-        result.ngs_metrics.ee.to_value(u.one), [0.42, 0.40, 0.38], rtol=0.0, atol=1e-12
+        result.ngs_metrics.ee.to_value(u.one),
+        np.array([0.42, 0.40, 0.38], dtype=result.ngs_metrics.dtype),
+        rtol=0.0,
+        atol=1e-12,
     )
     np.testing.assert_allclose(
         result.ctot_angle.to_value(u.mas**2), golden["ctot_mas2"], rtol=1e-5, atol=1e-7
@@ -120,7 +135,7 @@ def test_real_mastsel_engine_matches_retained_hybrid_golden(tmp_path: Path) -> N
 
     # The same MASTSEL-only INI and loaded providers also work through the
     # public Python magnitude path, independently of AO Predict.
-    configuration = load_configuration(configuration_path)
+    configuration = load_configuration(configuration_path, dtype=np.float64)
     zeropoint = 1.0e10 * u.photon / (u.m**2 * u.s)
     photometry = WFSPhotometryConfig(
         telescope_diameter=TELESCOPE_DIAMETER_M * u.m,

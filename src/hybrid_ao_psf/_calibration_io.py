@@ -22,6 +22,7 @@ from ._calibration_contracts import (
     SensingWfsMeasurements,
 )
 from ._io import atomic_output_path
+from ._validation import validate_psf_dtype
 
 _SAMPLE_SCHEMAS = {
     "covariance-telemetry": (
@@ -89,17 +90,47 @@ def save_calibration_samples(
         raise TypeError("unsupported calibration sample record")
     header = {
         "schema": "hybrid-ao-psf-calibration-samples",
-        "version": 1,
+        "version": 2 if hasattr(samples, "dtype") else 1,
         "kind": kind,
         "units": units,
     }
-    arrays = {item.name: getattr(samples, item.name) for item in fields(samples)}
+    if hasattr(samples, "dtype"):
+        header["precision"] = samples.dtype.name
+    arrays = {
+        item.name: getattr(samples, item.name)
+        for item in fields(samples)
+        if item.name != "dtype"
+    }
     arrays = {
         name: value.value if isinstance(value, u.Quantity) else value
         for name, value in arrays.items()
     }
     with atomic_output_path(Path(path)) as temporary, temporary.open("wb") as stream:
         np.savez(stream, __header__=json.dumps(header, sort_keys=True), **arrays)
+
+
+def validate_observation_precision(header, saved, *, history_fields=()):
+    """Reject missing/mismatched v2 declarations before coercing constructors.
+
+    Replay history fields retain their actual captured precision independently
+    of calculation precision, including legacy histories rewritten as v2.
+    """
+    if not isinstance(header, dict):
+        raise ValueError("invalid observation header")  # noqa: TRY004 -- persisted schema, not a call argument.
+    if header.get("version") != 2:
+        return
+    if header.get("precision") not in ("float32", "float64"):
+        raise ValueError("version-2 observations require precision float32 or float64")
+    dtype = validate_psf_dtype(header["precision"])
+    for name in saved.files:
+        if name == "__header__":
+            continue
+        if name == "pupil" and saved[name].dtype == np.dtype(bool):
+            continue
+        if name in history_fields:
+            validate_psf_dtype(saved[name].dtype)
+        elif saved[name].dtype != dtype:
+            raise ValueError(f"observation precision mismatch at {name}")
 
 
 def load_calibration_samples(
@@ -126,22 +157,29 @@ def load_calibration_samples(
         header = json.loads(str(saved["__header__"]))
         if (
             not isinstance(header, dict)
-            or set(header) != {"schema", "version", "kind", "units"}
+            or set(header)
+            != {"schema", "version", "kind", "units"}
+            | ({"precision"} if header.get("version") == 2 else set())
             or header["schema"] != "hybrid-ao-psf-calibration-samples"
             or type(header["version"]) is not int
-            or header["version"] != 1
+            or header["version"] not in (1, 2)
             or header["kind"] not in _SAMPLE_SCHEMAS
         ):
             raise ValueError("unsupported calibration-samples schema")
+        validate_observation_precision(header, saved)
         cls, units = _SAMPLE_SCHEMAS[header["kind"]]
         if header["units"] != units or set(saved.files) != {
             "__header__",
-            *(item.name for item in fields(cls)),
+            *(item.name for item in fields(cls) if item.name != "dtype"),
         }:
             raise ValueError(
                 "calibration sample fields/units do not match their schema"
             )
-        values = {item.name: saved[item.name] for item in fields(cls)}
+        values = {
+            item.name: saved[item.name] for item in fields(cls) if item.name != "dtype"
+        }
+        if any(item.name == "dtype" for item in fields(cls)):
+            values["dtype"] = header.get("precision", np.float64)
         for name, unit in units.items():
             values[name] = values[name] * u.Unit(unit)
         return cls(**values)

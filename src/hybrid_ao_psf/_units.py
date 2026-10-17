@@ -38,7 +38,9 @@ def require_quantity(
     try:
         return value.to(unit, copy=False)
     except u.UnitConversionError as exc:
-        raise ValueError(f"{label} must have units equivalent to {unit_string(unit)!r}.") from exc
+        raise ValueError(
+            f"{label} must have units equivalent to {unit_string(unit)!r}."
+        ) from exc
 
 
 def quantity_value(
@@ -49,6 +51,8 @@ def quantity_value(
     dtype: Any | None = None,
 ) -> np.ndarray:
     """Return the unit-normalized numerical view of one required quantity."""
+    if dtype is not None and isinstance(value, u.Quantity):
+        value = value.astype(dtype)
     quantity = require_quantity(value, unit, label=label)
     return np.asarray(quantity.value, dtype=dtype)
 

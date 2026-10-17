@@ -32,13 +32,15 @@ def samples():
             common - 10 * matrix[:, 1],
         ]
     )
-    return SensingWfsMeasurements(zero=zero * u.mas, shifted=shifted * u.mas), matrix
+    return SensingWfsMeasurements(
+        zero=zero * u.mas, shifted=shifted * u.mas, dtype=np.float64
+    ), matrix
 
 
 def test_paired_gain_and_population_covariance_known_inputs():
     measured, expected = samples()
     stats = estimate_sensing_statistics(
-        measured, displacement=10 * u.mas, block_draws=8
+        measured, displacement=10 * u.mas, block_draws=8, dtype=np.float64
     )
     np.testing.assert_allclose(
         stats.gain_matrix.value, expected, rtol=1e-14, atol=1e-14
@@ -74,10 +76,15 @@ def test_reusable_sensing_observations_preserve_raw_means_pairing_and_statistics
         sampling=SensingWfsSampling(
             zero_draws=128, gain_draws=64, block_draws=8, seed=77
         ),
-        controller=FixedGainIntegrator(gain=0.3, delay=2, frame_rate=500 * u.Hz),
-        photometry=CalibrationPhotometry(
-            magnitude_band="fixture", photons_per_frame_zeropoint=1e8 * u.photon
+        controller=FixedGainIntegrator(
+            gain=0.3, delay=2, frame_rate=500 * u.Hz, dtype=np.float64
         ),
+        photometry=CalibrationPhotometry(
+            magnitude_band="fixture",
+            photons_per_frame_zeropoint=1e8 * u.photon,
+            dtype=np.float64,
+        ),
+        dtype=np.float64,
     )
     path = tmp_path / "measured.npz"
     save_sensing_measurements(point, path)
@@ -110,9 +117,13 @@ def test_complete_sensing_offline_replay_shape_fit_and_roundtrip(tmp_path):
         save_sensing_replay,
     )
 
-    controller = FixedGainIntegrator(gain=0.3, delay=2, frame_rate=500 * u.Hz)
+    controller = FixedGainIntegrator(
+        gain=0.3, delay=2, frame_rate=500 * u.Hz, dtype=np.float64
+    )
     photometry = CalibrationPhotometry(
-        magnitude_band="fixture", photons_per_frame_zeropoint=1e8 * u.photon
+        magnitude_band="fixture",
+        photons_per_frame_zeropoint=1e8 * u.photon,
+        dtype=np.float64,
     )
     sampling = SensingWfsSampling(zero_draws=128, gain_draws=64, block_draws=8, seed=77)
     measured, _ = samples()
@@ -130,10 +141,14 @@ def test_complete_sensing_offline_replay_shape_fit_and_roundtrip(tmp_path):
                         sampling=sampling,
                         controller=controller,
                         photometry=photometry,
+                        dtype=np.float64,
                     )
                 )
     response = build_sensing_response(
-        points, field_radius=2 * u.arcsec, magnitude_intervals=[[8, 10]] * u.mag
+        points,
+        field_radius=2 * u.arcsec,
+        magnitude_intervals=[[8, 10]] * u.mag,
+        dtype=np.float64,
     )
     prediction = response.model.predict(
         positions=[[0, 0]] * u.arcsec, magnitudes=9 * u.mag, zenith_angle=20 * u.deg
@@ -149,6 +164,7 @@ def test_complete_sensing_offline_replay_shape_fit_and_roundtrip(tmp_path):
         frame_rate=500 * u.Hz,
         tilt=tilt * u.mas,
         coma=(tilt * 2) * u.nm,
+        dtype=np.float64,
     )
     covariances = build_covariance_calibration(
         [
@@ -158,13 +174,16 @@ def test_complete_sensing_offline_replay_shape_fit_and_roundtrip(tmp_path):
                 settings=CovarianceCalibrationSettings(
                     feedback=(0.5, 1, 1.5), bootstrap_draws=7
                 ),
+                dtype=np.float64,
             )
-        ]
+        ],
+        dtype=np.float64,
     ).model
     prior = ReconstructorNoiseModel(
         photons_per_frame=[1, 1e6] * u.photon,
         fwhm=[50, 100] * u.mas,
         variance=np.ones((2, 2)) * 0.01 * u.mas**2,
+        dtype=np.float64,
     )
     requests = [
         SensingReplayRequest(
@@ -176,6 +195,7 @@ def test_complete_sensing_offline_replay_shape_fit_and_roundtrip(tmp_path):
             ee=np.full(n, 0.5) * u.one,
             fwhm=np.full(n, 80) * u.mas,
             seed=901 + n,
+            dtype=np.float64,
         )
         for n in (1, 2, 3)
     ]
@@ -189,7 +209,7 @@ def test_complete_sensing_offline_replay_shape_fit_and_roundtrip(tmp_path):
     )
     replays = list(
         replay_sensing_calibration(
-            response, requests, covariances, prior, settings=settings
+            response, requests, covariances, prior, settings=settings, dtype=np.float64
         )
     )
     for replay in replays:
@@ -221,7 +241,7 @@ def test_complete_sensing_offline_replay_shape_fit_and_roundtrip(tmp_path):
         centred = displacement - pooled
         np.testing.assert_allclose(
             replay.displacements.value,
-            centred.astype(np.float32),
+            centred.astype(replay.dtype),
             rtol=1e-10,
             atol=1e-10,
         )
@@ -254,6 +274,7 @@ def test_complete_sensing_offline_replay_shape_fit_and_roundtrip(tmp_path):
                 ),
                 *replays[1:],
             ],
+            dtype=np.float64,
         )
     with pytest.raises(ValueError, match="positive semidefinite"):
         replace(replays[0], measured_covariance=np.diag([-1.0, 1.0]) * u.mas**2)
@@ -278,7 +299,7 @@ def test_complete_sensing_offline_replay_shape_fit_and_roundtrip(tmp_path):
     np.savez_compressed(path, **arrays)
     with pytest.raises(ValueError, match="history moments"):
         load_sensing_replay(path)
-    result = build_sensing_calibration(response, replays)
+    result = build_sensing_calibration(response, replays, dtype=np.float64)
     assert result.diagnostics["asterisms"] == 3
     assert result.diagnostics["final_fit"]["family_weights"] == {
         "single": 0.5,
@@ -313,4 +334,5 @@ def test_empty_replay_asterism_is_rejected_before_loop_work():
             ee=np.empty(0) * u.one,
             fwhm=np.empty(0) * u.mas,
             seed=7,
+            dtype=np.float64,
         )

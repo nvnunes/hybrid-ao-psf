@@ -15,7 +15,9 @@ def main(argv: Sequence[str] | None = None) -> int:
         prog="hybrid-ao-psf",
         description="Run one MASTSEL-backed Hybrid AO PSF simulation.",
     )
-    parser.add_argument("configuration", type=Path, help="combined Hybrid-and-MASTSEL INI")
+    parser.add_argument(
+        "configuration", type=Path, help="combined Hybrid-and-MASTSEL INI"
+    )
     parser.add_argument(
         "--output",
         type=Path,
@@ -26,12 +28,18 @@ def main(argv: Sequence[str] | None = None) -> int:
         action="store_true",
         help="replace an existing result file",
     )
+    parser.add_argument(
+        "--precision",
+        choices=("float32", "float64"),
+        help="override [hybrid] precision",
+    )
     arguments = parser.parse_args(argv)
     try:
         run_configuration(
             arguments.configuration,
             output=arguments.output,
             overwrite=arguments.overwrite,
+            dtype=arguments.precision,
         )
     except (OSError, TypeError, ValueError, RuntimeError) as exc:
         parser.exit(1, f"hybrid-ao-psf: {type(exc).__name__}: {exc}\n")

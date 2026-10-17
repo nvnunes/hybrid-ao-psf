@@ -20,6 +20,15 @@ Artifact and output paths are resolved relative to the INI file. The artifact
 paths must exist when the configuration is loaded; the output and its parent
 directory may be created later.
 
+`precision = float32|float64` selects shared numerical state, calculations and
+outputs; the default is float32. Python `load_configuration(..., dtype=...)` or
+`run_configuration(..., dtype=...)` and CLI `--precision` override the INI.
+Omitting an override preserves the INI choice. `HybridRequest.dtype` supplies
+the same boundary to direct Python calls. Loaded concrete providers are
+prepared once for that precision, without changing their saved producer state.
+MASTSEL and native WFS arithmetic remain engine-owned; SciPy internal solver
+workspace may differ, while shared callbacks use the selected dtype.
+
 `non_psd_policy` is optional and defaults to `error`. The other accepted value
 is `clip`. `diagnostics_level` is optional and defaults to `none`. The
 `validation` level retains lightweight PSD validity and angular-Ctot summary
@@ -93,3 +102,10 @@ configuration. From a bootstrapped checkout:
 The builder creates the two ready-to-evaluate products referenced by the INI.
 The command writes the configured `examples/results/hybrid.h5` result. The
 sample is also the Python-and-CLI real-MASTSEL end-to-end verification route.
+
+### Calibration Precision
+
+The optional `[e2e] precision = float32|float64` selects shared calculation
+precision (default float32). `E2ECalibrationConfiguration.dtype` is the resolved
+NumPy dtype. `with_overrides(dtype=...)` overrides the INI; omitting it retains
+the INI choice. Native WFS arithmetic remains owned by the native adapter.

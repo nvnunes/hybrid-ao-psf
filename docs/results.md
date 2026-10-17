@@ -2,8 +2,11 @@
 
 `save_result()` writes one `HybridResult` to HDF5. Files identify themselves
 with root attributes `schema = "hybrid-ao-psf-result"` and
-`schema_version = 1`. `load_result()` rejects other identities or versions
-rather than guessing at compatibility.
+`schema_version = 2` and `precision = float32|float64`. `load_result()` also
+accepts version 1, preserving each stored array and exposing `result.dtype=None`
+when no uniform arithmetic precision was recorded. Saving that result retains
+its arrays and writes `precision=mixed`. Other identities/versions and declared
+precision mismatches are rejected.
 
 ## Layout
 
@@ -28,7 +31,7 @@ rather than guessing at compatibility.
 
 Every physical quantity dataset carries a `unit` attribute containing an
 Astropy-readable unit string. The final PSF and optional pre-blur PSF datasets
-are dimensionless `float32` arrays in the provider's flux convention. Ctot,
+are dimensionless arrays at the result precision in the provider's flux convention. Ctot,
 NGS inputs, metrics, jitter, PSF metadata, and source metadata retain explicit
 units. `ngs/flux` always stores the effective `photon / s` rate. The magnitude
 and caller-supplied zeropoint datasets are present together only for magnitude

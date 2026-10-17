@@ -302,3 +302,18 @@ assert FixedGainIntegrator(gain=.3, delay=2, frame_rate=500*u.Hz).delay == 2
         capture_output=True,
         text=True,
     )
+
+
+def test_precision_configuration_defaults_ini_and_explicit_override(tmp_path):
+    path = ini(tmp_path)
+    assert load_e2e_calibration_configuration(path).dtype == np.dtype("float32")
+    path = ini(tmp_path, "precision = float64\n")
+    configured = load_e2e_calibration_configuration(path)
+    assert configured.dtype == np.dtype("float64")
+    assert configured.with_overrides().dtype == np.dtype("float64")
+    assert configured.with_overrides(dtype=np.float32).dtype == np.dtype("float32")
+    with pytest.raises(ValueError, match="float32 or float64"):
+        configured.with_overrides(dtype="int64")
+    path = ini(tmp_path, "precision = float16\n")
+    with pytest.raises(ValueError, match="float32 or float64"):
+        load_e2e_calibration_configuration(path)

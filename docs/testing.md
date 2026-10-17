@@ -46,7 +46,10 @@ surface.
 `test_psf_precision.py` checks explicit float64 source-node pixels, flux,
 off-node interpolation and replay through save/load and prediction, while
 preserving existing float32 defaults and rejecting unsupported precisions.
-The engine and result contract remain float32.
+It also checks physical metadata, NGS metrics, immutable runtime preparation
+and retention of producer precision. `test_execution_precision.py` adds independent FFT comparisons, a source
+pixel perturbation below float32 resolution, metrics, both-mode result
+round trips, legacy mixed-array preservation and declared-precision rejection.
 
 ## Calibration Input Coverage
 

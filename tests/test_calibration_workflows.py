@@ -46,12 +46,16 @@ class SyntheticCalibration(E2ECalibration):
 
     def controller(self, zenith_angle):
         self._native()
-        return FixedGainIntegrator(gain=0.3, delay=2, frame_rate=500 * u.Hz)
+        return FixedGainIntegrator(
+            gain=0.3, delay=2, frame_rate=500 * u.Hz, dtype=self.configuration.dtype
+        )
 
     def photometry(self, zenith_angle):
         self._native()
         return CalibrationPhotometry(
-            magnitude_band="fixture", photons_per_frame_zeropoint=1e8 * u.photon
+            magnitude_band="fixture",
+            photons_per_frame_zeropoint=1e8 * u.photon,
+            dtype=self.configuration.dtype,
         )
 
     def measure_reconstructor_noise(self, zenith_angle, inputs):
@@ -62,7 +66,8 @@ class SyntheticCalibration(E2ECalibration):
             / (inputs.photons_per_frame.value * inputs.ee.value)
         )
         return ReconstructorNoiseMeasurements(
-            covariance=variance[:, None, None] * np.eye(2) * u.mas**2
+            covariance=variance[:, None, None] * np.eye(2) * u.mas**2,
+            dtype=self.configuration.dtype,
         )
 
     def read_covariance_telemetry(self, zenith_angles=None):
@@ -78,6 +83,7 @@ class SyntheticCalibration(E2ECalibration):
                 frame_rate=500 * u.Hz,
                 tilt=data * u.mas,
                 coma=data * 2 * u.nm,
+                dtype=self.configuration.dtype,
             )
 
     def read_coma_wavefronts(self, zenith_angle, samples):
@@ -87,6 +93,7 @@ class SyntheticCalibration(E2ECalibration):
             wavefront=rng.normal(size=(samples, 4, 4)) * u.nm,
             coma=(rng.normal(size=(samples, 2)) * 30 + 4) * u.nm,
             pupil=np.ones((4, 4), dtype=bool),
+            dtype=self.configuration.dtype,
         )
 
     def measure_coma_wfs(self, zenith_angle, wavefronts, sampling):
@@ -102,7 +109,11 @@ class SyntheticCalibration(E2ECalibration):
         draws = np.repeat(
             tilt[:, :, None, :] + noise, sampling.noise_draws // 4, axis=2
         )
-        return ComaWfsMeasurements(measured=draws * u.mas, noiseless=tilt * u.mas)
+        return ComaWfsMeasurements(
+            measured=draws * u.mas,
+            noiseless=tilt * u.mas,
+            dtype=self.configuration.dtype,
+        )
 
     def measure_sensing_wfs(self, zenith_angle, spot, sampling):
         self._native()
@@ -112,13 +123,16 @@ class SyntheticCalibration(E2ECalibration):
         zero = rng.normal(size=(sampling.zero_draws, 2)) + [3, -7]
         paired = rng.normal(size=(sampling.gain_draws, 2))
         shifted = paired[None, :, :] + spot.displacements.value[1:, None, :]
-        return SensingWfsMeasurements(zero=zero * u.mas, shifted=shifted * u.mas)
+        return SensingWfsMeasurements(
+            zero=zero * u.mas, shifted=shifted * u.mas, dtype=self.configuration.dtype
+        )
 
 
-@pytest.fixture(scope="module")
-def pipeline(tmp_path_factory):
+@pytest.fixture(scope="module", params=[np.float32, np.float64])
+def pipeline(tmp_path_factory, request):
     tmp_path = tmp_path_factory.mktemp("calibration-pipeline")
     config = E2ECalibrationConfiguration(
+        dtype=request.param,
         source=tmp_path / "unused.ini",
         **{
             f"{family}_model": tmp_path / family / "model.json"
@@ -194,7 +208,10 @@ def pipeline(tmp_path_factory):
     )
     calibration.native_available = False
     response = build_sensing_response(
-        points, field_radius=2 * u.arcsec, magnitude_intervals=[[8, 10]] * u.mag
+        points,
+        field_radius=2 * u.arcsec,
+        magnitude_intervals=[[8, 10]] * u.mag,
+        dtype=config.dtype,
     )
     requests = [
         SensingReplayRequest(

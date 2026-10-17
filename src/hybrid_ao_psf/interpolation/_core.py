@@ -27,14 +27,18 @@ class _FrozenRbfInterpolator:
     __slots__ = ("__interpolator",)
 
     def __init__(self, interpolator: RBFInterpolator) -> None:
-        object.__setattr__(self, "_FrozenRbfInterpolator__interpolator", deepcopy(interpolator))
+        object.__setattr__(
+            self, "_FrozenRbfInterpolator__interpolator", deepcopy(interpolator)
+        )
         _freeze_object_arrays(self.__interpolator)
 
     def __call__(self, coordinates: np.ndarray) -> np.ndarray:
         return self.__interpolator(coordinates)
 
     def __setattr__(self, name: str, value: object) -> None:
-        raise AttributeError(f"{type(self).__name__} is immutable; cannot set {name!r}.")
+        raise AttributeError(
+            f"{type(self).__name__} is immutable; cannot set {name!r}."
+        )
 
     def __getstate__(self) -> RBFInterpolator:
         return self.__interpolator
@@ -69,6 +73,24 @@ def freeze_artifact_value(value: Any) -> Any:
     return value
 
 
+def cast_artifact_value(value: Any, dtype: np.dtype) -> Any:
+    """Copy owned physical/numerical state without altering nonfloating metadata."""
+    if isinstance(value, u.Quantity):
+        return u.Quantity(value.value, value.unit, dtype=dtype, copy=True)
+    if isinstance(value, np.ndarray) and value.dtype.kind in "fc":
+        target = (
+            dtype
+            if value.dtype.kind == "f"
+            else (np.complex64 if dtype.itemsize == 4 else np.complex128)
+        )
+        return value.astype(target)
+    if isinstance(value, Mapping):
+        return {name: cast_artifact_value(item, dtype) for name, item in value.items()}
+    if isinstance(value, tuple):
+        return tuple(cast_artifact_value(item, dtype) for item in value)
+    return value
+
+
 def thaw_artifact_value(value: Any) -> Any:
     """Return ordinary containers suitable for project-owned pickle output."""
     if isinstance(value, Mapping):
@@ -82,7 +104,9 @@ def validate_rbf_config(config: RbfInterpolationConfig) -> RbfInterpolationConfi
     """Return a validated RBF configuration."""
 
     if not isinstance(config, RbfInterpolationConfig):
-        raise TypeError("interpolation_config must be a RbfInterpolationConfig instance.")
+        raise TypeError(
+            "interpolation_config must be a RbfInterpolationConfig instance."
+        )
     kernel = str(config.kernel).strip()
     if not kernel:
         raise ValueError("interpolation_config.kernel must be non-empty.")
@@ -95,11 +119,15 @@ def validate_rbf_config(config: RbfInterpolationConfig) -> RbfInterpolationConfi
     return RbfInterpolationConfig(kernel=kernel, smoothing=smoothing, degree=degree)
 
 
-def validate_regular_grid_config(config: RegularGridInterpolationConfig) -> RegularGridInterpolationConfig:
+def validate_regular_grid_config(
+    config: RegularGridInterpolationConfig,
+) -> RegularGridInterpolationConfig:
     """Return a validated regular-grid interpolation configuration."""
 
     if not isinstance(config, RegularGridInterpolationConfig):
-        raise TypeError("interpolation_config must be a RegularGridInterpolationConfig instance.")
+        raise TypeError(
+            "interpolation_config must be a RegularGridInterpolationConfig instance."
+        )
     method = str(config.method).strip()
     if method not in SUPPORTED_REGULAR_GRID_METHODS:
         supported = ", ".join(sorted(SUPPORTED_REGULAR_GRID_METHODS))
@@ -117,14 +145,16 @@ def zenith_angle_to_airmass(zenith_angle: u.Quantity) -> u.Quantity:
         A NumPy array of airmass values with the input shape.
     """
 
-    values = quantity_value(zenith_angle, u.deg, label="zenith_angle", dtype=float)
+    values = quantity_value(zenith_angle, u.deg, label="zenith_angle")
     return (1.0 / np.cos(np.deg2rad(values))) * u.dimensionless_unscaled
 
 
-def require_finite_vector(value: Any, *, label: str, length: int | None = None) -> np.ndarray:
+def require_finite_vector(
+    value: Any, *, label: str, length: int | None = None, dtype=None
+) -> np.ndarray:
     """Return a finite 1-D float vector."""
 
-    vector = np.asarray(value, dtype=float).reshape(-1)
+    vector = np.asarray(value, dtype=dtype).reshape(-1)
     if length is not None and vector.size != int(length):
         raise ValueError(f"{label} must have length {int(length)}, got {vector.size}.")
     if not np.all(np.isfinite(vector)):
@@ -132,10 +162,12 @@ def require_finite_vector(value: Any, *, label: str, length: int | None = None) 
     return vector
 
 
-def require_positive_vector(value: Any, *, label: str, length: int | None = None) -> np.ndarray:
+def require_positive_vector(
+    value: Any, *, label: str, length: int | None = None, dtype=None
+) -> np.ndarray:
     """Return a finite positive 1-D float vector."""
 
-    vector = require_finite_vector(value, label=label, length=length)
+    vector = require_finite_vector(value, label=label, length=length, dtype=dtype)
     if np.any(vector <= 0.0):
         raise ValueError(f"{label} must contain only values > 0.")
     return vector
@@ -153,10 +185,12 @@ def require_positive_scalar(value: Any, *, label: str) -> float:
     return scalar
 
 
-def require_pupil(value: Any, *, label: str = "tel_pupil") -> np.ndarray:
+def require_pupil(
+    value: Any, *, label: str = "tel_pupil", dtype=np.float32
+) -> np.ndarray:
     """Return a finite 2-D telescope pupil array."""
 
-    pupil = np.asarray(value, dtype=np.float32)
+    pupil = np.asarray(value, dtype=dtype)
     if pupil.ndim != 2:
         raise ValueError(f"{label} must be a 2-D array; got shape {pupil.shape}.")
     if not np.all(np.isfinite(pupil)):
@@ -174,10 +208,12 @@ def normalize_psfs(psfs: np.ndarray) -> np.ndarray:
     return (psf_cube / totals).astype(np.float32, copy=False)
 
 
-def validate_psf_array(psfs: Any, *, label: str, ndim: int) -> np.ndarray:
+def validate_psf_array(
+    psfs: Any, *, label: str, ndim: int, dtype=np.float32
+) -> np.ndarray:
     """Return a finite PSF array with the expected dimensionality."""
 
-    array = np.asarray(psfs, dtype=np.float32)
+    array = np.asarray(psfs, dtype=dtype)
     if array.ndim != ndim:
         raise ValueError(f"{label} must have ndim={ndim}, got shape {array.shape}.")
     if not np.all(np.isfinite(array)):
@@ -191,13 +227,17 @@ def field_coordinates(x: Any, y: Any) -> np.ndarray:
     """Return validated ``(x, y)`` field coordinates."""
 
     x = require_finite_vector(quantity_value(x, u.arcsec, label="x"), label="x")
-    y = require_finite_vector(quantity_value(y, u.arcsec, label="y"), label="y", length=x.size)
+    y = require_finite_vector(
+        quantity_value(y, u.arcsec, label="y"), label="y", length=x.size
+    )
     if x.size == 0:
         raise ValueError("At least one field coordinate is required.")
     return np.column_stack([x, y])
 
 
-def rectangular_field_axes(x: Any, y: Any, *, label: str) -> tuple[np.ndarray, np.ndarray]:
+def rectangular_field_axes(
+    x: Any, y: Any, *, label: str
+) -> tuple[np.ndarray, np.ndarray]:
     """Return sorted rectangular field axes after validating complete support."""
 
     coordinates = field_coordinates(x, y)
@@ -214,7 +254,9 @@ def rectangular_field_axes(x: Any, y: Any, *, label: str) -> tuple[np.ndarray, n
         iy = axis_index(y_axis, float(y_value), label="y")
         key = (iy, ix)
         if key in seen:
-            raise ValueError(f"Duplicate {label} field point at x={x_value}, y={y_value}.")
+            raise ValueError(
+                f"Duplicate {label} field point at x={x_value}, y={y_value}."
+            )
         seen.add(key)
     return x_axis, y_axis
 
@@ -263,12 +305,18 @@ def validate_rectangular_field_query(
     x = np.asarray(coordinates[:, 0], dtype=float)
     y = np.asarray(coordinates[:, 1], dtype=float)
     if np.any(x < x_axis[0] - atol) or np.any(x > x_axis[-1] + atol):
-        raise ValueError(f"x query is outside {label} field support [{x_axis[0]}, {x_axis[-1]}].")
+        raise ValueError(
+            f"x query is outside {label} field support [{x_axis[0]}, {x_axis[-1]}]."
+        )
     if np.any(y < y_axis[0] - atol) or np.any(y > y_axis[-1] + atol):
-        raise ValueError(f"y query is outside {label} field support [{y_axis[0]}, {y_axis[-1]}].")
+        raise ValueError(
+            f"y query is outside {label} field support [{y_axis[0]}, {y_axis[-1]}]."
+        )
 
 
-def snap_rectangular_field_query(x_axis: Any, y_axis: Any, coordinates: np.ndarray) -> np.ndarray:
+def snap_rectangular_field_query(
+    x_axis: Any, y_axis: Any, coordinates: np.ndarray
+) -> np.ndarray:
     """Clip near-boundary rectangular field queries onto their field axes."""
 
     snapped = np.asarray(coordinates, dtype=float).copy()
@@ -286,8 +334,9 @@ def make_scaled_rbf_model(
 ) -> dict[str, Any]:
     """Fit scaled RBF models, dropping coordinate dimensions with no variation."""
 
+    dtype = np.asarray(next(iter(values_by_name.values()))).dtype
     config = validate_rbf_config(config)
-    coordinates = np.asarray(coordinates, dtype=float)
+    coordinates = np.asarray(coordinates, dtype=dtype)
     if coordinates.ndim != 2 or coordinates.shape[0] == 0:
         raise ValueError("coordinates must be a non-empty 2-D array.")
     if not np.all(np.isfinite(coordinates)):
@@ -306,9 +355,11 @@ def make_scaled_rbf_model(
 
     models: dict[str, _FrozenRbfInterpolator] = {}
     for name, values in values_by_name.items():
-        values = np.asarray(values, dtype=float)
+        values = np.asarray(values, dtype=dtype)
         if values.shape[0] != coordinates.shape[0]:
-            raise ValueError(f"{name} has leading dimension {values.shape[0]}; expected {coordinates.shape[0]}.")
+            raise ValueError(
+                f"{name} has leading dimension {values.shape[0]}; expected {coordinates.shape[0]}."
+            )
         if not np.all(np.isfinite(values)):
             raise ValueError(f"{name} contains non-finite values.")
         models[str(name)] = _FrozenRbfInterpolator(
@@ -330,16 +381,21 @@ def make_scaled_rbf_model(
     }
 
 
-def evaluate_scaled_rbf_model(model: Mapping[str, Any], coordinates: np.ndarray) -> dict[str, np.ndarray]:
+def evaluate_scaled_rbf_model(
+    model: Mapping[str, Any], coordinates: np.ndarray
+) -> dict[str, np.ndarray]:
     """Evaluate a scaled RBF model produced by ``make_scaled_rbf_model``."""
 
-    coordinates = np.asarray(coordinates, dtype=float)
+    dtype = np.asarray(model["coord_mean"]).dtype
+    coordinates = np.asarray(coordinates, dtype=dtype)
     active_dims = np.asarray(model["active_dims"], dtype=bool)
-    coord_mean = np.asarray(model["coord_mean"], dtype=float)
-    coord_scale = np.asarray(model["coord_scale"], dtype=float)
-    scaled = (coordinates[:, active_dims] - coord_mean[active_dims]) / coord_scale[active_dims]
+    coord_mean = np.asarray(model["coord_mean"], dtype=dtype)
+    coord_scale = np.asarray(model["coord_scale"], dtype=dtype)
+    scaled = (coordinates[:, active_dims] - coord_mean[active_dims]) / coord_scale[
+        active_dims
+    ]
     return {
-        name: np.asarray(interpolator(scaled), dtype=float)
+        name: np.asarray(interpolator(scaled), dtype=dtype)
         for name, interpolator in dict(model["models"]).items()
     }
 
@@ -350,7 +406,11 @@ def unique_sorted(values: np.ndarray, *, label: str) -> np.ndarray:
     values = require_finite_vector(values, label=label)
     if values.size == 0:
         raise ValueError(f"{label} must not be empty.")
-    rounded = np.round(values, decimals=10)
+    # Ten decimal places are below float32 resolution; scaling by 1e10
+    # can itself move representable nodes such as 30 or 60.
+    rounded = (
+        values if values.dtype == np.dtype("float32") else np.round(values, decimals=10)
+    )
     unique = np.asarray(sorted({float(value) for value in rounded}), dtype=float)
     return unique
 
@@ -364,21 +424,29 @@ def axis_index(axis: np.ndarray, value: float, *, label: str) -> int:
     return int(matches[0])
 
 
-def interpolation_axis_weights(axis: np.ndarray, value: float, *, label: str) -> list[tuple[int, float]]:
+def interpolation_axis_weights(
+    axis: np.ndarray, value: float, *, label: str
+) -> list[tuple[int, float]]:
     """Return linear interpolation weights, rejecting out-of-range values."""
 
-    axis = np.asarray(axis, dtype=float).reshape(-1)
-    value = float(value)
+    axis = np.asarray(axis).reshape(-1)
+    value = axis.dtype.type(value)
     if axis.size == 0:
         raise ValueError(f"{label} axis is empty.")
     if axis.size == 1:
         if np.isclose(value, axis[0], rtol=0.0, atol=_AXIS_ATOL):
             return [(0, 1.0)]
-        raise ValueError(f"{label}={value} is outside the supported range [{axis[0]}, {axis[0]}].")
+        raise ValueError(
+            f"{label}={value} is outside the supported range [{axis[0]}, {axis[0]}]."
+        )
     if value < axis[0] and not np.isclose(value, axis[0], rtol=0.0, atol=_AXIS_ATOL):
-        raise ValueError(f"{label}={value} is below the supported range minimum {axis[0]}.")
+        raise ValueError(
+            f"{label}={value} is below the supported range minimum {axis[0]}."
+        )
     if value > axis[-1] and not np.isclose(value, axis[-1], rtol=0.0, atol=_AXIS_ATOL):
-        raise ValueError(f"{label}={value} is above the supported range maximum {axis[-1]}.")
+        raise ValueError(
+            f"{label}={value} is above the supported range maximum {axis[-1]}."
+        )
     if np.isclose(value, axis[0], rtol=0.0, atol=_AXIS_ATOL):
         return [(0, 1.0)]
     if np.isclose(value, axis[-1], rtol=0.0, atol=_AXIS_ATOL):
@@ -423,7 +491,9 @@ def load_payload(path: Path) -> dict[str, Any]:
     return payload
 
 
-def validate_payload_kind(payload: Mapping[str, Any], *, kind: str, version: int) -> None:
+def validate_payload_kind(
+    payload: Mapping[str, Any], *, kind: str, version: int
+) -> None:
     """Validate common persisted artifact kind and version fields."""
 
     if payload.get("kind") != kind:

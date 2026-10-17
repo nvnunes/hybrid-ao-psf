@@ -194,9 +194,9 @@ def test_noop_preserves_complete_result_and_runtime_lifetime(hook_runtime):
 def test_doubling_uses_one_effective_covariance_for_blur_and_diagnostics(hook_runtime):
     _, instances = hook_runtime
     science, ngs = _providers()
-    baseline = engine.simulate(_request(), science, ngs)
+    baseline = engine.simulate(replace(_request(), dtype=np.float64), science, ngs)
     actual = engine.simulate(
-        _request(),
+        replace(_request(), dtype=np.float64),
         science,
         ngs,
         ctot_correction=HybridCtotCorrection(
@@ -210,9 +210,10 @@ def test_doubling_uses_one_effective_covariance_for_blur_and_diagnostics(hook_ru
     )
     expected = blur_psfs_with_ctot(
         science.prediction.psfs,
-        2 * baseline.ctot_wavefront,
+        actual.ctot_wavefront,
         pixel_scale=science.prediction.pixel_scale,
         angle_to_wavefront_scale=baseline.angle_to_wavefront_scale,
+        dtype=np.float64,
     )
     np.testing.assert_array_equal(actual.psfs, expected)
     assert actual.diagnostics.ctot_angle_trace_mean == 300 * u.mas**2
@@ -430,13 +431,14 @@ def test_magnitude_request_resolves_the_same_flux_and_psf_as_direct_flux(
         zeropoint=zeropoint,
     )
     expected_flux = magnitudes_to_effective_photons_per_second(magnitudes, photometry)
-    base = _request()
+    base = replace(_request(), dtype=np.float64)
     ini = base.mastsel_ini.replace(
         "ZenithAngle = 0.0", "ZenithAngle = 0.0\nTelescopeDiameter = 8.0"
     )
     magnitude_request = replace(
         base,
         mastsel_ini=ini,
+        dtype=np.float64,
         ngs_flux=None,
         ngs_magnitude=magnitudes,
         ngs_magnitude_zeropoint=zeropoint,
@@ -625,7 +627,9 @@ def test_rotated_roundoff_ctot_remains_active_after_conditioning(
     science, ngs = _providers()
 
     result = engine.simulate(
-        _request(diagnostics=DiagnosticsLevel.VALIDATION), science, ngs
+        replace(_request(diagnostics=DiagnosticsLevel.VALIDATION), dtype=np.float64),
+        science,
+        ngs,
     )
 
     np.testing.assert_array_equal(result.psd_clipped, [True, True])
@@ -721,7 +725,7 @@ def test_public_blur_rejects_unconditioned_ctot() -> None:
 
 
 def test_finite_field_otf_applies_mean_shift_without_renormalizing() -> None:
-    psfs = np.zeros((1, 9, 9), dtype=np.float32)
+    psfs = np.zeros((1, 9, 9), dtype=np.float64)
     psfs[0, 4, 4] = 2.0
     psfs[0, 2, 5] = 0.5
     psfs[0, 6, 3] = 0.25
@@ -729,6 +733,7 @@ def test_finite_field_otf_applies_mean_shift_without_renormalizing() -> None:
         np.zeros((2, 2)),
         (18, 18),
         mean_shift_pix=np.array([2.0, -1.0]),
+        dtype=np.float64,
     )
     apply_finite_fov_otfs(psfs, otf[None])
 

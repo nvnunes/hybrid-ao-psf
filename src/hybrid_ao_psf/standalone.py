@@ -40,14 +40,13 @@ def run_configuration(
     *,
     output: str | Path | None = None,
     overwrite: bool = False,
+    dtype=None,
 ) -> HybridResult:
     """Run one combined INI and write its versioned standalone result."""
-    configuration = load_configuration(path)
+    configuration = load_configuration(path, dtype=dtype)
     result = simulate_configuration(configuration)
     destination = (
-        configuration.output
-        if output is None
-        else Path(output).expanduser().resolve()
+        configuration.output if output is None else Path(output).expanduser().resolve()
     )
     save_result(destination, result, overwrite=overwrite)
     return result

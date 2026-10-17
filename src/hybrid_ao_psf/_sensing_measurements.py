@@ -3,11 +3,12 @@
 from __future__ import annotations
 
 import json
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 
 import numpy as np
 from astropy import units as u
+from numpy.typing import DTypeLike
 
 from ._calibration_contracts import (
     CalibrationPhotometry,
@@ -18,6 +19,7 @@ from ._calibration_contracts import (
     _PhysicalRecord,
     _quantity,
 )
+from ._calibration_io import validate_observation_precision
 from ._calibration_products import (
     controller_header,
     photometry_header,
@@ -26,6 +28,7 @@ from ._calibration_products import (
 )
 from ._io import atomic_output_path
 from ._sensing_statistics import measurement_statistics
+from ._validation import validate_psf_dtype
 
 _KIND = "hybrid-ao-psf-sensing-measurements"
 
@@ -35,9 +38,10 @@ class WfsSensingStatistics(_PhysicalRecord):
     """Conditional noise and paired local-response estimates at one fixed spot.
 
     Attributes:
+        dtype: Real calculation/state precision, float32 by default or float64.
         mean: Two-component mean measured tilt at zero imposed displacement.
         covariance: Full (2,2) angular-squared population noise covariance.
-        white: Dimensionless paired zero draws, rounded to the accepted float32
+        white: Dimensionless paired zero draws, stored at the selected
             bank precision, retaining both axes and their sample order.
         gain_matrix: Dimensionless (2,2) local response, output x/y by input x/y.
         gain_standard_error: Dimensionless (2,2) paired-batch standard errors.
@@ -57,9 +61,12 @@ class WfsSensingStatistics(_PhysicalRecord):
     gain_blocks: u.Quantity
     shifted_means: u.Quantity
 
+    dtype: DTypeLike = field(default=np.float32, kw_only=True)
+
     def __post_init__(self):
+        object.__setattr__(self, "dtype", validate_psf_dtype(self.dtype))
         values = {
-            name: _quantity(getattr(self, name), unit, name, ndim)
+            name: _quantity(getattr(self, name), unit, name, ndim, dtype=self.dtype)
             for name, unit, ndim in (
                 ("mean", u.mas, 1),
                 ("covariance", u.mas**2, 2),
@@ -95,21 +102,31 @@ class WfsSensingStatistics(_PhysicalRecord):
 
 
 def estimate_sensing_statistics(
-    samples: SensingWfsMeasurements, *, displacement: u.Quantity, block_draws: int
+    samples: SensingWfsMeasurements,
+    *,
+    displacement: u.Quantity,
+    block_draws: int,
+    dtype=np.float32,
 ) -> WfsSensingStatistics:
     """Estimate gain/noise while preserving signed pairing and population divisors.
 
     Remove the mean conditionally at this fixed input for the noise covariance,
     retaining paired x/y draws and +x,-x,+y,-y ordering. All reductions use
-    float64; whitened bank values use the accepted float32 sample precision.
+    the selected precision; whitened samples retain that precision.
     """
     if not isinstance(samples, SensingWfsMeasurements):
         raise TypeError("samples must be SensingWfsMeasurements")
-    offset = _quantity(displacement, u.mas, "displacement", 0)
+    dtype = validate_psf_dtype(dtype)
+    offset = _quantity(displacement, u.mas, "displacement", 0, dtype=dtype)
     stats = measurement_statistics(
-        samples.zero.value, samples.shifted.value, float(offset.value), block_draws
+        samples.zero.value,
+        samples.shifted.value,
+        float(offset.value),
+        block_draws,
+        dtype=dtype,
     )
     return WfsSensingStatistics(
+        dtype=dtype,
         mean=stats["mean"] * u.mas,
         covariance=stats["covariance"] * u.mas**2,
         white=stats["white"] * u.one,
@@ -120,10 +137,10 @@ def estimate_sensing_statistics(
     )
 
 
-def _sensing_coordinates(position, magnitude):
+def _sensing_coordinates(position, magnitude, *, dtype=np.float64):
     """Validate one physical WFS direction and scalar magnitude before dispatch."""
-    position = _quantity(position, u.arcsec, "position", 1)
-    magnitude = _quantity(magnitude, u.mag, "magnitude", 0)
+    position = _quantity(position, u.arcsec, "position", 1, dtype=dtype)
+    magnitude = _quantity(magnitude, u.mag, "magnitude", 0, dtype=dtype)
     if position.shape != (2,):
         raise ValueError("two-axis sensing position required")
     return position, magnitude
@@ -134,6 +151,7 @@ class SensingCalibrationMeasurements(_PhysicalRecord):
     """Reusable paired WFS draws and physical coordinates for one calibration point.
 
     Attributes:
+        dtype: Real calculation/state precision, float32 by default or float64.
         zenith_angle: Scalar physical viewing angle.
         position: Cartesian angular x/y direction, shape (2,).
         magnitude: Scalar magnitude in the declared photometric convention.
@@ -155,13 +173,20 @@ class SensingCalibrationMeasurements(_PhysicalRecord):
     controller: FixedGainIntegrator
     photometry: CalibrationPhotometry
 
+    dtype: DTypeLike = field(default=np.float32, kw_only=True)
+
     def __post_init__(self):
-        position, magnitude = _sensing_coordinates(self.position, self.magnitude)
+        object.__setattr__(self, "dtype", validate_psf_dtype(self.dtype))
+        position, magnitude = _sensing_coordinates(
+            self.position, self.magnitude, dtype=self.dtype
+        )
         values = {
-            "zenith_angle": _angle(self.zenith_angle),
+            "zenith_angle": _angle(self.zenith_angle, dtype=self.dtype),
             "position": position,
             "magnitude": magnitude,
-            "displacement": _quantity(self.displacement, u.mas, "displacement", 0),
+            "displacement": _quantity(
+                self.displacement, u.mas, "displacement", 0, dtype=self.dtype
+            ),
         }
         if values["displacement"].value <= 0:
             raise ValueError("positive displacement required")
@@ -190,6 +215,7 @@ class SensingCalibrationMeasurements(_PhysicalRecord):
             self.samples,
             displacement=self.displacement,
             block_draws=self.sampling.block_draws,
+            dtype=self.dtype,
         )
 
 
@@ -201,7 +227,8 @@ def save_sensing_measurements(
         raise TypeError("unsupported sensing measurement type")
     header = {
         "schema": _KIND,
-        "version": 1,
+        "version": 2,
+        "precision": measurements.dtype.name,
         "units": {
             "position": "arcsec",
             "magnitude": "mag",
@@ -230,8 +257,9 @@ def load_sensing_measurements(path: str | Path) -> SensingCalibrationMeasurement
     """Load strict physical WFS observations without any E2E files/software."""
     with np.load(Path(path), allow_pickle=False) as saved:
         header = json.loads(str(saved["__header__"]))
+        validate_observation_precision(header, saved)
         if (
-            set(header)
+            (set(header) - ({"precision"} if header.get("version") == 2 else set()))
             != {
                 "schema",
                 "version",
@@ -246,7 +274,7 @@ def load_sensing_measurements(path: str | Path) -> SensingCalibrationMeasurement
             }
             or header["schema"] != _KIND
             or type(header["version"]) is not int
-            or header["version"] != 1
+            or header["version"] not in (1, 2)
             or header["units"]
             != {
                 "position": "arcsec",
@@ -259,14 +287,21 @@ def load_sensing_measurements(path: str | Path) -> SensingCalibrationMeasurement
         ):
             raise ValueError("invalid sensing measurement schema, units or fields")
         return SensingCalibrationMeasurements(
+            dtype=header.get("precision", np.float64),
             zenith_angle=header["zenith_angle_deg"] * u.deg,
             position=header["position_arcsec"] * u.arcsec,
             magnitude=header["magnitude"] * u.mag,
             displacement=header["displacement_mas"] * u.mas,
             samples=SensingWfsMeasurements(
-                zero=saved["zero"] * u.mas, shifted=saved["shifted"] * u.mas
+                dtype=header.get("precision", np.float64),
+                zero=saved["zero"] * u.mas,
+                shifted=saved["shifted"] * u.mas,
             ),
             sampling=SensingWfsSampling(**header["sampling"]),
-            controller=read_controller_header(header["controller"]),
-            photometry=read_photometry_header(header["photometry"]),
+            controller=read_controller_header(
+                header["controller"], dtype=header.get("precision", np.float64)
+            ),
+            photometry=read_photometry_header(
+                header["photometry"], dtype=header.get("precision", np.float64)
+            ),
         )

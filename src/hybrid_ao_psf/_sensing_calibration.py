@@ -34,6 +34,7 @@ from ._sensing_statistics import (
     fit_noise_blur,
     replay_statistics,
 )
+from ._validation import validate_psf_dtype
 
 _KIND = "hybrid-ao-psf-sensing-calibration"
 _UNITS = {
@@ -69,6 +70,18 @@ class SensingCalibration:
             raise TypeError("typed complete sensing response and noise shape required")
 
     @property
+    def dtype(self) -> np.dtype:
+        """Numerical precision used by this complete runtime model."""
+        return self.response.dtype
+
+    def prepare(self, *, dtype=np.float32) -> SensingCalibration:
+        """Create immutable runtime state at a requested precision."""
+        return SensingCalibration(
+            response=self.response.prepare(dtype=dtype),
+            blur=self.blur.prepare(dtype=dtype),
+        )
+
+    @property
     def controller(self) -> FixedGainIntegrator:
         """Return the fixed gain, delay and frame rate declared by this calibration."""
         return self.response.controller
@@ -99,7 +112,7 @@ class SensingCalibration:
         values = self.predict(
             positions=positions, magnitudes=magnitudes, zenith_angle=zenith_angle
         )
-        weights = np.asarray(reconstructor)
+        weights = np.asarray(reconstructor, dtype=self.dtype)
         if (
             weights.shape != (2, 2 * len(values.gain))
             or weights.dtype.kind not in "fiu"
@@ -132,7 +145,10 @@ class SensingCalibrationResult:
 
 
 def build_sensing_calibration(
-    response: SensingResponseCalibration, replays: Iterable[SensingReplayMeasurements]
+    response: SensingResponseCalibration,
+    replays: Iterable[SensingReplayMeasurements],
+    *,
+    dtype=np.float32,
 ) -> SensingCalibrationResult:
     """Fit the complete noise-displacement shape from reusable pooled histories.
 
@@ -144,6 +160,8 @@ def build_sensing_calibration(
     """
     if not isinstance(response, SensingResponseCalibration):
         raise TypeError("prepared sensing response/banks required")
+    dtype = validate_psf_dtype(dtype)
+    response = response.prepare(dtype=dtype)
     cases = []
     widths = []
     angles = set()
@@ -184,7 +202,9 @@ def build_sensing_calibration(
             raise ValueError("duplicate case in sensing shape fit")
         identities.add(identity)
         angles.add(angle)
-        statistics = replay_statistics(replay.displacements.value.transpose(2, 0, 1))
+        statistics = replay_statistics(
+            replay.displacements.value.transpose(2, 0, 1), dtype=dtype
+        )
         case = ReplayCase(
             f"{angle:g}:{request.key}",
             len(request.positions),
@@ -208,7 +228,7 @@ def build_sensing_calibration(
         raise ValueError(
             "noise-shape replay must cover every measured response zenith plane"
         )
-    blur, fit = fit_noise_blur(cases)
+    blur, fit = fit_noise_blur(cases, dtype=dtype)
     model = SensingCalibration(response=response.model, blur=blur)
     diagnostic = {
         "final_fit": fit,
@@ -247,6 +267,11 @@ def save_sensing_calibration(model: SensingCalibration, path: str | Path) -> Non
         _KIND,
         {
             "units": _UNITS,
+            "precision": model.dtype.name,
+            "support_precision": response.support_precision.name,
+            "producer_precision": None
+            if response.producer_dtype is None
+            else response.producer_dtype.name,
             "controller": controller_header(model.controller),
             "photometry": photometry_header(response.photometry),
             "field_radius_arcsec": float(response.field_radius.value),
@@ -262,7 +287,7 @@ def load_sensing_calibration(path: str | Path) -> SensingCalibration:
     """Load the exact shared runtime schema with immutable state and no native files."""
     header, arrays = load_product(path, _KIND)
     if (
-        set(header)
+        (set(header) - {"precision", "producer_precision", "support_precision"})
         != {
             "schema",
             "version",
@@ -283,13 +308,16 @@ def load_sensing_calibration(path: str | Path) -> SensingCalibration:
         != {"mixture_weight", "mixture_single_scale", "mixture_multi_scale"}
     ):
         raise ValueError("invalid sensing model fields, units or centring")
+    dtype = validate_psf_dtype(header.get("precision", arrays["gain"].dtype))
     response = SensingResponseModel._from_arrays(
         arrays,
-        read_controller_header(header["controller"]),
-        read_photometry_header(header["photometry"]),
+        read_controller_header(header["controller"], dtype=dtype),
+        read_photometry_header(header["photometry"], dtype=dtype),
         header["field_radius_arcsec"] * u.arcsec,
         header["magnitude_intervals"],
+        producer_dtype=header.get("producer_precision"),
+        support_precision=header.get("support_precision"),
     )
     return SensingCalibration(
-        response=response, blur=NoiseBlurModel(**header["noise_blur"])
+        response=response, blur=NoiseBlurModel(**header["noise_blur"], dtype=dtype)
     )

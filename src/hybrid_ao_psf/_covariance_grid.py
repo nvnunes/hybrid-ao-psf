@@ -13,7 +13,7 @@ def rectangular_mapping(
     Use one common map for both variables and all covariance blocks. Ties follow
     rectangular y/x order, matching the established science-PSF fill convention.
     """
-    positions = np.asarray(positions, float)
+    positions = np.asarray(positions)
     xs, ys = np.unique(positions[:, 0]), np.unique(positions[:, 1])
     if len(xs) < 2 or len(ys) < 2:
         raise ValueError("Covariance spatial grid needs at least two nodes per axis")

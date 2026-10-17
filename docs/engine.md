@@ -18,7 +18,7 @@ One call:
 4. calls MASTSEL for Ctot and its angular conversion;
 5. invokes an optional field-wide covariance correction, then validates and,
    where permitted, conditions Ctot;
-6. applies the image-plane Gaussian OTF to a private `float32` PSF copy using
+6. applies the image-plane Gaussian OTF to a private selected-precision PSF copy using
    the provider-owned pixel scale and finite-field convention; and
 7. constructs the standard result, jitter, PSD facts, effective configuration,
    provenance, and selected diagnostics.

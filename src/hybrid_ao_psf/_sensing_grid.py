@@ -16,7 +16,7 @@ def calibration_magnitude_intervals(
     node must be covered. Without a declaration, retain the conservative gap
     rule: spacing above the minimum splits support.
     """
-    magnitudes = np.asarray(magnitudes, float)
+    magnitudes = np.asarray(magnitudes)
     if (
         magnitudes.ndim != 1
         or not len(magnitudes)
@@ -25,7 +25,7 @@ def calibration_magnitude_intervals(
     ):
         raise ValueError("Measured magnitudes must be finite and increasing.")
     if declared is not None:
-        intervals = np.asarray(declared, float)
+        intervals = np.asarray(declared, dtype=magnitudes.dtype)
         if (
             intervals.ndim != 2
             or intervals.shape[1] != 2

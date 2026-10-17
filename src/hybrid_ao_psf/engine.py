@@ -12,6 +12,7 @@ from ngs_photometry import (
     WFSPhotometryConfig,
     magnitudes_to_effective_photons_per_second,
 )
+from scipy.fft import fft2, ifft2
 
 from ._mastsel import (
     _capture_mastsel,
@@ -20,6 +21,7 @@ from ._mastsel import (
     _prepare_mastsel_context,
 )
 from ._units import quantity_value
+from ._validation import validate_psf_dtype
 from .contracts import (
     CTOT_PSD_TOLERANCE_NM2,
     DiagnosticsLevel,
@@ -78,6 +80,18 @@ def simulate(
             )
         provenance.update(ctot_correction.provenance)
 
+    # Concrete fitted providers prepare once; protocol-only providers have their
+    # returned physical records converted at the same operation boundary.
+    if (
+        hasattr(science_provider, "prepare")
+        and getattr(science_provider, "dtype", None) != request.dtype
+    ):
+        science_provider = science_provider.prepare(dtype=request.dtype)
+    if (
+        hasattr(ngs_provider, "prepare")
+        and getattr(ngs_provider, "dtype", None) != request.dtype
+    ):
+        ngs_provider = ngs_provider.prepare(dtype=request.dtype)
     science = science_provider.predict(
         zenith_angle=request.zenith_angle,
         wavelength=request.wavelength,
@@ -94,6 +108,10 @@ def simulate(
     if metrics.ee.size != request.ngs_x.size:
         raise ValueError("NGS provider output length does not match the request.")
 
+    from dataclasses import replace
+
+    science = replace(science, dtype=request.dtype)
+    metrics = replace(metrics, dtype=request.dtype)
     effective_ini, ngs_frame_rate, ngs_flux = _resolve_effective_mastsel(request)
     with tempfile.TemporaryDirectory(prefix="hybrid_ao_psf_") as temporary:
         context = _prepare_mastsel_context(
@@ -109,6 +127,7 @@ def simulate(
             ctot_raw, expected_size=request.science_x.size, label="MASTSEL Ctot"
         )
         angle_to_wavefront_scale = context.angle_to_wavefront_scale
+        ctot_raw = u.Quantity(ctot_raw, dtype=request.dtype)
         if ctot_correction is not None:
             ctot_raw.flags.writeable = False
             corrected = ctot_correction.apply(ctot_raw, context)
@@ -122,9 +141,11 @@ def simulate(
     ctot_wavefront, psd_clipped = condition_ctot(
         ctot_raw,
         policy=request.non_psd_policy,
+        dtype=request.dtype,
     )
+    angle_to_wavefront_scale = u.Quantity(angle_to_wavefront_scale, dtype=request.dtype)
     ctot_angle = ctot_wavefront / angle_to_wavefront_scale**2
-    pre_blur = np.asarray(science.psfs, dtype=np.float32).copy()
+    pre_blur = np.asarray(science.psfs, dtype=request.dtype).copy()
     psfs = pre_blur.copy()
     apply_ctot_blur(
         psfs,
@@ -144,6 +165,7 @@ def simulate(
             ),
         )
     return HybridResult(
+        dtype=request.dtype,
         psfs=psfs,
         metadata=science.metadata,
         source_metadata=science.meta,
@@ -170,6 +192,7 @@ def _build_diagnostics(
     pre_blur_psfs: np.ndarray | None,
 ) -> HybridDiagnostics:
     return HybridDiagnostics(
+        dtype=ctot_wavefront.dtype,
         psd_valid_mask=psd_valid_mask(ctot_wavefront),
         **_ctot_angle_summaries(ctot_angle),
         pre_blur_psfs=pre_blur_psfs,
@@ -185,15 +208,17 @@ def condition_ctot(
     ctot_wavefront: u.Quantity,
     *,
     policy: NonPsdPolicy | str = NonPsdPolicy.ERROR,
+    dtype=np.float32,
 ) -> tuple[u.Quantity, np.ndarray]:
     """Symmetrize Ctot and apply the fixed numerical/non-PSD policy."""
+    dtype = validate_psf_dtype(dtype)
     validate_ctot_shape(ctot_wavefront, label="Ctot")
     try:
         policy = NonPsdPolicy(policy)
     except ValueError as exc:
         raise ValueError("policy must be 'error' or 'clip'.") from exc
     values = quantity_value(
-        ctot_wavefront, u.nm**2, label="ctot_wavefront", dtype=float
+        ctot_wavefront, u.nm**2, label="ctot_wavefront", dtype=dtype
     )
     symmetric = 0.5 * (values + np.swapaxes(values, -1, -2))
     eigenvalues, eigenvectors = np.linalg.eigh(symmetric)
@@ -342,14 +367,15 @@ def apply_ctot_blur(
         label="Ctot",
     )
     psfs_array = np.asarray(psfs)
+    dtype = validate_psf_dtype(psfs_array.dtype)
     if psfs_array.ndim != 3:
         raise ValueError(f"psfs must have shape (N, y, x); got {psfs_array.shape}.")
     if not np.all(np.isfinite(psfs_array)):
         raise ValueError("psfs must contain only finite values.")
-    pixel_scale_value = float(
+    pixel_scale_value = dtype.type(
         quantity_value(pixel_scale, u.mas, label="pixel_scale").item()
     )
-    scale = float(
+    scale = dtype.type(
         quantity_value(
             angle_to_wavefront_scale,
             u.nm / u.mas,
@@ -360,11 +386,11 @@ def apply_ctot_blur(
         raise ValueError("pixel_scale must be positive and finite.")
     if not np.isfinite(scale) or scale <= 0.0:
         raise ValueError("angle_to_wavefront_scale must be positive and finite.")
-    input_flux = np.sum(psfs_array, axis=(-2, -1), dtype=np.float64)
+    input_flux = np.sum(psfs_array, axis=(-2, -1), dtype=psfs_array.dtype)
     if not np.all(np.isfinite(input_flux)) or np.any(input_flux <= 0.0):
         raise ValueError("psfs must have strictly positive finite total flux.")
     values = quantity_value(
-        ctot_wavefront, u.nm**2, label="ctot_wavefront", dtype=float
+        ctot_wavefront, u.nm**2, label="ctot_wavefront", dtype=dtype
     )
     active = np.flatnonzero(psd_valid_mask(ctot_wavefront))
     if active.size == 0:
@@ -374,7 +400,7 @@ def apply_ctot_blur(
     work_shape = tuple(2 * size for size in psfs_array.shape[-2:])
     otfs = np.stack(
         [
-            image_plane_gaussian_otf(covariance_pix2[index], work_shape)
+            image_plane_gaussian_otf(covariance_pix2[index], work_shape, dtype=dtype)
             for index in active
         ]
     )
@@ -388,18 +414,20 @@ def blur_psfs_with_ctot(
     *,
     pixel_scale: u.Quantity,
     angle_to_wavefront_scale: u.Quantity,
+    dtype=np.float32,
 ) -> np.ndarray:
     """Blur external PSFs with an already-conditioned wavefront Ctot cube.
 
     Return a new array without renormalizing finite-field spill. This focused
     operation does not run MASTSEL or apply a non-PSD conditioning policy.
     """
-    source = np.asarray(psfs)
+    dtype = validate_psf_dtype(dtype)
+    source = np.asarray(psfs, dtype=dtype)
     if source.ndim != 3:
         raise ValueError(f"psfs must have shape (N, y, x); got {source.shape}.")
     validate_ctot_shape(ctot_wavefront, expected_size=source.shape[0], label="Ctot")
     values = quantity_value(
-        ctot_wavefront, u.nm**2, label="ctot_wavefront", dtype=float
+        ctot_wavefront, u.nm**2, label="ctot_wavefront", dtype=dtype
     )
     if not np.allclose(values, np.swapaxes(values, -1, -2)):
         raise ValueError("Ctot matrices must be symmetric.")
@@ -423,6 +451,7 @@ def image_plane_gaussian_otf(
     shape: tuple[int, int],
     *,
     mean_shift_pix: np.ndarray | None = None,
+    dtype=np.float32,
 ) -> np.ndarray:
     """Return a finite-field Gaussian OTF for an x/y covariance in pixel squared.
 
@@ -431,33 +460,34 @@ def image_plane_gaussian_otf(
     unshifted FFT frequency convention and can be passed to
     :func:`apply_finite_fov_otfs`.
     """
-    covariance_pix2 = np.asarray(covariance_pix2, dtype=float)
+    dtype = validate_psf_dtype(dtype)
+    covariance_pix2 = np.asarray(covariance_pix2, dtype=dtype)
     if covariance_pix2.shape != (2, 2) or not np.all(np.isfinite(covariance_pix2)):
         raise ValueError("covariance_pix2 must be a finite 2 x 2 matrix.")
     if len(shape) != 2 or any(int(size) != size or size < 1 for size in shape):
         raise ValueError(f"shape must contain two positive integers; got {shape}.")
     mean = (
-        np.zeros(2, dtype=float)
+        np.zeros(2, dtype=dtype)
         if mean_shift_pix is None
-        else np.asarray(mean_shift_pix, dtype=float)
+        else np.asarray(mean_shift_pix, dtype=dtype)
     )
     if mean.shape != (2,) or not np.all(np.isfinite(mean)):
         raise ValueError("mean_shift_pix must contain finite x/y displacements.")
     ny, nx = shape
-    fy = np.fft.fftfreq(ny)
-    fx = np.fft.fftfreq(nx)
+    fy = np.fft.fftfreq(ny).astype(dtype)
+    fx = np.fft.fftfreq(nx).astype(dtype)
     fx_grid, fy_grid = np.meshgrid(fx, fy)
     covariance = 0.5 * (covariance_pix2 + covariance_pix2.T)
     exponent = (
         -2.0
         * np.pi**2
         * (
-            float(covariance[0, 0]) * fx_grid**2
-            + float(covariance[1, 1]) * fy_grid**2
-            + 2.0 * float(covariance[0, 1]) * fx_grid * fy_grid
+            covariance[0, 0] * fx_grid**2
+            + covariance[1, 1] * fy_grid**2
+            + 2.0 * covariance[0, 1] * fx_grid * fy_grid
         )
     )
-    phase = -2j * np.pi * (float(mean[0]) * fx_grid + float(mean[1]) * fy_grid)
+    phase = -2j * np.pi * (mean[0] * fx_grid + mean[1] * fy_grid)
     return np.exp(exponent + phase)
 
 
@@ -471,7 +501,9 @@ def apply_finite_fov_otfs(psfs: np.ndarray, otfs: np.ndarray) -> None:
     retained flux raise ``ValueError``.
     """
     psfs_array = np.asarray(psfs)
-    otfs_array = np.asarray(otfs)
+    dtype = validate_psf_dtype(psfs_array.dtype)
+    complex_dtype = np.complex64 if dtype.itemsize == 4 else np.complex128
+    otfs_array = np.asarray(otfs, dtype=complex_dtype)
     if psfs_array.ndim != 3:
         raise ValueError(f"psfs must have shape (N, y, x); got {psfs_array.shape}.")
     expected = (psfs_array.shape[0], 2 * psfs_array.shape[1], 2 * psfs_array.shape[2])
@@ -479,16 +511,16 @@ def apply_finite_fov_otfs(psfs: np.ndarray, otfs: np.ndarray) -> None:
         raise ValueError(f"otfs must have shape {expected}; got {otfs_array.shape}.")
     if not np.all(np.isfinite(psfs_array)) or not np.all(np.isfinite(otfs_array)):
         raise ValueError("psfs and otfs must contain only finite values.")
-    if np.any(np.sum(psfs_array, axis=(-2, -1), dtype=np.float64) <= 0.0):
+    if np.any(np.sum(psfs_array, axis=(-2, -1), dtype=psfs_array.dtype) <= 0.0):
         raise ValueError("psfs must have strictly positive finite total flux.")
     work_shape = tuple(otfs_array.shape[-2:])
     original_shape = tuple(psfs_array.shape[-2:])
     for index, otf in enumerate(otfs_array):
         padded = _centered_pad(psfs_array[index], work_shape)
-        raw = np.real(np.fft.ifft2(np.fft.fft2(padded) * otf))
+        raw = np.real(ifft2(fft2(padded) * otf))
         raw = _center_crop(raw, original_shape)
-        raw = np.clip(raw.astype(np.float32, copy=False), 0.0, None)
-        if float(np.sum(raw, dtype=np.float64)) <= 0.0:
+        raw = np.clip(raw.astype(psfs_array.dtype, copy=False), 0.0, None)
+        if float(np.sum(raw, dtype=psfs_array.dtype)) <= 0.0:
             raise ValueError(
                 f"Finite-FOV blur produced non-positive flux for PSF {index}."
             )

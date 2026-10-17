@@ -35,12 +35,16 @@ def measurement(angle):
             tilt_mean=tilt * u.mas,
             tilt_batches=(tilt[:, :, None, :] + noise) * u.mas,
             tilt_noiseless=tilt * u.mas,
+            dtype=np.float64,
         ),
         sensing_wavelength=710e-9 * u.m,
         photometry=CalibrationPhotometry(
-            magnitude_band="fixture", photons_per_frame_zeropoint=1e8 * u.photon
+            magnitude_band="fixture",
+            photons_per_frame_zeropoint=1e8 * u.photon,
+            dtype=np.float64,
         ),
         settings=ComaCalibrationSettings(samples=32, noise_draws=16),
+        dtype=np.float64,
     )
 
 
@@ -55,7 +59,7 @@ def test_offline_coma_build_preserves_scalar_matrix_and_noise_diagnostics(tmp_pa
             loaded.response.tilt_batches, original.response.tilt_batches
         )
         planes.append(loaded)
-    result = build_coma_calibration(planes)
+    result = build_coma_calibration(planes, dtype=np.float64)
     np.testing.assert_allclose(
         [result.model.a0.value, result.model.b.value, result.model.m_half.value],
         [0.1, 0.04, 18.5],
@@ -94,18 +98,20 @@ def test_offline_coma_build_preserves_scalar_matrix_and_noise_diagnostics(tmp_pa
 
 def test_measured_support_is_not_expanded():
     planes = [measurement(angle) for angle in (10, 20, 30)]
-    result = build_coma_calibration(planes, heldout_zenith=None)
+    result = build_coma_calibration(planes, heldout_zenith=None, dtype=np.float64)
     np.testing.assert_array_equal(result.model.zenith_support.value, [10, 30])
     with pytest.raises(ValueError, match="support"):
         result.model.predict(magnitude=10 * u.mag, zenith_angle=0 * u.deg)
     with pytest.raises(ValueError, match="three"):
-        build_coma_calibration(planes[:2])
+        build_coma_calibration(planes[:2], dtype=np.float64)
 
 
 def test_bootstrap_override_reuses_paired_observations():
     planes = [measurement(angle) for angle in (0, 20, 40)]
-    result = build_coma_calibration(planes, bootstrap_seed=57, heldout_zenith=None)
+    result = build_coma_calibration(
+        planes, bootstrap_seed=57, heldout_zenith=None, dtype=np.float64
+    )
     assert result.diagnostics["bootstrap_seeds"] == (57, 57, 57)
     assert all(plane.settings.bootstrap_seed == 901732 for plane in planes)
     with pytest.raises(ValueError, match="bootstrap_seed"):
-        build_coma_calibration(planes, bootstrap_seed=-1)
+        build_coma_calibration(planes, bootstrap_seed=-1, dtype=np.float64)

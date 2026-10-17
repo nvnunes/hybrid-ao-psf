@@ -10,6 +10,7 @@ from pathlib import Path
 
 import numpy as np
 from astropy import units as u
+from numpy.typing import DTypeLike
 
 from ._calibration_contracts import (
     SensingWfsSampling,
@@ -17,6 +18,7 @@ from ._calibration_contracts import (
     _PhysicalRecord,
     _quantity,
 )
+from ._validation import validate_psf_dtype
 
 
 @dataclass(frozen=True, kw_only=True)
@@ -168,6 +170,7 @@ class E2ECalibrationConfiguration:
     """Shared INI fields and effective controls, with no native dependencies.
 
     Attributes:
+        dtype: Resolved real calculation precision, float32 by default.
         source: Absolute shared INI path.
         covariance_model: Planned or existing covariance model.json path.
         coma_model: Planned or existing response model.json path.
@@ -185,6 +188,7 @@ class E2ECalibrationConfiguration:
     configuration does not imply that calibration or source products exist.
     """
 
+    dtype: DTypeLike = np.float32
     source: Path
     covariance_model: Path
     coma_model: Path
@@ -205,6 +209,7 @@ class E2ECalibrationConfiguration:
     )
 
     def __post_init__(self):
+        object.__setattr__(self, "dtype", validate_psf_dtype(self.dtype))
         object.__setattr__(self, "source", Path(self.source).expanduser().resolve())
         for name in (
             "covariance_model",
@@ -237,6 +242,7 @@ class E2ECalibrationConfiguration:
     def with_overrides(
         self,
         *,
+        dtype: DTypeLike | None = None,
         covariance: Mapping[str, object] | None = None,
         coma: Mapping[str, object] | None = None,
         sensing: Mapping[str, object] | None = None,
@@ -247,7 +253,7 @@ class E2ECalibrationConfiguration:
         Omit an option to retain its existing value. Unknown fields and explicit
         invalid values raise; callers should omit absent CLI options entirely.
         """
-        updates = {}
+        updates = {} if dtype is None else {"dtype": validate_psf_dtype(dtype)}
         for name, override in [
             ("covariance", covariance),
             ("coma", coma),
@@ -297,9 +303,11 @@ def load_e2e_calibration_configuration(path: str | Path) -> E2ECalibrationConfig
         raise ValueError(f"Unknown calibration sections: {sorted(unknown_sections)}")
     if parser.defaults():
         raise ValueError("[DEFAULT] values are not supported in the shared E2E INI")
-    if not parser.has_section("e2e") or set(parser["e2e"]) != set(_MODEL_KEYS):
+    if not parser.has_section("e2e") or (set(parser["e2e"]) - {"precision"}) != set(
+        _MODEL_KEYS
+    ):
         raise ValueError(f"[e2e] requires exactly {', '.join(_MODEL_KEYS)}")
-    values = {}
+    values = {"dtype": validate_psf_dtype(parser["e2e"].get("precision", "float32"))}
     for key in _MODEL_KEYS:
         raw = parser["e2e"][key].strip()
         if not raw:

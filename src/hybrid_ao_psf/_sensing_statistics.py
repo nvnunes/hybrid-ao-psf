@@ -10,6 +10,7 @@ from scipy.optimize import minimize
 from scipy.special import ndtr
 
 from ._noise_blur import NoiseBlurModel
+from ._validation import validate_psf_dtype
 
 RADIAL_EDGES = np.r_[0.0, np.geomspace(1e-4, 200.0, 512), np.inf]
 PROJECTION_EDGES = np.linspace(-8, 8, 257)
@@ -47,6 +48,8 @@ class ReplayCase:
 
 def pooled_replay_moments(
     displacements_mas: NDArray,
+    *,
+    dtype=None,
 ) -> tuple[NDArray, NDArray, NDArray]:
     """Centre one case across all retained frames and realizations.
 
@@ -55,7 +58,10 @@ def pooled_replay_moments(
     shape, the two-component pooled mean, and its 2-by-2 population covariance.
     Differences between realization means remain in the centred distribution.
     """
-    samples = np.asarray(displacements_mas, float)
+    dtype = validate_psf_dtype(
+        np.asarray(displacements_mas).dtype if dtype is None else dtype
+    )
+    samples = np.asarray(displacements_mas, dtype=dtype)
     if (
         samples.ndim != 3
         or samples.shape[0] != 2
@@ -71,22 +77,27 @@ def pooled_replay_moments(
     return centred, mean[:, 0, 0], covariance
 
 
-def replay_statistics(displacements_mas: NDArray) -> ReplayStatistics:
+def replay_statistics(displacements_mas: NDArray, *, dtype=None) -> ReplayStatistics:
     """Summarize shape after centring a (2,realizations,frames) case as one pool.
 
     The same pooled covariance both describes the displacement distribution and
     whitens it for shape fitting. Absolute prediction width comes from Lyapunov.
     """
-    samples, _, covariance = pooled_replay_moments(displacements_mas)
+    samples, _, covariance = pooled_replay_moments(displacements_mas, dtype=dtype)
+    dtype = samples.dtype
     samples = samples.reshape(2, -1)
     white = np.linalg.solve(np.linalg.cholesky(covariance), samples).T
     radius = np.sum(white**2, axis=1)
-    probability = np.histogram(radius, RADIAL_EDGES)[0] / len(radius)
+    probability = np.histogram(radius, RADIAL_EDGES.astype(dtype))[0].astype(
+        dtype
+    ) / len(radius)
     cdfs = []
-    for direction in DIRECTIONS:
+    for direction in DIRECTIONS.astype(dtype):
         values = white @ direction
-        counts = np.histogram(values, np.r_[-np.inf, PROJECTION_EDGES, np.inf])[0]
-        cdfs.append(np.cumsum(counts)[:-1] / len(values))
+        counts = np.histogram(
+            values, np.r_[-np.inf, PROJECTION_EDGES.astype(dtype), np.inf]
+        )[0]
+        cdfs.append(np.cumsum(counts)[:-1].astype(dtype) / len(values))
     return ReplayStatistics(
         probability, np.array(cdfs), float(np.mean(radius**2)), covariance, len(radius)
     )
@@ -95,8 +106,8 @@ def replay_statistics(displacements_mas: NDArray) -> ReplayStatistics:
 def _bin_probability(model: NoiseBlurModel, count: int) -> NDArray:
     narrow, broad = model.scales(count)
     weight = model.mixture_weight
-    low = RADIAL_EDGES[:-1]
-    width = np.diff(RADIAL_EDGES)
+    low = RADIAL_EDGES[:-1].astype(model.dtype)
+    width = np.diff(RADIAL_EDGES.astype(model.dtype))
 
     def component(scale):
         return np.exp(-low / (2 * scale)) * -np.expm1(-width / (2 * scale))
@@ -104,14 +115,50 @@ def _bin_probability(model: NoiseBlurModel, count: int) -> NDArray:
     return weight * component(narrow) + (1 - weight) * component(broad)
 
 
-def fit_noise_blur(cases: list[ReplayCase]) -> tuple[NoiseBlurModel, dict]:
+def _bin_probability_gradient(model: NoiseBlurModel, count: int) -> NDArray:
+    """Differentiate bin mass by mixture weight and the family's narrow scale.
+
+    The broad scale is constrained by the unit total covariance. Handle the
+    infinite final bin explicitly so its derivative never forms infinity times
+    zero. Columns follow weight and narrow scale, respectively.
+    """
+    low = RADIAL_EDGES[:-1].astype(model.dtype)
+    width = np.diff(RADIAL_EDGES.astype(model.dtype))
+    weight = model.mixture_weight
+    narrow, broad = model.scales(count)
+
+    def component(scale):
+        survival = np.exp(-low / (2 * scale))
+        fraction = -np.expm1(-width / (2 * scale))
+        upper_term = np.zeros_like(width)
+        finite = np.isfinite(width)
+        upper_term[finite] = width[finite] * np.exp(-width[finite] / (2 * scale))
+        derivative = survival * (low * fraction - upper_term) / (2 * scale**2)
+        return survival * fraction, derivative
+
+    first, first_prime = component(narrow)
+    second, second_prime = component(broad)
+    return np.stack(
+        (
+            first - second + second_prime * (1 - narrow) / (1 - weight),
+            weight * (first_prime - second_prime),
+        ),
+        axis=1,
+    )
+
+
+def fit_noise_blur(
+    cases: list[ReplayCase], *, dtype=np.float32
+) -> tuple[NoiseBlurModel, dict]:
     """Fit the documented three-coefficient covariance-preserving mixture.
 
     Equal total objective weight is assigned to one-NGS and multiple-NGS
     families; cases within each family share its weight equally. The objective
     is binned likelihood of squared Mahalanobis radius for centred 2D Gaussians.
+    An analytic gradient includes the broad scale's covariance constraint.
     No PSF values, probe covariances or sensing-gain parameters enter this fit.
     """
+    dtype = validate_psf_dtype(dtype)
     groups = {
         name: [c for c in cases if (c.ngs_count == 1) == single]
         for name, single in [("single", True), ("multi", False)]
@@ -124,11 +171,34 @@ def fit_noise_blur(cases: list[ReplayCase]) -> tuple[NoiseBlurModel, dict]:
     }
 
     def objective(values):
-        model = NoiseBlurModel(*values)
+        model = NoiseBlurModel(*values, dtype=dtype)
         return -0.5 * sum(
-            pooled[name] @ np.log(np.maximum(_bin_probability(model, count), 1e-300))
+            pooled[name]
+            @ np.log(
+                np.maximum(
+                    _bin_probability(model, count),
+                    1e-300 if dtype.itemsize == 8 else np.finfo(dtype).tiny,
+                )
+            )
             for name, count in [("single", 1), ("multi", 2)]
         )
+
+    def gradient(values):
+        model = NoiseBlurModel(*values, dtype=dtype)
+        result = np.zeros(3, dtype=dtype)
+        floor = 1e-300 if dtype.itemsize == 8 else np.finfo(dtype).tiny
+        for index, (name, count) in enumerate((("single", 1), ("multi", 2))):
+            probability = _bin_probability(model, count)
+            ratio = np.divide(
+                pooled[name],
+                np.maximum(probability, floor),
+                out=np.zeros_like(probability),
+                where=probability > floor,
+            )
+            pair = -dtype.type(0.5) * (ratio @ _bin_probability_gradient(model, count))
+            result[0] += pair[0]
+            result[index + 1] = pair[1]
+        return result
 
     starts = [(0.5, 0.8, 0.95), (0.8, 0.5, 0.9), (0.95, 0.7, 0.95), (0.2, 0.3, 0.7)]
     results = [
@@ -136,8 +206,13 @@ def fit_noise_blur(cases: list[ReplayCase]) -> tuple[NoiseBlurModel, dict]:
             objective,
             start,
             method="L-BFGS-B",
+            jac=gradient,
             bounds=[(0.01, 0.99), (0.01, 1.0), (0.01, 1.0)],
-            options={"ftol": 1e-13, "gtol": 1e-7, "maxiter": 1000},
+            options={
+                "ftol": 1e-13,
+                "gtol": 1e-7,
+                "maxiter": 1000,
+            },
         )
         for start in starts
     ]
@@ -164,7 +239,7 @@ def fit_noise_blur(cases: list[ReplayCase]) -> tuple[NoiseBlurModel, dict]:
             for r in results
         ],
     }
-    return NoiseBlurModel(*best.x), diagnostics
+    return NoiseBlurModel(*best.x, dtype=dtype), diagnostics
 
 
 def assess_noise_blur(model: NoiseBlurModel, case: ReplayCase) -> dict:
@@ -197,16 +272,22 @@ def measurement_statistics(
     shifted_samples: NDArray,
     displacement_mas: float,
     block_draws: int,
+    *,
+    dtype=None,
 ) -> dict:
     """Calculate full response/noise matrices from paired angular samples.
 
     Zero samples are (N0,2); shifted samples are (4,N,2), ordered +x,-x,+y,-y.
     Adjacent signed inputs retain paired draw/block identities. Conditional
     mean removal supplies population noise covariance and whitened zero draws.
-    Statistics accumulate in float64, including when raw storage is float32.
+    Statistics accumulate in the selected dtype, inferred from inputs if omitted.
     """
-    zero = np.asarray(zero_samples, dtype=float)
-    shifted = np.asarray(shifted_samples, dtype=float)
+    dtype = validate_psf_dtype(
+        np.asarray(zero_samples).dtype if dtype is None else dtype
+    )
+    zero = np.asarray(zero_samples, dtype=dtype)
+    shifted = np.asarray(shifted_samples, dtype=dtype)
+    displacement_mas = dtype.type(displacement_mas)
     if (
         zero.ndim != 2
         or zero.shape[1] != 2
@@ -240,10 +321,10 @@ def measurement_statistics(
     return {
         "mean": mean,
         "covariance": covariance,
-        "white": white.astype(np.float32),
+        "white": white.astype(dtype),
         "gain_matrix": gain_matrix,
         "gain": np.trace(gain_matrix) / 2,
-        "gain_se": blocks.std(0, ddof=1) / np.sqrt(len(blocks)),
+        "gain_se": blocks.std(0, ddof=1) / np.sqrt(dtype.type(len(blocks))),
         "paired_gain_blocks": blocks,
         "shifted_means": means,
     }

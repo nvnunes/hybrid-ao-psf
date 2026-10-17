@@ -84,10 +84,16 @@ class E2ECalibration(ABC):
         from ._calibration_contracts import _angle, _quantity
         from .interpolation import load_science_ho_psf_interpolator
 
-        zenith_angle = _angle(zenith_angle)
-        positions = _quantity(positions, u.arcsec, "positions", 2)
-        magnitudes = _quantity(magnitudes, u.mag, "magnitudes", 1)
-        wavelength = _quantity(wavelength, u.m, "wavelength", 0)
+        zenith_angle = _angle(zenith_angle, dtype=self.configuration.dtype)
+        positions = _quantity(
+            positions, u.arcsec, "positions", 2, dtype=self.configuration.dtype
+        )
+        magnitudes = _quantity(
+            magnitudes, u.mag, "magnitudes", 1, dtype=self.configuration.dtype
+        )
+        wavelength = _quantity(
+            wavelength, u.m, "wavelength", 0, dtype=self.configuration.dtype
+        )
         if positions.shape != (len(magnitudes), 2) or not len(magnitudes):
             raise ValueError(
                 "aligned nonempty (points,2) positions/magnitudes required"
@@ -96,7 +102,9 @@ class E2ECalibration(ABC):
             raise ValueError("wavelength must be positive")
         settings = self.configuration.sensing
         seeds = iter([settings.seed] * len(magnitudes) if seeds is None else seeds)
-        provider = load_science_ho_psf_interpolator(self.configuration.ngs_psf)
+        provider = load_science_ho_psf_interpolator(self.configuration.ngs_psf).prepare(
+            dtype=self.configuration.dtype
+        )
         photometry = self.photometry(zenith_angle)
         previous = None
         prediction = None
@@ -120,6 +128,7 @@ class E2ECalibration(ABC):
                 photons_per_frame=photometry.photons_per_frame(magnitude),
                 displacements=np.array([[0, 0], [1, 0], [-1, 0], [0, 1], [0, -1]])
                 * delta,
+                dtype=self.configuration.dtype,
             )
             yield self.measure_sensing_point(
                 zenith_angle,
@@ -164,7 +173,7 @@ class E2ECalibration(ABC):
 
         if not isinstance(spot, SensingSpot):
             raise TypeError("spot must be SensingSpot")
-        zenith_angle = _angle(zenith_angle)
+        zenith_angle = _angle(zenith_angle, dtype=self.configuration.dtype)
         position, magnitude = _sensing_coordinates(position, magnitude)
         if sampling is not None and not isinstance(sampling, SensingWfsSampling):
             raise TypeError("sampling must be SensingWfsSampling")
@@ -197,6 +206,7 @@ class E2ECalibration(ABC):
             sampling=sampling,
             controller=self.controller(zenith_angle),
             photometry=photometry,
+            dtype=self.configuration.dtype,
         )
 
     def measure_coma(
@@ -222,9 +232,13 @@ class E2ECalibration(ABC):
         )
         from ._coma_calibration import ComaCalibrationMeasurements
 
-        zenith_angle = _angle(zenith_angle)
+        zenith_angle = _angle(zenith_angle, dtype=self.configuration.dtype)
         sensing_wavelength = _quantity(
-            sensing_wavelength, u.m, "sensing_wavelength", 0
+            sensing_wavelength,
+            u.m,
+            "sensing_wavelength",
+            0,
+            dtype=self.configuration.dtype,
         )
         if sensing_wavelength.value <= 0:
             raise ValueError("sensing_wavelength must be positive")
@@ -233,6 +247,7 @@ class E2ECalibration(ABC):
             magnitudes=magnitudes,
             noise_draws=settings.noise_draws,
             seed=settings.noise_seed,
+            dtype=self.configuration.dtype,
         )
         wavefronts = self.read_coma_wavefronts(zenith_angle, settings.samples)
         measured = self.measure_coma_wfs(zenith_angle, wavefronts, sampling)
@@ -248,6 +263,7 @@ class E2ECalibration(ABC):
             tilt_mean=batches.mean(axis=2),
             tilt_batches=batches,
             tilt_noiseless=measured.noiseless,
+            dtype=self.configuration.dtype,
         )
         return ComaCalibrationMeasurements(
             zenith_angle=zenith_angle,
@@ -255,6 +271,7 @@ class E2ECalibration(ABC):
             sensing_wavelength=sensing_wavelength,
             photometry=self.photometry(zenith_angle),
             settings=settings,
+            dtype=self.configuration.dtype,
         )
 
     def measure_covariance(
@@ -275,6 +292,7 @@ class E2ECalibration(ABC):
                 telemetry,
                 self.controller(telemetry.zenith_angle),
                 settings=self.configuration.covariance,
+                dtype=self.configuration.dtype,
             )
 
     def measure_reconstructor(
@@ -298,7 +316,7 @@ class E2ECalibration(ABC):
             reconstructor_calibration_inputs,
         )
 
-        zenith_angle = _angle(zenith_angle)
+        zenith_angle = _angle(zenith_angle, dtype=self.configuration.dtype)
         settings = self.configuration.reconstructor
         inputs = reconstructor_calibration_inputs(
             photons_per_frame,
@@ -306,6 +324,7 @@ class E2ECalibration(ABC):
             ee=ee,
             holdouts=settings.holdouts,
             seed=settings.seed,
+            dtype=self.configuration.dtype,
         )
         measured = self.measure_reconstructor_noise(zenith_angle, inputs)
         return ReconstructorCalibrationMeasurements(
@@ -316,6 +335,7 @@ class E2ECalibration(ABC):
             covariance=measured.covariance,
             holdouts=settings.holdouts,
             seed=settings.seed,
+            dtype=self.configuration.dtype,
         )
 
     def build_reconstructor(
@@ -335,7 +355,9 @@ class E2ECalibration(ABC):
         )
 
         result = build_reconstructor_calibration(
-            measurements, interpolation=self.configuration.reconstructor.interpolation
+            measurements,
+            interpolation=self.configuration.reconstructor.interpolation,
+            dtype=self.configuration.dtype,
         )
         publish_result(
             result,
@@ -363,7 +385,9 @@ class E2ECalibration(ABC):
             save_covariance_calibration,
         )
 
-        result = build_covariance_calibration(measurements)
+        result = build_covariance_calibration(
+            measurements, dtype=self.configuration.dtype
+        )
         if validation_telemetry is not None:
             from ._calibration_products import json_metadata
             from ._covariance_calibration import CovarianceCalibrationResult
@@ -415,7 +439,9 @@ class E2ECalibration(ABC):
         from ._coma_calibration import build_coma_calibration, save_coma_calibration
 
         result = build_coma_calibration(
-            measurements, bootstrap_seed=self.configuration.coma.bootstrap_seed
+            measurements,
+            bootstrap_seed=self.configuration.coma.bootstrap_seed,
+            dtype=self.configuration.dtype,
         )
         publish_result(result, self.configuration.coma_model, save_coma_calibration)
         return result
@@ -439,7 +465,12 @@ class E2ECalibration(ABC):
         covariance = load_covariance_calibration(self.configuration.covariance_model)
         prior = load_reconstructor_calibration(self.configuration.reconstructor_model)
         yield from replay_sensing_calibration(
-            response, requests, covariance, prior, settings=self.configuration.sensing
+            response,
+            requests,
+            covariance,
+            prior,
+            settings=self.configuration.sensing,
+            dtype=self.configuration.dtype,
         )
 
     def build_sensing(
@@ -460,7 +491,9 @@ class E2ECalibration(ABC):
             save_sensing_calibration,
         )
 
-        result = build_sensing_calibration(response, replays)
+        result = build_sensing_calibration(
+            response, replays, dtype=self.configuration.dtype
+        )
         publish_result(
             result, self.configuration.sensing_model, save_sensing_calibration
         )

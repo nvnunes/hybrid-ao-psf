@@ -3,11 +3,12 @@
 from __future__ import annotations
 
 from collections.abc import Mapping
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from pathlib import Path
 
 import numpy as np
 from astropy import units as u
+from numpy.typing import DTypeLike
 from scipy.interpolate import RegularGridInterpolator
 
 from ._calibration_contracts import (
@@ -17,15 +18,17 @@ from ._calibration_contracts import (
     _PhysicalRecord,
     _quantity,
 )
+from ._calibration_io import validate_observation_precision
 from ._calibration_products import immutable_metadata, load_product, save_product
 from ._io import atomic_output_path
+from ._validation import clip_support, support_dtype, validate_psf_dtype
 
 _KIND = "hybrid-ao-psf-reconstructor-noise"
 _MEASUREMENTS = "hybrid-ao-psf-reconstructor-measurements"
 
 
-def _axis(value, unit, name):
-    value = _quantity(value, unit, name, 1)
+def _axis(value, unit, name, *, dtype=np.float64):
+    value = _quantity(value, unit, name, 1, dtype=dtype)
     if len(value) < 2 or np.any(value.value <= 0) or np.any(np.diff(value.value) <= 0):
         raise ValueError(f"{name} requires >=2 increasing positive nodes")
     return value
@@ -36,6 +39,7 @@ class ReconstructorCalibrationMeasurements(_PhysicalRecord):
     """Complete ordered grid, holdout and equal-signal validation observations.
 
     Attributes:
+        dtype: Real calculation/state precision, float32 by default or float64.
         photons_per_frame: Increasing count axis; P*EE signal when ee is None.
         fwhm: Increasing angular width axis.
         ee: Increasing fractions in (0,1], or None for the product representation.
@@ -57,10 +61,17 @@ class ReconstructorCalibrationMeasurements(_PhysicalRecord):
     seed: int
     ee: u.Quantity | None = None
 
+    dtype: DTypeLike = field(default=np.float32, kw_only=True)
+
     def __post_init__(self):
-        photons = _axis(self.photons_per_frame, u.photon, "photons_per_frame")
-        widths = _axis(self.fwhm, u.mas, "fwhm")
-        encircled = None if self.ee is None else _axis(self.ee, u.one, "ee")
+        object.__setattr__(self, "dtype", validate_psf_dtype(self.dtype))
+        photons = _axis(
+            self.photons_per_frame, u.photon, "photons_per_frame", dtype=self.dtype
+        )
+        widths = _axis(self.fwhm, u.mas, "fwhm", dtype=self.dtype)
+        encircled = (
+            None if self.ee is None else _axis(self.ee, u.one, "ee", dtype=self.dtype)
+        )
         if encircled is not None and np.any(encircled.value > 1):
             raise ValueError("ee must be <=1")
         _count(self.holdouts, "holdouts")
@@ -68,7 +79,7 @@ class ReconstructorCalibrationMeasurements(_PhysicalRecord):
         if not isinstance(self.inputs, ReconstructorNoiseInputs):
             raise TypeError("inputs must be ReconstructorNoiseInputs")
         covariance = ReconstructorNoiseMeasurements(
-            covariance=self.covariance
+            covariance=self.covariance, dtype=self.dtype
         ).covariance
         if covariance.shape[0] != len(self.inputs.ee):
             raise ValueError("noise observations must align with ordered inputs")
@@ -77,7 +88,12 @@ class ReconstructorCalibrationMeasurements(_PhysicalRecord):
         object.__setattr__(self, "ee", encircled)
         object.__setattr__(self, "covariance", covariance)
         expected = reconstructor_calibration_inputs(
-            photons, widths, ee=encircled, holdouts=self.holdouts, seed=self.seed
+            photons,
+            widths,
+            ee=encircled,
+            holdouts=self.holdouts,
+            seed=self.seed,
+            dtype=self.dtype,
         )
         for name in ("photons_per_frame", "ee", "fwhm"):
             if not np.array_equal(
@@ -89,7 +105,7 @@ class ReconstructorCalibrationMeasurements(_PhysicalRecord):
 
 
 def reconstructor_calibration_inputs(
-    photons_per_frame, fwhm, *, ee=None, holdouts=1200, seed=20261014
+    photons_per_frame, fwhm, *, ee=None, holdouts=1200, seed=20261014, dtype=np.float32
 ):
     """Construct the deterministic ordered batch for pre-filter noise calibration.
 
@@ -98,9 +114,10 @@ def reconstructor_calibration_inputs(
     contains flattened ij-grid nodes, seeded holdouts and 24 equal-signal triples.
     This function requires no calibration object or native software.
     """
-    photons = _axis(photons_per_frame, u.photon, "photons_per_frame").value
-    widths = _axis(fwhm, u.mas, "fwhm").value
-    encircled = None if ee is None else _axis(ee, u.one, "ee").value
+    dtype = validate_psf_dtype(dtype)
+    photons = _axis(photons_per_frame, u.photon, "photons_per_frame", dtype=dtype).value
+    widths = _axis(fwhm, u.mas, "fwhm", dtype=dtype).value
+    encircled = None if ee is None else _axis(ee, u.one, "ee", dtype=dtype).value
     if encircled is not None and np.any(encircled > 1):
         raise ValueError("ee must be <=1")
     _count(holdouts, "holdouts")
@@ -113,9 +130,9 @@ def reconstructor_calibration_inputs(
     grid = np.meshgrid(*axes.values(), indexing="ij")
     rng = np.random.default_rng(seed)
     random = {
-        name: rng.uniform(a[0], a[-1], holdouts)
+        name: rng.uniform(a[0], a[-1], holdouts).astype(dtype)
         if name == "ee"
-        else np.exp(rng.uniform(np.log(a[0]), np.log(a[-1]), holdouts))
+        else np.exp(rng.uniform(np.log(a[0]), np.log(a[-1]), holdouts).astype(dtype))
         for name, a in axes.items()
     }
     values = {
@@ -127,8 +144,9 @@ def reconstructor_calibration_inputs(
     bounds = photons[[0, -1]] if ee is None else photons[[0, -1]] * encircled[[0, -1]]
     signal = np.repeat(np.geomspace(*bounds, 6), 12)
     product_width = np.tile(np.repeat(np.geomspace(*widths[[0, -1]], 4), 3), 6)
-    product_ee = np.tile([0.2, 0.5, 1.0], 24)
+    product_ee = np.tile(np.array([0.2, 0.5, 1.0], dtype=dtype), 24)
     return ReconstructorNoiseInputs(
+        dtype=dtype,
         photons_per_frame=np.r_[counts, signal / product_ee] * u.photon,
         ee=np.r_[fractions, product_ee] * u.one,
         fwhm=np.r_[values["fwhm"], product_width] * u.mas,
@@ -140,6 +158,9 @@ class ReconstructorNoiseModel(_PhysicalRecord):
     """Immutable rectangular, isotropic pre-filter noise prior.
 
     Attributes:
+        producer_dtype: Recorded calibration precision, or None when unknown.
+        support_precision: Coarsest coordinate precision retained through preparation.
+        dtype: Real calculation/state precision, float32 by default or float64.
         photons_per_frame: Positive increasing count axis, P*EE when ee=None.
         fwhm: Positive increasing angular width axis.
         variance: Positive angular-squared grid with ij axis ordering.
@@ -159,10 +180,26 @@ class ReconstructorNoiseModel(_PhysicalRecord):
     interpolation: str = "log-linear"
     _interpolator: object = field(init=False, repr=False, compare=False)
 
+    dtype: DTypeLike = field(default=np.float32, kw_only=True)
+    producer_dtype: DTypeLike | None = field(default=None, kw_only=True)
+    support_precision: DTypeLike | None = field(default=None, kw_only=True)
+
     def __post_init__(self):
-        photons = _axis(self.photons_per_frame, u.photon, "photons_per_frame")
-        widths = _axis(self.fwhm, u.mas, "fwhm")
-        ee = None if self.ee is None else _axis(self.ee, u.one, "ee")
+        object.__setattr__(self, "dtype", validate_psf_dtype(self.dtype))
+        if self.producer_dtype is not None:
+            object.__setattr__(
+                self, "producer_dtype", validate_psf_dtype(self.producer_dtype)
+            )
+        object.__setattr__(
+            self,
+            "support_precision",
+            support_dtype(self.dtype, self.producer_dtype, self.support_precision),
+        )
+        photons = _axis(
+            self.photons_per_frame, u.photon, "photons_per_frame", dtype=self.dtype
+        )
+        widths = _axis(self.fwhm, u.mas, "fwhm", dtype=self.dtype)
+        ee = None if self.ee is None else _axis(self.ee, u.one, "ee", dtype=self.dtype)
         if ee is not None and np.any(ee.value > 1):
             raise ValueError("ee must be <=1")
         axes = (
@@ -170,7 +207,9 @@ class ReconstructorNoiseModel(_PhysicalRecord):
             if ee is None
             else (photons.value, ee.value, widths.value)
         )
-        variance = _quantity(self.variance, u.mas**2, "variance", len(axes))
+        variance = _quantity(
+            self.variance, u.mas**2, "variance", len(axes), dtype=self.dtype
+        )
         if variance.shape != tuple(map(len, axes)) or np.any(variance.value <= 0):
             raise ValueError("variance must be positive and match the declared grid")
         if self.interpolation not in ("linear", "log-linear"):
@@ -194,6 +233,10 @@ class ReconstructorNoiseModel(_PhysicalRecord):
         ):
             object.__setattr__(self, name, value)
 
+    def prepare(self, *, dtype=np.float32) -> ReconstructorNoiseModel:
+        """Copy runtime table state without changing saved producer precision."""
+        return replace(self, dtype=validate_psf_dtype(dtype))
+
     def predict(
         self, *, photons_per_frame: u.Quantity, ee: u.Quantity, fwhm: u.Quantity
     ) -> u.Quantity:
@@ -206,9 +249,9 @@ class ReconstructorNoiseModel(_PhysicalRecord):
         if not all(isinstance(v, u.Quantity) for v in (photons_per_frame, ee, fwhm)):
             raise TypeError("noise queries require physical quantities")
         photons, fraction, width = np.broadcast_arrays(
-            photons_per_frame.to_value(u.photon),
-            ee.to_value(u.one),
-            fwhm.to_value(u.mas),
+            np.asarray(photons_per_frame.to_value(u.photon), dtype=self.dtype),
+            np.asarray(ee.to_value(u.one), dtype=self.dtype),
+            np.asarray(fwhm.to_value(u.mas), dtype=self.dtype),
         )
         if any(
             v.dtype.kind not in "fiu" or not np.isfinite(v).all() or np.any(v <= 0)
@@ -230,22 +273,33 @@ class ReconstructorNoiseModel(_PhysicalRecord):
             if self.ee is None
             else ("photons_per_frame", "ee", "fwhm")
         )
-        for name, value, axis in zip(names, values, axes, strict=True):
-            if np.any(value < axis[0]) or np.any(value > axis[-1]):
-                raise ValueError(
-                    f"noise query outside calibrated {name} support [{axis[0]}, {axis[-1]}]"
-                )
+        precision = self.support_precision
+        values = tuple(
+            clip_support(value, axis, dtype=precision, label=name)
+            for name, value, axis in zip(names, values, axes, strict=True)
+        )
         logarithmic = self.interpolation == "log-linear"
         coordinates = [
             np.log(v) if logarithmic and not (self.ee is not None and i == 1) else v
             for i, v in enumerate(values)
         ]
+        coordinates = [
+            clip_support(value, axis, dtype=precision, label=name)
+            for value, axis, name in zip(
+                coordinates, self._interpolator.grid, names, strict=True
+            )
+        ]
         predicted = self._interpolator(
             np.column_stack([v.ravel() for v in coordinates])
         )
+        predicted = np.asarray(predicted, dtype=self.dtype)
         if logarithmic:
             predicted = np.exp(predicted)
-        return predicted.reshape(width.shape)[..., None, None] * np.eye(2) * u.mas**2
+        return (
+            predicted.reshape(width.shape)[..., None, None]
+            * np.eye(2, dtype=self.dtype)
+            * u.mas**2
+        )
 
     def measurement_noise(
         self, *, photons_per_frame: u.Quantity, ee: u.Quantity, fwhm: u.Quantity
@@ -276,7 +330,10 @@ class ReconstructorCalibrationResult:
 
 
 def build_reconstructor_calibration(
-    measurements: ReconstructorCalibrationMeasurements, *, interpolation="log-linear"
+    measurements: ReconstructorCalibrationMeasurements,
+    *,
+    interpolation="log-linear",
+    dtype=np.float32,
 ) -> ReconstructorCalibrationResult:
     """Validate observations and build the calibrated prior without native access.
 
@@ -286,7 +343,10 @@ def build_reconstructor_calibration(
     """
     if not isinstance(measurements, ReconstructorCalibrationMeasurements):
         raise TypeError("measurements must be ReconstructorCalibrationMeasurements")
-    covariance = measurements.covariance.to_value(u.mas**2)
+    dtype = validate_psf_dtype(dtype)
+    # Captured query coordinates remain authoritative; rebuilding at another
+    # precision must not regenerate a different random acquisition batch.
+    covariance = np.asarray(measurements.covariance.to_value(u.mas**2), dtype=dtype)
     variance = np.diagonal(covariance, axis1=-2, axis2=-1)
     if np.any(variance <= 0):
         raise ValueError("nonpositive noise variance")
@@ -314,9 +374,12 @@ def build_reconstructor_calibration(
         raise ValueError("unexpected calibration batch length")
     product = scalar[count + holdouts :].reshape(-1, 3)
     reduction = float(np.max(abs(product / product[:, :1] - 1)))
-    if measurements.ee is None and reduction > 1e-10:
+    if measurements.ee is None and reduction > max(1e-10, 8 * np.finfo(dtype).eps):
         raise ValueError("P*EE reduction is unsupported; use separate inputs")
     model = ReconstructorNoiseModel(
+        dtype=dtype,
+        producer_dtype=dtype,
+        support_precision=support_dtype(dtype, measurements.dtype),
         photons_per_frame=measurements.photons_per_frame,
         fwhm=measurements.fwhm,
         ee=measurements.ee,
@@ -329,7 +392,7 @@ def build_reconstructor_calibration(
         fwhm=measurements.inputs.fwhm[: count + holdouts],
     ).value[..., 0, 0]
     node_error = float(np.max(abs(prediction[:count] / scalar[:count] - 1)))
-    if node_error > 1e-12:
+    if node_error > max(1e-12, 16 * np.finfo(dtype).eps):
         raise ValueError("interpolator does not recover grid nodes")
     error = prediction[count:] / scalar[count : count + holdouts] - 1
     return ReconstructorCalibrationResult(
@@ -368,6 +431,11 @@ def save_reconstructor_calibration(
         path,
         _KIND,
         {
+            "precision": model.dtype.name,
+            "support_precision": model.support_precision.name,
+            "producer_precision": None
+            if model.producer_dtype is None
+            else np.dtype(model.producer_dtype).name,
             "representation": "product" if model.ee is None else "separate",
             "interpolation": model.interpolation,
             "units": {
@@ -384,7 +452,7 @@ def save_reconstructor_calibration(
 def load_reconstructor_calibration(path: str | Path) -> ReconstructorNoiseModel:
     """Load a strict shared prior without detector metadata or native software."""
     header, arrays = load_product(path, _KIND)
-    if set(header) != {
+    if (set(header) - {"precision", "producer_precision", "support_precision"}) != {
         "schema",
         "version",
         "payload",
@@ -413,6 +481,9 @@ def load_reconstructor_calibration(path: str | Path) -> ReconstructorNoiseModel:
     ):
         raise ValueError("invalid reconstructor axes/representation")
     return ReconstructorNoiseModel(
+        dtype=header.get("precision", arrays["variance"].dtype),
+        producer_dtype=header.get("producer_precision"),
+        support_precision=header.get("support_precision"),
         photons_per_frame=arrays["photons_per_frame"] * u.photon,
         fwhm=arrays["fwhm"] * u.mas,
         variance=arrays["variance"] * u.mas**2,
@@ -429,7 +500,8 @@ def save_reconstructor_measurements(
         raise TypeError("unsupported measurement type")
     header = {
         "schema": _MEASUREMENTS,
-        "version": 1,
+        "version": 2,
+        "precision": measurements.dtype.name,
         "holdouts": measurements.holdouts,
         "seed": measurements.seed,
         "representation": "product" if measurements.ee is None else "separate",
@@ -459,12 +531,13 @@ def load_reconstructor_measurements(
 
     with np.load(Path(path), allow_pickle=False) as saved:
         header = json.loads(str(saved["__header__"]))
+        validate_observation_precision(header, saved)
         if (
-            set(header)
+            (set(header) - ({"precision"} if header.get("version") == 2 else set()))
             != {"schema", "version", "holdouts", "seed", "representation", "units"}
             or header["schema"] != _MEASUREMENTS
             or type(header["version"]) is not int
-            or header["version"] != 1
+            or header["version"] not in (1, 2)
             or header["units"]
             != {"count": "ph", "fwhm": "mas", "ee": "", "covariance": "mas2"}
         ):
@@ -484,10 +557,12 @@ def load_reconstructor_measurements(
         }:
             raise ValueError("invalid reconstructor measurement fields")
         return ReconstructorCalibrationMeasurements(
+            dtype=header.get("precision", np.float64),
             photons_per_frame=saved["photons_per_frame"] * u.photon,
             fwhm=saved["fwhm"] * u.mas,
             ee=None if product else saved["ee"] * u.one,
             inputs=ReconstructorNoiseInputs(
+                dtype=header.get("precision", np.float64),
                 photons_per_frame=saved["input_photons"] * u.photon,
                 ee=saved["input_ee"] * u.one,
                 fwhm=saved["input_fwhm"] * u.mas,
@@ -502,6 +577,8 @@ def solve_lo_reconstructor(
     ngs_covariance: u.Quantity,
     centre_ngs_covariance: u.Quantity,
     measurement_noise: u.Quantity,
+    *,
+    dtype=np.float32,
 ) -> u.Quantity:
     """Solve absolute field-centre LO weights from explicit angular covariances.
 
@@ -513,15 +590,18 @@ def solve_lo_reconstructor(
     """
     from ._calibration_numerics import lo_reconstructor
 
+    dtype = validate_psf_dtype(dtype)
     values = [
-        _quantity(value, u.mas**2, name, 2).value
+        _quantity(value, u.mas**2, name, 2, dtype=dtype).value
         for value, name in (
             (ngs_covariance, "ngs_covariance"),
             (centre_ngs_covariance, "centre_ngs_covariance"),
             (measurement_noise, "measurement_noise"),
         )
     ]
-    return _quantity(lo_reconstructor(*values) * u.one, u.one, "weights", 2)
+    return _quantity(
+        lo_reconstructor(*values, dtype=dtype) * u.one, u.one, "weights", 2, dtype=dtype
+    )
 
 
 def build_lo_reconstructor(
@@ -533,6 +613,7 @@ def build_lo_reconstructor(
     photons_per_frame: u.Quantity,
     ee: u.Quantity,
     fwhm: u.Quantity,
+    dtype=np.float32,
 ) -> np.ndarray:
     """Return absolute dimensionless field-centre LO weights, shape (2,2*N).
 
@@ -546,8 +627,9 @@ def build_lo_reconstructor(
     from ._calibration_contracts import _angle
     from ._calibration_numerics import lo_reconstructor
 
-    positions = _quantity(ngs_positions, u.arcsec, "ngs_positions", 2)
-    angle = _angle(zenith_angle)
+    dtype = validate_psf_dtype(dtype)
+    positions = _quantity(ngs_positions, u.arcsec, "ngs_positions", 2, dtype=dtype)
+    angle = _angle(zenith_angle, dtype=dtype)
     if positions.shape[1] != 2:
         raise ValueError("ngs_positions must have shape (N,2)")
     if not all(
@@ -555,7 +637,7 @@ def build_lo_reconstructor(
     ):
         raise TypeError("counts, EE and FWHM must be physical quantities")
     counts, fractions, widths = (
-        np.atleast_1d(value.to_value(unit))
+        np.atleast_1d(np.asarray(value.to_value(unit), dtype=dtype))
         for value, unit in ((photons_per_frame, u.photon), (ee, u.one), (fwhm, u.mas))
     )
     n = len(positions)
@@ -565,7 +647,7 @@ def build_lo_reconstructor(
     ) or np.any(fractions > 1):
         raise ValueError("one positive count/FWHM and EE in (0,1] required per NGS")
     if n == 1:
-        return np.eye(2)
+        return np.eye(2, dtype=dtype)
     if covariances is None or not isinstance(noise, ReconstructorNoiseModel):
         raise ValueError(
             "multiple NGS require calibrated atmospheric and noise providers"
@@ -582,7 +664,7 @@ def build_lo_reconstructor(
     prior = noise.measurement_noise(
         photons_per_frame=counts * u.photon, ee=fractions * u.one, fwhm=widths * u.mas
     ).to_value(u.mas**2)
-    return lo_reconstructor(css, cas, prior)
+    return lo_reconstructor(css, cas, prior, dtype=dtype)
 
 
 def validate_covariance_reconstructor(
@@ -613,6 +695,7 @@ def validate_covariance_reconstructor(
         raise TypeError("calibrated bank, prior and physical telemetry required")
     if telemetry.frame_rate != covariances.controller.frame_rate:
         raise ValueError("validation and covariance frame rates differ")
+    dtype = covariances.dtype
     cut = covariances.discard
     if telemetry.tilt.shape[1] - cut < 3:
         raise ValueError("insufficient validation frames after settling")
@@ -647,19 +730,20 @@ def validate_covariance_reconstructor(
             noise,
             ngs_positions=positions,
             zenith_angle=angle,
-            photons_per_frame=np.full(count, photons) * u.photon,
-            ee=np.full(count, fraction) * u.one,
-            fwhm=np.full(count, width) * u.mas,
+            photons_per_frame=np.full(count, photons, dtype=dtype) * u.photon,
+            ee=np.full(count, fraction, dtype=dtype) * u.one,
+            fwhm=np.full(count, width, dtype=dtype) * u.mas,
+            dtype=dtype,
         )
         blocks = [weights[:, 2 * g : 2 * g + 2] for g in range(count)]
-        sensing = np.linalg.solve(sum(blocks, np.zeros((2, 2))), feedback)
+        sensing = np.linalg.solve(sum(blocks, np.zeros((2, 2), dtype=dtype)), feedback)
         transforms = [block @ sensing for block in blocks]
         inputs = sum(
             (
                 telemetry.tilt.value[:, :, index] @ transform.T
                 for index, transform in zip(indices, transforms, strict=True)
             ),
-            np.zeros(telemetry.tilt.shape[:2] + (2,)),
+            np.zeros(telemetry.tilt.shape[:2] + (2,), dtype=dtype),
         )
         commands = np.broadcast_to(
             np.linalg.solve(feedback, inputs[:, 0].T).T[:, None], inputs.shape
@@ -672,7 +756,7 @@ def validate_covariance_reconstructor(
                 + gain * inputs[:, frame - delay]
             )
         commands = commands[:, cut:]
-        q, k = np.zeros((2, 2)), np.zeros((2, 2))
+        q, k = np.zeros((2, 2), dtype=dtype), np.zeros((2, 2), dtype=dtype)
         for (xi, yi), left in zip(positions, transforms, strict=True):
             for p, projection in enumerate(projections):
                 a = projection @ left
@@ -707,7 +791,14 @@ def validate_covariance_reconstructor(
         }
         errors = {}
         for name, (predicted, expected) in comparisons.items():
-            if not np.allclose(predicted, expected, rtol=1e-12, atol=1e-10):
+            roundoff = (
+                128
+                * np.finfo(dtype).eps
+                * max(np.linalg.norm(predicted), np.linalg.norm(expected))
+            )
+            if not np.allclose(
+                predicted, expected, rtol=1e-12, atol=max(1e-10, roundoff)
+            ):
                 raise ValueError(
                     f"calibrated-reconstructor validation failed: {count} NGS, {name}"
                 )

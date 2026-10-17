@@ -2,16 +2,22 @@
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 
 import numpy as np
 from astropy import units as u
+from numpy.typing import DTypeLike
+
+from ._validation import validate_psf_dtype
 
 
-def _quantity(value, unit, name, ndim):
+def _quantity(value, unit, name, ndim, *, dtype=np.float64):
     if not isinstance(value, u.Quantity):
         raise TypeError(f"{name} must be an Astropy Quantity")
-    array = np.asarray(value.to_value(unit))
+    dtype = validate_psf_dtype(dtype)
+    if value.dtype.kind not in "fiu":
+        raise ValueError(f"{name} must be finite real {ndim}D values")
+    array = np.asarray(value.astype(dtype).to_value(unit))
     if (
         array.dtype.kind not in "fiu"
         or array.ndim != ndim
@@ -20,8 +26,9 @@ def _quantity(value, unit, name, ndim):
         raise ValueError(f"{name} must be finite real {ndim}D values")
     if any(n == 0 for n in array.shape):
         raise ValueError(f"{name} must not be empty")
-    array = np.asarray(array, dtype=np.float64, order="C")
-    immutable = np.frombuffer(array.tobytes(), dtype=np.float64).reshape(array.shape)
+    dtype = validate_psf_dtype(dtype)
+    array = np.asarray(array, dtype=dtype, order="C")
+    immutable = np.frombuffer(array.tobytes(), dtype=dtype).reshape(array.shape)
     return u.Quantity(immutable, unit, copy=False)
 
 
@@ -30,8 +37,8 @@ def _count(value, name, minimum=1):
         raise ValueError(f"{name} must be an integer >= {minimum}")
 
 
-def _angle(value):
-    angle = _quantity(value, u.deg, "zenith_angle", 0)
+def _angle(value, *, dtype=np.float64):
+    angle = _quantity(value, u.deg, "zenith_angle", 0, dtype=dtype)
     if not 0 <= angle.value < 90:
         raise ValueError("zenith_angle must lie in [0,90) degrees")
     return angle
@@ -55,6 +62,7 @@ class FixedGainIntegrator(_PhysicalRecord):
     """Fixed delayed-integrator settings shared by calibration and prediction.
 
     Attributes:
+        dtype: Real calculation/state precision, float32 by default or float64.
         gain: Positive dimensionless gain, fixed while filtering.
         delay: Positive integer measurement-to-command delay, in frames.
         frame_rate: Positive scalar frequency; one telemetry sample per frame.
@@ -64,11 +72,14 @@ class FixedGainIntegrator(_PhysicalRecord):
     delay: int
     frame_rate: u.Quantity
 
+    dtype: DTypeLike = field(default=np.float32, kw_only=True)
+
     def __post_init__(self):
+        object.__setattr__(self, "dtype", validate_psf_dtype(self.dtype))
         if isinstance(self.gain, bool) or not np.isfinite(self.gain) or self.gain <= 0:
             raise ValueError("gain must be positive and finite")
         _count(self.delay, "delay")
-        rate = _quantity(self.frame_rate, u.Hz, "frame_rate", 0)
+        rate = _quantity(self.frame_rate, u.Hz, "frame_rate", 0, dtype=self.dtype)
         if rate.value <= 0:
             raise ValueError("frame_rate must be positive")
         object.__setattr__(self, "gain", float(self.gain))
@@ -83,7 +94,7 @@ class FixedGainIntegrator(_PhysicalRecord):
         """
         from ._calibration_numerics import integrator_transition
 
-        return integrator_transition(response, self.gain, self.delay)
+        return integrator_transition(response, self.gain, self.delay, dtype=self.dtype)
 
     def filter(
         self, history: u.Quantity, response: np.ndarray, *, equilibrium: bool = False
@@ -114,14 +125,19 @@ class FixedGainIntegrator(_PhysicalRecord):
             raise ValueError("history must have angular or OPD units")
         if values.dtype.kind not in "fiu" or type(equilibrium) is not bool:
             raise ValueError("history must be real and equilibrium must be boolean")
+        response = np.asarray(response)
+        if response.dtype.kind not in "fiu":
+            raise ValueError("response must be a real matrix")
+        response = response.astype(self.dtype)
+        values = values.astype(self.dtype)
         initial = (
             np.linalg.solve(response, values[:, 0, :].T).T
             if equilibrium
-            else np.zeros((len(values), 2))
+            else np.zeros((len(values), 2), dtype=self.dtype)
         )
         inputs = values - values[:, :1, :] if equilibrium else values
         result = filter_input(
-            inputs.transpose(2, 0, 1), response, self.gain, self.delay
+            inputs.transpose(2, 0, 1), response, self.gain, self.delay, dtype=self.dtype
         )
         result = result + initial.T[:, :, None]
         return result.transpose(1, 2, 0) * history.unit
@@ -141,7 +157,11 @@ class FixedGainIntegrator(_PhysicalRecord):
             raise TypeError("reconstructed_noise must be an Astropy quantity")
         return (
             integrator_noise_covariance(
-                response, reconstructed_noise.to_value(u.mas**2), self.gain, self.delay
+                response,
+                reconstructed_noise.to_value(u.mas**2),
+                self.gain,
+                self.delay,
+                dtype=self.dtype,
             )
             * u.mas**2
         )
@@ -152,6 +172,7 @@ class CalibrationPhotometry(_PhysicalRecord):
     """Numerical magnitude-to-incident-photon conversion supplied downstream.
 
     Attributes:
+        dtype: Real calculation/state precision, float32 by default or float64.
         magnitude_band: Explicit calibration magnitude convention, e.g. R.
         photons_per_frame_zeropoint: Positive zero-magnitude incident photon
             count per frame, including the native photon budget before cropping.
@@ -160,11 +181,18 @@ class CalibrationPhotometry(_PhysicalRecord):
     magnitude_band: str
     photons_per_frame_zeropoint: u.Quantity
 
+    dtype: DTypeLike = field(default=np.float32, kw_only=True)
+
     def __post_init__(self):
+        object.__setattr__(self, "dtype", validate_psf_dtype(self.dtype))
         if not isinstance(self.magnitude_band, str) or not self.magnitude_band.strip():
             raise ValueError("magnitude_band must be a nonempty convention name")
         count = _quantity(
-            self.photons_per_frame_zeropoint, u.photon, "photons_per_frame_zeropoint", 0
+            self.photons_per_frame_zeropoint,
+            u.photon,
+            "photons_per_frame_zeropoint",
+            0,
+            dtype=self.dtype,
         )
         if count.value <= 0:
             raise ValueError("photons_per_frame_zeropoint must be positive")
@@ -174,7 +202,7 @@ class CalibrationPhotometry(_PhysicalRecord):
         """Return incident counts for finite magnitude values in this convention."""
         if not isinstance(magnitudes, u.Quantity):
             raise TypeError("magnitudes must be an Astropy Quantity")
-        values = np.asarray(magnitudes.to_value(u.mag), float)
+        values = np.asarray(magnitudes.to_value(u.mag), dtype=self.dtype)
         if not np.isfinite(values).all():
             raise ValueError("magnitudes must be finite")
         result = self.photons_per_frame_zeropoint * 10.0 ** (-0.4 * values)
@@ -188,6 +216,7 @@ class CovarianceTelemetry(_PhysicalRecord):
     """Aligned uncentred histories on one zenith plane, with independent resets.
 
     Attributes:
+        dtype: Real calculation/state precision, float32 by default or float64.
         zenith_angle: Scalar viewing angle, in [0,90) degrees.
         positions: Distinct Cartesian field coordinates, (directions,2).
         frame_rate: Positive scalar cadence; every sample is one LO frame.
@@ -206,7 +235,10 @@ class CovarianceTelemetry(_PhysicalRecord):
     tilt: u.Quantity
     coma: u.Quantity
 
+    dtype: DTypeLike = field(default=np.float32, kw_only=True)
+
     def __post_init__(self):
+        object.__setattr__(self, "dtype", validate_psf_dtype(self.dtype))
         for name, unit, ndim in [
             ("positions", u.arcsec, 2),
             ("frame_rate", u.Hz, 0),
@@ -214,9 +246,13 @@ class CovarianceTelemetry(_PhysicalRecord):
             ("coma", u.nm, 4),
         ]:
             object.__setattr__(
-                self, name, _quantity(getattr(self, name), unit, name, ndim)
+                self,
+                name,
+                _quantity(getattr(self, name), unit, name, ndim, dtype=self.dtype),
             )
-        object.__setattr__(self, "zenith_angle", _angle(self.zenith_angle))
+        object.__setattr__(
+            self, "zenith_angle", _angle(self.zenith_angle, dtype=self.dtype)
+        )
         if self.positions.shape[1] != 2 or len(
             np.unique(self.positions.value, axis=0)
         ) != len(self.positions):
@@ -238,6 +274,7 @@ class ComaWavefronts(_PhysicalRecord):
     """Paired independent residual-HO samples for native sensor measurement.
 
     Attributes:
+        dtype: Real calculation/state precision, float32 by default or float64.
         wavefront: OPD length, (samples,height,width), piston/TT removed and
             zero outside pupil; after common HO, before science correction.
         coma: Primary-coma OPD length, (samples,2), in the telemetry basis.
@@ -248,9 +285,12 @@ class ComaWavefronts(_PhysicalRecord):
     coma: u.Quantity
     pupil: np.ndarray
 
+    dtype: DTypeLike = field(default=np.float32, kw_only=True)
+
     def __post_init__(self):
-        wavefront = _quantity(self.wavefront, u.nm, "wavefront", 3)
-        coma = _quantity(self.coma, u.nm, "coma", 2)
+        object.__setattr__(self, "dtype", validate_psf_dtype(self.dtype))
+        wavefront = _quantity(self.wavefront, u.nm, "wavefront", 3, dtype=self.dtype)
+        coma = _quantity(self.coma, u.nm, "coma", 2, dtype=self.dtype)
         pupil = np.asarray(self.pupil)
         if pupil.dtype != bool or pupil.ndim != 2 or not pupil.any():
             raise ValueError("pupil must be a nonempty 2D boolean mask")
@@ -270,6 +310,7 @@ class ComaWfsSampling(_PhysicalRecord):
     """Magnitude grid and paired noise draws for a native coma measurement.
 
     Attributes:
+        dtype: Real calculation/state precision, float32 by default or float64.
         magnitudes: Strictly increasing magnitude grid with at least two nodes.
         noise_draws: Draws per wavefront/magnitude, a positive multiple of four.
         seed: Nonnegative uint32 seed for deterministic native draw scheduling.
@@ -279,8 +320,11 @@ class ComaWfsSampling(_PhysicalRecord):
     noise_draws: int = 512
     seed: int = 0
 
+    dtype: DTypeLike = field(default=np.float32, kw_only=True)
+
     def __post_init__(self):
-        values = _quantity(self.magnitudes, u.mag, "magnitudes", 1)
+        object.__setattr__(self, "dtype", validate_psf_dtype(self.dtype))
+        values = _quantity(self.magnitudes, u.mag, "magnitudes", 1, dtype=self.dtype)
         if len(values) < 2 or np.any(np.diff(values.value) <= 0):
             raise ValueError("magnitudes must be strictly increasing, with >=2 nodes")
         _count(self.noise_draws, "noise_draws", 4)
@@ -297,6 +341,7 @@ class ComaWfsMeasurements(_PhysicalRecord):
     """Uncentred angular WFS observations paired with supplied wavefronts.
 
     Attributes:
+        dtype: Real calculation/state precision, float32 by default or float64.
         measured: Tilt (samples,magnitudes,draws,2), physical x/y.
         noiseless: Comparison tilt (samples,magnitudes,2).
     """
@@ -304,9 +349,12 @@ class ComaWfsMeasurements(_PhysicalRecord):
     measured: u.Quantity
     noiseless: u.Quantity
 
+    dtype: DTypeLike = field(default=np.float32, kw_only=True)
+
     def __post_init__(self):
-        measured = _quantity(self.measured, u.mas, "measured", 4)
-        noiseless = _quantity(self.noiseless, u.mas, "noiseless", 3)
+        object.__setattr__(self, "dtype", validate_psf_dtype(self.dtype))
+        measured = _quantity(self.measured, u.mas, "measured", 4, dtype=self.dtype)
+        noiseless = _quantity(self.noiseless, u.mas, "noiseless", 3, dtype=self.dtype)
         if measured.shape[-1] != 2 or noiseless.shape != measured.shape[:2] + (2,):
             raise ValueError("measured/noiseless WFS tilt axes must align")
         object.__setattr__(self, "measured", measured)
@@ -318,6 +366,7 @@ class SensingSpot(_PhysicalRecord):
     """Known fixed HO spot and signed displacements for native WFS draws.
 
     Attributes:
+        dtype: Real calculation/state precision, float32 by default or float64.
         image: Nonnegative (y,x) fractions per incident photon, positive sum;
             do not recenter or normalize detector cropping.
         pixel_scale: Positive angular scale per image pixel.
@@ -333,7 +382,10 @@ class SensingSpot(_PhysicalRecord):
     photons_per_frame: u.Quantity
     displacements: u.Quantity
 
+    dtype: DTypeLike = field(default=np.float32, kw_only=True)
+
     def __post_init__(self):
+        object.__setattr__(self, "dtype", validate_psf_dtype(self.dtype))
         image = np.asarray(self.image)
         if (
             image.dtype.kind not in "fiu"
@@ -344,22 +396,24 @@ class SensingSpot(_PhysicalRecord):
             or image.sum() <= 0
         ):
             raise ValueError("image must be a positive finite 2D light-fraction image")
-        image = np.asarray(image, dtype=np.float64, order="C")
+        image = np.asarray(image, dtype=self.dtype, order="C")
         object.__setattr__(
             self,
             "image",
-            np.frombuffer(image.tobytes(), dtype=np.float64).reshape(image.shape),
+            np.frombuffer(image.tobytes(), dtype=self.dtype).reshape(image.shape),
         )
         for name, unit in [
             ("pixel_scale", u.mas),
             ("wavelength", u.m),
             ("photons_per_frame", u.photon),
         ]:
-            value = _quantity(getattr(self, name), unit, name, 0)
+            value = _quantity(getattr(self, name), unit, name, 0, dtype=self.dtype)
             if value.value <= 0:
                 raise ValueError(f"{name} must be positive")
             object.__setattr__(self, name, value)
-        offsets = _quantity(self.displacements, u.mas, "displacements", 2)
+        offsets = _quantity(
+            self.displacements, u.mas, "displacements", 2, dtype=self.dtype
+        )
         if offsets.shape != (5, 2):
             raise ValueError("displacements must have shape (5,2)")
         d = offsets.value[1, 0]
@@ -408,6 +462,7 @@ class SensingWfsMeasurements(_PhysicalRecord):
     """All native angular samples, retaining means and signed-draw pairing.
 
     Attributes:
+        dtype: Real calculation/state precision, float32 by default or float64.
         zero: Unshifted samples (zero_draws,2).
         shifted: Samples (4,gain_draws,2), ordered +x,-x,+y,-y.
     """
@@ -415,9 +470,12 @@ class SensingWfsMeasurements(_PhysicalRecord):
     zero: u.Quantity
     shifted: u.Quantity
 
+    dtype: DTypeLike = field(default=np.float32, kw_only=True)
+
     def __post_init__(self):
-        zero = _quantity(self.zero, u.mas, "zero", 2)
-        shifted = _quantity(self.shifted, u.mas, "shifted", 3)
+        object.__setattr__(self, "dtype", validate_psf_dtype(self.dtype))
+        zero = _quantity(self.zero, u.mas, "zero", 2, dtype=self.dtype)
+        shifted = _quantity(self.shifted, u.mas, "shifted", 3, dtype=self.dtype)
         if zero.shape[1] != 2 or shifted.shape[0] != 4 or shifted.shape[-1] != 2:
             raise ValueError("need zero (draws,2), shifted (4,draws,2)")
         object.__setattr__(self, "zero", zero)
@@ -429,6 +487,7 @@ class ReconstructorNoiseInputs(_PhysicalRecord):
     """Ordered pre-filter noise-query samples, without controller settings.
 
     Attributes:
+        dtype: Real calculation/state precision, float32 by default or float64.
         photons_per_frame: Positive photon-count vector.
         ee: Dimensionless fractions, aligned, in (0,1].
         fwhm: Positive angular full widths at half maximum, aligned.
@@ -438,13 +497,16 @@ class ReconstructorNoiseInputs(_PhysicalRecord):
     ee: u.Quantity
     fwhm: u.Quantity
 
+    dtype: DTypeLike = field(default=np.float32, kw_only=True)
+
     def __post_init__(self):
+        object.__setattr__(self, "dtype", validate_psf_dtype(self.dtype))
         for name, unit in [
             ("photons_per_frame", u.photon),
             ("ee", u.one),
             ("fwhm", u.mas),
         ]:
-            value = _quantity(getattr(self, name), unit, name, 1)
+            value = _quantity(getattr(self, name), unit, name, 1, dtype=self.dtype)
             if np.any(value.value <= 0):
                 raise ValueError(f"{name} must be positive")
             object.__setattr__(self, name, value)
@@ -461,13 +523,19 @@ class ReconstructorNoiseMeasurements(_PhysicalRecord):
     """Native pre-filter noise results, distinct from measured WFS variance.
 
     Attributes:
+        dtype: Real calculation/state precision, float32 by default or float64.
         covariance: Ordered (samples,2,2) symmetric PSD angular covariances.
     """
 
     covariance: u.Quantity
 
+    dtype: DTypeLike = field(default=np.float32, kw_only=True)
+
     def __post_init__(self):
-        covariance = _quantity(self.covariance, u.mas**2, "covariance", 3)
+        object.__setattr__(self, "dtype", validate_psf_dtype(self.dtype))
+        covariance = _quantity(
+            self.covariance, u.mas**2, "covariance", 3, dtype=self.dtype
+        )
         if covariance.shape[1:] != (2, 2) or not np.allclose(
             covariance.value, covariance.value.swapaxes(-1, -2), rtol=1e-12, atol=0
         ):
@@ -482,6 +550,7 @@ class ComaResponseMeasurements(_PhysicalRecord):
     """Sufficient paired observations for offline response and joint-law fitting.
 
     Attributes:
+        dtype: Real calculation/state precision, float32 by default or float64.
         coma: OPD coefficients (samples,2), uncentred.
         magnitudes: Increasing grid (magnitudes,).
         tilt_mean: Angular noise means (samples,magnitudes,2).
@@ -496,7 +565,10 @@ class ComaResponseMeasurements(_PhysicalRecord):
     tilt_batches: u.Quantity
     tilt_noiseless: u.Quantity
 
+    dtype: DTypeLike = field(default=np.float32, kw_only=True)
+
     def __post_init__(self):
+        object.__setattr__(self, "dtype", validate_psf_dtype(self.dtype))
         for name, unit, ndim in [
             ("coma", u.nm, 2),
             ("magnitudes", u.mag, 1),
@@ -505,7 +577,9 @@ class ComaResponseMeasurements(_PhysicalRecord):
             ("tilt_noiseless", u.mas, 3),
         ]:
             object.__setattr__(
-                self, name, _quantity(getattr(self, name), unit, name, ndim)
+                self,
+                name,
+                _quantity(getattr(self, name), unit, name, ndim, dtype=self.dtype),
             )
         n, m = len(self.coma), len(self.magnitudes)
         if (

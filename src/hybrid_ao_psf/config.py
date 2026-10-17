@@ -35,7 +35,7 @@ class HybridConfiguration:
     source: Path
 
 
-def load_configuration(path: str | Path) -> HybridConfiguration:
+def load_configuration(path: str | Path, *, dtype=None) -> HybridConfiguration:
     """Load one combined Hybrid-and-MASTSEL INI file.
 
     Relative artifact and output paths are resolved from the directory that
@@ -49,7 +49,13 @@ def load_configuration(path: str | Path) -> HybridConfiguration:
     parser.optionxform = str
     with source.open(encoding="utf-8") as stream:
         parser.read_file(stream)
-    for section in (HYBRID_SECTION, "telescope", "sources_science", "sources_LO", "RTC"):
+    for section in (
+        HYBRID_SECTION,
+        "telescope",
+        "sources_science",
+        "sources_LO",
+        "RTC",
+    ):
         if not parser.has_section(section):
             raise ValueError(f"Configuration requires [{section}].")
 
@@ -59,7 +65,9 @@ def load_configuration(path: str | Path) -> HybridConfiguration:
             "hybrid.pixel_scale_mas is not supported; the science PSF artifact "
             "owns the pixel scale."
         )
-    science_r = _array(parser["sources_science"], "Zenith", label="sources_science.Zenith")
+    science_r = _array(
+        parser["sources_science"], "Zenith", label="sources_science.Zenith"
+    )
     science_theta = _array(
         parser["sources_science"], "Azimuth", label="sources_science.Azimuth"
     )
@@ -75,10 +83,15 @@ def load_configuration(path: str | Path) -> HybridConfiguration:
     )
     if wavelength_values.size != 1:
         raise ValueError("sources_science.Wavelength must contain exactly one value.")
-    ngs_flux = _array(hybrid, "ngs_flux_photon_per_s", label="hybrid.ngs_flux_photon_per_s")
+    ngs_flux = _array(
+        hybrid, "ngs_flux_photon_per_s", label="hybrid.ngs_flux_photon_per_s"
+    )
     if ngs_flux.shape != ngs_r.shape:
-        raise ValueError("hybrid.ngs_flux_photon_per_s must match sources_LO coordinates.")
+        raise ValueError(
+            "hybrid.ngs_flux_photon_per_s must match sources_LO coordinates."
+        )
     request = HybridRequest(
+        dtype=hybrid.get("precision", "float32") if dtype is None else dtype,
         science_x=science_x * u.arcsec,
         science_y=science_y * u.arcsec,
         ngs_x=ngs_x * u.arcsec,
@@ -91,9 +104,7 @@ def load_configuration(path: str | Path) -> HybridConfiguration:
         * u.deg,
         mastsel_ini=_mastsel_ini(parser),
         non_psd_policy=hybrid.get("non_psd_policy", NonPsdPolicy.ERROR.value),
-        diagnostics_level=hybrid.get(
-            "diagnostics_level", DiagnosticsLevel.NONE.value
-        ),
+        diagnostics_level=hybrid.get("diagnostics_level", DiagnosticsLevel.NONE.value),
     )
     return HybridConfiguration(
         request=request,
@@ -127,7 +138,9 @@ def _resolved_path(
         path = source.parent / path
     path = path.resolve()
     if must_exist and not path.is_file():
-        raise FileNotFoundError(f"Hybrid AO PSF artifact not found for hybrid.{option}: {path}")
+        raise FileNotFoundError(
+            f"Hybrid AO PSF artifact not found for hybrid.{option}: {path}"
+        )
     return path
 
 
@@ -161,9 +174,13 @@ def _scalar(section: SectionProxy, option: str, *, label: str) -> float:
     return value
 
 
-def _polar_to_cartesian(r: np.ndarray, theta: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
+def _polar_to_cartesian(
+    r: np.ndarray, theta: np.ndarray
+) -> tuple[np.ndarray, np.ndarray]:
     if r.shape != theta.shape:
-        raise ValueError("Polar coordinate radius and azimuth vectors must have identical shapes.")
+        raise ValueError(
+            "Polar coordinate radius and azimuth vectors must have identical shapes."
+        )
     radians = np.deg2rad(theta)
     return r * np.cos(radians), r * np.sin(radians)
 

@@ -20,6 +20,7 @@ class _ResponseArrays:
 
 
 def _regression(coma, tilt):
+    dtype = np.asarray(coma).dtype
     coma = coma - coma.mean(axis=0)
     tilt = tilt - tilt.mean(axis=0)
     denominator = np.sum(coma * coma)
@@ -28,10 +29,10 @@ def _regression(coma, tilt):
     h = np.sum(coma * tilt) / denominator
     gram = coma.T @ coma
     # MATLAB rcond uses the one-norm condition estimate.
-    if 1 / np.linalg.cond(gram, 1) > np.finfo(float).eps:
+    if 1 / np.linalg.cond(gram, 1) > np.finfo(dtype).eps:
         matrix = np.linalg.solve(gram.T, (tilt.T @ coma).T).T
     else:
-        matrix = np.full((2, 2), np.nan)
+        matrix = np.full((2, 2), np.nan, dtype=dtype)
     return h, matrix
 
 
@@ -46,13 +47,28 @@ def _resample(rng, coma):
 
 def _simplex(objective, initial, *, joint=False):
     """Use the fminsearch simplex, coefficients, stopping rules and budgets."""
+    initial = np.asarray(initial)
+    # A float32 simplex cannot shrink below representable coordinate steps.
+    xatol = max(
+        1e-10, 4 * np.finfo(initial.dtype).eps * max(1.0, float(np.max(abs(initial))))
+    )
+    # The float32 callback cost also has finite resolution. Keep the retained
+    # double-precision stopping rules exactly as specified.
+    fatol = (
+        1e-12
+        if initial.dtype == np.dtype("float64")
+        else max(
+            1e-12,
+            8 * np.finfo(initial.dtype).eps * max(1.0, float(abs(objective(initial)))),
+        )
+    )
     return minimize(
         objective,
         initial,
         method="Nelder-Mead",
         options={
-            "xatol": 1e-10,
-            "fatol": 1e-12,
+            "xatol": xatol,
+            "fatol": fatol,
             "maxiter": 3000 if joint else 200 * len(initial),
             "maxfev": 6000 if joint else 200 * len(initial),
         },
@@ -61,7 +77,8 @@ def _simplex(objective, initial, *, joint=False):
 
 def response_law(parameters, airmass, magnitudes):
     """Evaluate the joint law in mas/nm for (ZA,magnitude) broadcast grids."""
-    a0, b, half = parameters
+    dtype = np.asarray(magnitudes).dtype
+    a0, b, half = np.asarray(parameters, dtype=dtype)
     return (a0 + b * (np.asarray(airmass).reshape(-1, 1) - 1)) / (
         1 + 10 ** (0.4 * (np.asarray(magnitudes) - half))
     )
@@ -81,6 +98,7 @@ def fit_response(
     to MATLAB rng (PhaseSeed+1). Input means are removed across wavefronts.
     No native WFS objects, physical configuration or acquisition files are read.
     """
+    dtype = np.asarray(response.coma).dtype
     if not np.isfinite(sensing_wavelength) or sensing_wavelength <= 0:
         raise ValueError("sensing_wavelength must be positive metres")
     if type(bootstrap_seed) is not int or not 0 <= bootstrap_seed < 2**32:
@@ -89,26 +107,26 @@ def fit_response(
     if not np.any(c != c[0]):
         raise ValueError("Coma measurements must vary across wavefronts")
     m = len(magnitudes)
-    h = np.empty(m)
-    matrix = np.empty((m, 2, 2))
+    h = np.empty(m, dtype=dtype)
+    matrix = np.empty((m, 2, 2), dtype=dtype)
     for j in range(m):
         h[j], matrix[j] = _regression(c, t[:, j])
     rng = np.random.RandomState(5489 if bootstrap_seed == 0 else bootstrap_seed)
-    bootstrap = np.empty((200, m))
-    matrix_bootstrap = np.empty((200, m, 2, 2))
+    bootstrap = np.empty((200, m), dtype=dtype)
+    matrix_bootstrap = np.empty((200, m, 2, 2), dtype=dtype)
     for b in range(200):
         ids = _resample(rng, c)
         for j in range(m):
             bootstrap[b, j], matrix_bootstrap[b, j] = _regression(c[ids], t[ids, j])
     standard_error = bootstrap.std(axis=0, ddof=1)
-    half_h = np.full((2, m), np.nan)
-    half_error = np.full((2, m), np.nan)
+    half_h = np.full((2, m), np.nan, dtype=dtype)
+    half_error = np.full((2, m), np.nan, dtype=dtype)
     for half, ids in enumerate(np.array_split(np.arange(len(c)), 2)):
         if not np.any(c[ids] != c[ids[0]]):
             continue
         for j in range(m):
             half_h[half, j] = _regression(c[ids], t[ids, j])[0]
-        samples = np.empty((200, m))
+        samples = np.empty((200, m), dtype=dtype)
         for b in range(200):
             selected = ids[_resample(rng, c[ids])]
             for j in range(m):
@@ -118,21 +136,23 @@ def fit_response(
     scale = sensing_wavelength * 1e9 / (2 * np.pi)
     curve = lambda p: p[0] / (1 + 10 ** (0.4 * (magnitudes - p[1])))
     fit = _simplex(
-        lambda q: np.sum((curve([np.exp(q[0]), q[1]]) - h * scale) ** 2),
+        lambda q: np.sum(
+            (curve([np.exp(dtype.type(q[0])), dtype.type(q[1])]) - h * scale) ** 2
+        ),
         [np.log(max(h) * scale), np.median(magnitudes)],
     )
-    parameters = np.array([np.exp(fit.x[0]) / scale, fit.x[1]])
+    parameters = np.array([np.exp(fit.x[0]) / scale, fit.x[1]], dtype=dtype)
     predicted = curve(parameters)
-    difference = matrix - h[:, None, None] * np.eye(2)
+    difference = matrix - h[:, None, None] * np.eye(2, dtype=dtype)
     matrix_error = np.full_like(matrix, np.nan)
-    axis_error = np.full(m, np.nan)
+    axis_error = np.full(m, np.nan, dtype=dtype)
     valid_counts = np.zeros(m, dtype=int)
     for j in range(m):
         valid = np.isfinite(matrix_bootstrap[:, j]).all(axis=(1, 2))
         valid_counts[j] = valid.sum()
         if valid.sum() >= 2:
             sampled = matrix_bootstrap[valid, j]
-            delta = sampled - bootstrap[valid, j, None, None] * np.eye(2)
+            delta = sampled - bootstrap[valid, j, None, None] * np.eye(2, dtype=dtype)
             matrix_error[j] = delta.std(axis=0, ddof=1)
             axis_error[j] = (sampled[:, 0, 0] - sampled[:, 1, 1]).std(ddof=1)
     batch_count = response.tilt_batches.shape[2]
@@ -146,9 +166,10 @@ def fit_response(
         [
             [_regression(c, response.tilt_batches[:, j, b])[0] for j in range(m)]
             for b in range(batch_count)
-        ]
+        ],
+        dtype=dtype,
     )
-    batch_error = batch_h.std(axis=0, ddof=1) / np.sqrt(batch_count)
+    batch_error = batch_h.std(axis=0, ddof=1) / np.sqrt(dtype.type(batch_count))
     return {
         "h": h,
         "jacobian": matrix,
@@ -211,8 +232,9 @@ def fit_airmass(
     The caller selects ZA planes and the held-out angle. measurements and
     standard_error are (ZA,magnitude). All three parameters are fitted together.
     """
+    dtype = np.asarray(measurements).dtype
     zeniths, magnitudes, measured, error = (
-        np.asarray(x, dtype=float)
+        np.asarray(x, dtype=dtype)
         for x in (zeniths, magnitudes, measurements, standard_error)
     )
     if (
@@ -238,7 +260,7 @@ def fit_airmass(
     def solve(airmass, target):
         target = target * scale
         amplitude = np.linalg.lstsq(
-            np.column_stack((np.ones(len(airmass)), airmass - 1)),
+            np.column_stack((np.ones(len(airmass), dtype=dtype), airmass - 1)),
             target[:, 0],
             rcond=None,
         )[0]
@@ -248,7 +270,7 @@ def fit_airmass(
             [*amplitude, magnitudes[half]],
             joint=True,
         )
-        parameters = fit.x.copy()
+        parameters = fit.x.astype(dtype)
         parameters[:2] /= scale
         return parameters, fit.success
 

@@ -4,11 +4,12 @@ from __future__ import annotations
 
 import json
 from collections.abc import Iterable, Mapping
-from dataclasses import dataclass
+from dataclasses import dataclass, field, replace
 from pathlib import Path
 
 import numpy as np
 from astropy import units as u
+from numpy.typing import DTypeLike
 
 from ._calibration_config import ComaCalibrationSettings
 from ._calibration_contracts import (
@@ -18,6 +19,7 @@ from ._calibration_contracts import (
     _PhysicalRecord,
     _quantity,
 )
+from ._calibration_io import validate_observation_precision
 from ._calibration_products import (
     immutable_metadata,
     load_product,
@@ -26,6 +28,7 @@ from ._calibration_products import (
 )
 from ._coma_fitting import _ResponseArrays, fit_airmass, fit_response
 from ._io import atomic_output_path
+from ._validation import clip_support, support_dtype, validate_psf_dtype
 
 _KIND = "hybrid-ao-psf-coma-response"
 _MEASUREMENTS = "hybrid-ao-psf-coma-measurements"
@@ -44,6 +47,7 @@ class ComaCalibrationMeasurements(_PhysicalRecord):
     """Reusable paired response observations and their effective fit controls.
 
     Attributes:
+        dtype: Real calculation/state precision, float32 by default or float64.
         zenith_angle: Physical viewing angle of these independent wavefronts.
         response: Primary-coma OPD and uncentred mean/batch/noiseless WFS tilt.
         sensing_wavelength: Positive WFS reference wavelength. It preserves the
@@ -62,9 +66,14 @@ class ComaCalibrationMeasurements(_PhysicalRecord):
     photometry: CalibrationPhotometry
     settings: ComaCalibrationSettings
 
+    dtype: DTypeLike = field(default=np.float32, kw_only=True)
+
     def __post_init__(self):
-        angle = _angle(self.zenith_angle)
-        wavelength = _quantity(self.sensing_wavelength, u.m, "sensing_wavelength", 0)
+        object.__setattr__(self, "dtype", validate_psf_dtype(self.dtype))
+        angle = _angle(self.zenith_angle, dtype=self.dtype)
+        wavelength = _quantity(
+            self.sensing_wavelength, u.m, "sensing_wavelength", 0, dtype=self.dtype
+        )
         if wavelength.value <= 0:
             raise ValueError("sensing_wavelength must be positive")
         if (
@@ -90,6 +99,9 @@ class ComaResponseModel(_PhysicalRecord):
     """Positive three-parameter magnitude/airmass response over measured support.
 
     Attributes:
+        producer_dtype: Recorded calibration precision, or None when unknown.
+        support_precision: Coarsest coordinate precision retained through preparation.
+        dtype: Real calculation/state precision, float32 by default or float64.
         a0: Zenith bright-star response in angular tilt per OPD length.
         b: Response change per unit increase in airmass, in the same units.
         m_half: Magnitude at half response, inside the measured magnitude range.
@@ -108,9 +120,23 @@ class ComaResponseModel(_PhysicalRecord):
     zenith_support: u.Quantity
     photometry: CalibrationPhotometry
 
+    dtype: DTypeLike = field(default=np.float32, kw_only=True)
+    producer_dtype: DTypeLike | None = field(default=None, kw_only=True)
+    support_precision: DTypeLike | None = field(default=None, kw_only=True)
+
     def __post_init__(self):
+        object.__setattr__(self, "dtype", validate_psf_dtype(self.dtype))
+        if self.producer_dtype is not None:
+            object.__setattr__(
+                self, "producer_dtype", validate_psf_dtype(self.producer_dtype)
+            )
+        object.__setattr__(
+            self,
+            "support_precision",
+            support_dtype(self.dtype, self.producer_dtype, self.support_precision),
+        )
         values = {
-            name: _quantity(getattr(self, name), unit, name, ndim)
+            name: _quantity(getattr(self, name), unit, name, ndim, dtype=self.dtype)
             for name, unit, ndim in (
                 ("a0", u.mas / u.nm, 0),
                 ("b", u.mas / u.nm, 0),
@@ -142,6 +168,14 @@ class ComaResponseModel(_PhysicalRecord):
         for name, value in values.items():
             object.__setattr__(self, name, value)
 
+    def prepare(self, *, dtype=np.float32) -> ComaResponseModel:
+        """Copy runtime coefficients while retaining producer precision."""
+        return replace(
+            self,
+            dtype=validate_psf_dtype(dtype),
+            photometry=replace(self.photometry, dtype=dtype),
+        )
+
     def predict(self, *, magnitude: u.Quantity, zenith_angle: u.Quantity) -> u.Quantity:
         """Return broadcast primary-coma WFS response in mas/nm OPD.
 
@@ -153,20 +187,26 @@ class ComaResponseModel(_PhysicalRecord):
         ):
             raise TypeError("magnitude and zenith_angle must be physical quantities")
         mag, angle = np.broadcast_arrays(
-            magnitude.to_value(u.mag), zenith_angle.to_value(u.deg)
+            np.asarray(magnitude.to_value(u.mag), dtype=self.dtype),
+            np.asarray(zenith_angle.to_value(u.deg), dtype=self.dtype),
         )
         if any(
             v.dtype.kind not in "fiu" or not np.isfinite(v).all() for v in (mag, angle)
         ):
             raise ValueError("finite real magnitude/angle values required")
-        if np.any(mag < self.magnitude_support.value[0]) or np.any(
-            mag > self.magnitude_support.value[-1]
-        ):
-            raise ValueError("magnitude outside measured coma-response support")
-        if np.any(angle < self.zenith_support.value[0]) or np.any(
-            angle > self.zenith_support.value[-1]
-        ):
-            raise ValueError("zenith angle outside measured coma-response support")
+        precision = self.support_precision
+        mag = clip_support(
+            mag,
+            self.magnitude_support.value,
+            dtype=precision,
+            label="coma-response magnitude",
+        )
+        angle = clip_support(
+            angle,
+            self.zenith_support.value,
+            dtype=precision,
+            label="coma-response zenith angle",
+        )
         amplitude = self.a0 + self.b * (1 / np.cos(np.deg2rad(angle)) - 1)
         return (amplitude / (1 + 10 ** (0.4 * (mag - self.m_half.value)))).to(
             u.mas / u.nm
@@ -215,6 +255,7 @@ def build_coma_calibration(
     *,
     heldout_zenith: u.Quantity | None = 30 * u.deg,
     bootstrap_seed: int | None = None,
+    dtype=np.float32,
 ) -> ComaCalibrationResult:
     """Estimate each plane and fit the retained joint response law offline.
 
@@ -238,9 +279,20 @@ def build_coma_calibration(
         not isinstance(item, ComaCalibrationMeasurements) for item in measurements
     ):
         raise ValueError("at least three typed coma measurement planes required")
+    dtype = validate_psf_dtype(dtype)
+    coordinate_precision = support_dtype(dtype, *(item.dtype for item in measurements))
+    measurements = [
+        replace(
+            item,
+            dtype=dtype,
+            response=replace(item.response, dtype=dtype),
+            photometry=replace(item.photometry, dtype=dtype),
+        )
+        for item in measurements
+    ]
     measurements.sort(key=lambda item: float(item.zenith_angle.value))
     first = measurements[0]
-    angles = np.array([item.zenith_angle.value for item in measurements])
+    angles = np.array([item.zenith_angle.value for item in measurements], dtype=dtype)
     magnitudes = first.response.magnitudes.value
     if len(np.unique(angles)) != len(angles):
         raise ValueError("duplicate coma zenith planes")
@@ -285,6 +337,9 @@ def build_coma_calibration(
         raise ValueError("joint coma response law failed acceptance")
     a0, b, half = joint["parameters"]
     model = ComaResponseModel(
+        dtype=dtype,
+        producer_dtype=dtype,
+        support_precision=coordinate_precision,
         a0=a0 * u.mas / u.nm,
         b=b * u.mas / u.nm,
         m_half=half * u.mag,
@@ -317,6 +372,11 @@ def save_coma_calibration(model: ComaResponseModel, path: str | Path) -> None:
         path,
         _KIND,
         {
+            "precision": model.dtype.name,
+            "support_precision": model.support_precision.name,
+            "producer_precision": None
+            if model.producer_dtype is None
+            else np.dtype(model.producer_dtype).name,
             "parameters": {
                 "a0_mas_per_nm": float(model.a0.value),
                 "b_mas_per_nm": float(model.b.value),
@@ -335,7 +395,7 @@ def load_coma_calibration(path: str | Path) -> ComaResponseModel:
     header, arrays = load_product(path, _KIND)
     if (
         arrays is not None
-        or set(header)
+        or (set(header) - {"precision", "producer_precision", "support_precision"})
         != {
             "schema",
             "version",
@@ -355,12 +415,16 @@ def load_coma_calibration(path: str | Path) -> ComaResponseModel:
     coefficients = header["parameters"]
     photometry = header["photometry"]
     return ComaResponseModel(
+        dtype=header.get("precision", np.float64),
+        producer_dtype=header.get("producer_precision"),
+        support_precision=header.get("support_precision"),
         a0=coefficients["a0_mas_per_nm"] * u.mas / u.nm,
         b=coefficients["b_mas_per_nm"] * u.mas / u.nm,
         m_half=coefficients["m_half_mag"] * u.mag,
         magnitude_support=header["magnitude_support"] * u.mag,
         zenith_support=header["zenith_support_deg"] * u.deg,
         photometry=CalibrationPhotometry(
+            dtype=header.get("precision", np.float64),
             magnitude_band=photometry["magnitude_band"],
             photons_per_frame_zeropoint=photometry["photons_per_frame_zeropoint"]
             * u.photon,
@@ -376,7 +440,8 @@ def save_coma_measurements(
         raise TypeError("unsupported coma measurement type")
     header = {
         "schema": _MEASUREMENTS,
-        "version": 1,
+        "version": 2,
+        "precision": measurements.dtype.name,
         "zenith_angle_deg": float(measurements.zenith_angle.value),
         "sensing_wavelength_m": float(measurements.sensing_wavelength.value),
         "photometry": photometry_header(measurements.photometry),
@@ -395,8 +460,9 @@ def load_coma_measurements(path: str | Path) -> ComaCalibrationMeasurements:
     """Load strict paired response observations without wavefront/native resources."""
     with np.load(Path(path), allow_pickle=False) as saved:
         header = json.loads(str(saved["__header__"]))
+        validate_observation_precision(header, saved)
         if (
-            set(header)
+            (set(header) - ({"precision"} if header.get("version") == 2 else set()))
             != {
                 "schema",
                 "version",
@@ -408,7 +474,7 @@ def load_coma_measurements(path: str | Path) -> ComaCalibrationMeasurements:
             }
             or header["schema"] != _MEASUREMENTS
             or type(header["version"]) is not int
-            or header["version"] != 1
+            or header["version"] not in (1, 2)
             or header["units"] != _UNITS
             or set(saved.files) != {"__header__", *_FIELDS}
             or set(header["photometry"])
@@ -417,12 +483,15 @@ def load_coma_measurements(path: str | Path) -> ComaCalibrationMeasurements:
             raise ValueError("invalid coma measurements schema/units/fields")
         photometry = header["photometry"]
         return ComaCalibrationMeasurements(
+            dtype=header.get("precision", np.float64),
             zenith_angle=header["zenith_angle_deg"] * u.deg,
             response=ComaResponseMeasurements(
-                **{name: saved[name] * u.Unit(_UNITS[name]) for name in _FIELDS}
+                dtype=header.get("precision", np.float64),
+                **{name: saved[name] * u.Unit(_UNITS[name]) for name in _FIELDS},
             ),
             sensing_wavelength=header["sensing_wavelength_m"] * u.m,
             photometry=CalibrationPhotometry(
+                dtype=header.get("precision", np.float64),
                 magnitude_band=photometry["magnitude_band"],
                 photons_per_frame_zeropoint=photometry["photons_per_frame_zeropoint"]
                 * u.photon,

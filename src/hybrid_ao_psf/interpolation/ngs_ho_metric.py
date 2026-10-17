@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 from collections.abc import Mapping
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
@@ -17,15 +17,23 @@ from ao_stats import (
     compute_psf_sr,
 )
 from astropy import units as u
+from numpy.typing import DTypeLike
 from scipy.interpolate import RegularGridInterpolator
 from scipy.spatial import Delaunay, QhullError
 
 from .._units import quantity_value, require_quantity
+from .._validation import (
+    clip_support,
+    coordinate_support_dtype,
+    support_dtype,
+    validate_psf_dtype,
+)
 from ..contracts import NgsHoMetricPrediction
 from ._core import (
     RbfInterpolationConfig,
     RegularGridInterpolationConfig,
     axis_index,
+    cast_artifact_value,
     evaluate_scaled_rbf_model,
     field_coordinates,
     freeze_artifact_value,
@@ -181,17 +189,47 @@ class NgsHoMetricInterpolator:
     model: Mapping[str, Any]
     provenance: tuple[str, ...] = ()
     builder: Mapping[str, Any] = field(default_factory=dict)
+    dtype: DTypeLike = field(default=np.float32, kw_only=True)
 
     def __post_init__(self) -> None:
+        object.__setattr__(self, "dtype", validate_psf_dtype(self.dtype))
         object.__setattr__(self, "coordinate_order", tuple(self.coordinate_order))
-        object.__setattr__(self, "zenith_angle_axis", freeze_artifact_value(self.zenith_angle_axis))
-        object.__setattr__(self, "airmass_axis", freeze_artifact_value(self.airmass_axis))
+        object.__setattr__(
+            self, "zenith_angle_axis", freeze_artifact_value(self.zenith_angle_axis)
+        )
+        object.__setattr__(
+            self, "airmass_axis", freeze_artifact_value(self.airmass_axis)
+        )
         object.__setattr__(self, "x", freeze_artifact_value(self.x))
         object.__setattr__(self, "y", freeze_artifact_value(self.y))
-        object.__setattr__(self, "metric_names", tuple(str(value) for value in self.metric_names))
+        object.__setattr__(
+            self, "metric_names", tuple(str(value) for value in self.metric_names)
+        )
         object.__setattr__(self, "model", freeze_artifact_value(self.model))
-        object.__setattr__(self, "provenance", tuple(str(value) for value in self.provenance))
+        object.__setattr__(
+            self, "provenance", tuple(str(value) for value in self.provenance)
+        )
         object.__setattr__(self, "builder", freeze_artifact_value(self.builder))
+
+    def prepare(self, *, dtype: DTypeLike = np.float32) -> NgsHoMetricInterpolator:
+        """Copy provider state for runtime precision, retaining producer provenance."""
+        dtype = validate_psf_dtype(dtype)
+        names = ("zenith_angle_axis", "airmass_axis", "x", "y", "model")
+        return replace(
+            self,
+            dtype=dtype,
+            builder={
+                **self.builder,
+                "support_precision": support_dtype(
+                    self.dtype,
+                    dtype,
+                    self.builder.get(
+                        "support_precision", self.builder.get("precision")
+                    ),
+                ).name,
+            },
+            **{name: cast_artifact_value(getattr(self, name), dtype) for name in names},
+        )
 
     def predict(
         self,
@@ -209,20 +247,36 @@ class NgsHoMetricInterpolator:
         )
 
 
-def build_ngs_ho_metric_samples_from_psfs(samples: NgsHoPsfSamples) -> NgsHoMetricSamples:
+def build_ngs_ho_metric_samples_from_psfs(
+    samples: NgsHoPsfSamples, *, dtype: DTypeLike = np.float32
+) -> NgsHoMetricSamples:
     """Measure NGS-HO metrics from NGS-HO PSF samples."""
 
-    prepared = _prepare_psf_samples(samples)
+    dtype = validate_psf_dtype(dtype)
+    prepared = _prepare_psf_samples(samples, dtype=dtype)
     psfs = prepared.psfs.reshape((-1, *prepared.psfs.shape[2:]))
     metadata = PsfMetadata(
-        wavelength=_expand_psf_metadata(prepared.wavelength, prepared.psfs.shape[:2], unit=u.um, label="wavelength") * u.um,
-        pixel_scale=_expand_psf_metadata(prepared.pixel_scale, prepared.psfs.shape[:2], unit=u.mas, label="pixel_scale") * u.mas,
+        wavelength=_expand_psf_metadata(
+            prepared.wavelength, prepared.psfs.shape[:2], unit=u.um, label="wavelength"
+        )
+        * u.um,
+        pixel_scale=_expand_psf_metadata(
+            prepared.pixel_scale,
+            prepared.psfs.shape[:2],
+            unit=u.mas,
+            label="pixel_scale",
+        )
+        * u.mas,
         tel_diameter=prepared.tel_diameter,
         tel_pupil=prepared.tel_pupil,
     )
-    sr = np.asarray(compute_psf_sr(psfs, metadata, preprocess="default"), dtype=float)
-    fwhm = np.asarray(compute_psf_fwhm(psfs, metadata, preprocess="default"), dtype=float)
-    ee_aperture_diameters = np.asarray(2.0 * fwhm, dtype=np.float32).reshape(-1, 1) * u.mas
+    sr = np.asarray(
+        compute_psf_sr(psfs, metadata, preprocess="default", dtype=dtype), dtype=dtype
+    )
+    fwhm = np.asarray(
+        compute_psf_fwhm(psfs, metadata, preprocess="default", dtype=dtype), dtype=dtype
+    )
+    ee_aperture_diameters = np.asarray(2.0 * fwhm, dtype=dtype).reshape(-1, 1) * u.mas
     ee = np.asarray(
         compute_psf_ee(
             psfs,
@@ -230,8 +284,9 @@ def build_ngs_ho_metric_samples_from_psfs(samples: NgsHoPsfSamples) -> NgsHoMetr
             ee_apertures=ee_aperture_diameters,
             ee_geometry=EE_GEOMETRY_ENCIRCLED,
             preprocess="default",
+            dtype=dtype,
         ),
-        dtype=float,
+        dtype=dtype,
     ).reshape(-1)
     n_planes, n_points = prepared.psfs.shape[:2]
     return NgsHoMetricSamples(
@@ -248,12 +303,16 @@ def build_ngs_ho_metric_samples_from_psfs(samples: NgsHoPsfSamples) -> NgsHoMetr
 def build_ngs_ho_metric_interpolator_from_psfs(
     samples: NgsHoPsfSamples,
     *,
-    interpolation_config: RegularGridInterpolationConfig | RbfInterpolationConfig | None = None,
+    dtype: DTypeLike = np.float32,
+    interpolation_config: RegularGridInterpolationConfig
+    | RbfInterpolationConfig
+    | None = None,
 ) -> NgsHoMetricInterpolator:
     """Build an NGS-HO-metric artifact from NGS-HO PSF samples."""
 
     return build_ngs_ho_metric_interpolator(
-        build_ngs_ho_metric_samples_from_psfs(samples),
+        build_ngs_ho_metric_samples_from_psfs(samples, dtype=dtype),
+        dtype=dtype,
         interpolation_config=interpolation_config,
     )
 
@@ -261,12 +320,18 @@ def build_ngs_ho_metric_interpolator_from_psfs(
 def build_ngs_ho_metric_interpolator(
     samples: NgsHoMetricSamples,
     *,
-    interpolation_config: RegularGridInterpolationConfig | RbfInterpolationConfig | None = None,
+    dtype: DTypeLike = np.float32,
+    interpolation_config: RegularGridInterpolationConfig
+    | RbfInterpolationConfig
+    | None = None,
 ) -> NgsHoMetricInterpolator:
     """Build an NGS-HO-metric interpolation artifact from metric samples."""
 
-    config = _validate_interpolation_config(interpolation_config or RegularGridInterpolationConfig())
-    prepared = _prepare_metric_samples(samples)
+    dtype = validate_psf_dtype(dtype)
+    config = _validate_interpolation_config(
+        interpolation_config or RegularGridInterpolationConfig()
+    )
+    prepared = _prepare_metric_samples(samples, dtype=dtype)
     values_by_name = {
         "ee": prepared.ee.to_value(u.dimensionless_unscaled),
         "fwhm": prepared.fwhm.to_value(u.mas),
@@ -292,13 +357,18 @@ def build_ngs_ho_metric_interpolator(
             zenith_axis,
         )
     model = dict(model)
-    model["metric_units"] = {"ee": u.dimensionless_unscaled, "fwhm": u.mas, "sr": u.dimensionless_unscaled}
+    model["metric_units"] = {
+        "ee": u.dimensionless_unscaled,
+        "fwhm": u.mas,
+        "sr": u.dimensionless_unscaled,
+    }
     if "metric_grids" in model:
         model["metric_grids"] = {
             name: np.asarray(grid) * model["metric_units"][name]
             for name, grid in dict(model["metric_grids"]).items()
         }
     return NgsHoMetricInterpolator(
+        dtype=dtype,
         coordinate_order=coordinate_order,
         zenith_angle_axis=zenith_axis * u.deg,
         airmass_axis=zenith_angle_to_airmass(zenith_axis * u.deg),
@@ -310,10 +380,14 @@ def build_ngs_ho_metric_interpolator(
         provenance=tuple(prepared.provenance),
         builder={
             "name": "hybrid_ao_psf.interpolation.ngs_ho_metric",
+            "precision": dtype.name,
+            "support_precision": coordinate_support_dtype(
+                dtype, samples.x, samples.y, samples.zenith_angle
+            ).name,
             "created_at": datetime.now(UTC).isoformat(),
             "interpolation_strategy": _interpolation_strategy(config),
         },
-    )
+    ).prepare(dtype=dtype)
 
 
 def evaluate_ngs_ho_metric_interpolator(
@@ -355,9 +429,12 @@ def evaluate_ngs_ho_metric_interpolator(
         output = _evaluate_regular_grid_metric_model(interpolator, config, query=query)
     _validate_predicted_metrics(output)
     return NgsHoMetricPrediction(
-        ee=np.asarray(output["ee"], dtype=float) * u.dimensionless_unscaled,
-        fwhm=np.asarray(output["fwhm"], dtype=float) * u.mas,
-        sr=np.asarray(output["sr"], dtype=float) * u.dimensionless_unscaled,
+        dtype=interpolator.dtype,
+        ee=np.asarray(output["ee"], dtype=interpolator.dtype)
+        * u.dimensionless_unscaled,
+        fwhm=np.asarray(output["fwhm"], dtype=interpolator.dtype) * u.mas,
+        sr=np.asarray(output["sr"], dtype=interpolator.dtype)
+        * u.dimensionless_unscaled,
     )
 
 
@@ -401,10 +478,17 @@ def _prepare_validated_query(
         raise TypeError("interpolator must be an NgsHoMetricInterpolator instance.")
     _validate_interpolator(interpolator)
     query = _query_values(interpolator, zenith_angle, x, y)
-    if isinstance(_validate_interpolation_config(interpolator.interpolation_config), RegularGridInterpolationConfig):
-        _validate_regular_grid_field_support(interpolator, query[NGS_COORD_X], query[NGS_COORD_Y])
+    if isinstance(
+        _validate_interpolation_config(interpolator.interpolation_config),
+        RegularGridInterpolationConfig,
+    ):
+        _validate_regular_grid_field_support(
+            interpolator, query[NGS_COORD_X], query[NGS_COORD_Y]
+        )
     else:
-        _validate_rbf_field_support(interpolator, query[NGS_COORD_X], query[NGS_COORD_Y])
+        _validate_rbf_field_support(
+            interpolator, query[NGS_COORD_X], query[NGS_COORD_Y]
+        )
     return query
 
 
@@ -422,13 +506,15 @@ def replay_ngs_ho_metric_interpolator(
 ) -> NgsHoMetricReplaySummary:
     """Replay an NGS-HO-metric artifact at source sample nodes."""
 
-    prepared = _prepare_metric_samples(samples)
+    prepared = _prepare_metric_samples(samples, dtype=interpolator.dtype)
     query_kwargs: dict[str, Any] = {
         "x": np.tile(prepared.x.to_value(u.arcsec), prepared.ee.shape[0]) * u.arcsec,
         "y": np.tile(prepared.y.to_value(u.arcsec), prepared.ee.shape[0]) * u.arcsec,
     }
     if prepared.zenith_angle is not None:
-        query_kwargs["zenith_angle"] = np.repeat(prepared.zenith_angle.to_value(u.deg), prepared.x.size) * u.deg
+        query_kwargs["zenith_angle"] = (
+            np.repeat(prepared.zenith_angle.to_value(u.deg), prepared.x.size) * u.deg
+        )
     prediction = evaluate_ngs_ho_metric_interpolator(interpolator, **query_kwargs)
     reference = {
         "ee": prepared.ee.to_value(u.dimensionless_unscaled).reshape(-1),
@@ -440,7 +526,11 @@ def replay_ngs_ho_metric_interpolator(
         "fwhm": prediction.fwhm.to_value(u.mas),
         "sr": prediction.sr.to_value(u.dimensionless_unscaled),
     }
-    units = {"ee": u.dimensionless_unscaled, "fwhm": u.mas, "sr": u.dimensionless_unscaled}
+    units = {
+        "ee": u.dimensionless_unscaled,
+        "fwhm": u.mas,
+        "sr": u.dimensionless_unscaled,
+    }
     return NgsHoMetricReplaySummary(
         metric_rms={
             name: float(np.sqrt(np.mean((measured[name] - reference[name]) ** 2)))
@@ -448,8 +538,7 @@ def replay_ngs_ho_metric_interpolator(
             for name in reference
         },
         metric_max_abs={
-            name: float(np.max(np.abs(measured[name] - reference[name])))
-            * units[name]
+            name: float(np.max(np.abs(measured[name] - reference[name]))) * units[name]
             for name in reference
         },
         num_planes=int(prepared.ee.shape[0]),
@@ -481,22 +570,46 @@ def load_ngs_ho_metric_interpolator(path: Path) -> NgsHoMetricInterpolator:
 # Sample preparation
 
 
-def _prepare_metric_samples(samples: NgsHoMetricSamples) -> NgsHoMetricSamples:
+def _prepare_metric_samples(
+    samples: NgsHoMetricSamples, *, dtype: DTypeLike = np.float32
+) -> NgsHoMetricSamples:
     if not isinstance(samples, NgsHoMetricSamples):
         raise TypeError("samples must be an NgsHoMetricSamples instance.")
     coordinates = field_coordinates(samples.x, samples.y)
     n_planes = _infer_metric_plane_count(samples, coordinates.shape[0])
-    zenith_angle = _prepare_optional_plane_values(samples.zenith_angle, label="zenith_angle", length=n_planes)
+    zenith_angle = _prepare_optional_plane_values(
+        samples.zenith_angle, label="zenith_angle", length=n_planes, dtype=dtype
+    )
     if zenith_angle is None and n_planes != 1:
         raise ValueError("Multiple NGS HO metric planes require zenith_angle.")
     expected_shape = (n_planes, coordinates.shape[0])
-    ee = _prepare_metric_array(samples.ee, unit=u.dimensionless_unscaled, label="ee", expected_shape=expected_shape)
-    fwhm = _prepare_metric_array(samples.fwhm, unit=u.mas, label="fwhm", expected_shape=expected_shape)
-    sr = _prepare_metric_array(samples.sr, unit=u.dimensionless_unscaled, label="sr", expected_shape=expected_shape)
+    ee = _prepare_metric_array(
+        samples.ee,
+        unit=u.dimensionless_unscaled,
+        label="ee",
+        expected_shape=expected_shape,
+        dtype=dtype,
+    )
+    fwhm = _prepare_metric_array(
+        samples.fwhm,
+        unit=u.mas,
+        label="fwhm",
+        expected_shape=expected_shape,
+        dtype=dtype,
+    )
+    sr = _prepare_metric_array(
+        samples.sr,
+        unit=u.dimensionless_unscaled,
+        label="sr",
+        expected_shape=expected_shape,
+        dtype=dtype,
+    )
     return NgsHoMetricSamples(
         zenith_angle=zenith_angle,
-        x=quantity_value(samples.x, u.arcsec, label="x", dtype=float).reshape(-1) * u.arcsec,
-        y=quantity_value(samples.y, u.arcsec, label="y", dtype=float).reshape(-1) * u.arcsec,
+        x=quantity_value(samples.x, u.arcsec, label="x", dtype=dtype).reshape(-1)
+        * u.arcsec,
+        y=quantity_value(samples.y, u.arcsec, label="y", dtype=dtype).reshape(-1)
+        * u.arcsec,
         ee=ee,
         fwhm=fwhm,
         sr=sr,
@@ -504,31 +617,51 @@ def _prepare_metric_samples(samples: NgsHoMetricSamples) -> NgsHoMetricSamples:
     )
 
 
-def _prepare_psf_samples(samples: NgsHoPsfSamples) -> NgsHoPsfSamples:
+def _prepare_psf_samples(
+    samples: NgsHoPsfSamples, *, dtype: DTypeLike = np.float32
+) -> NgsHoPsfSamples:
     if not isinstance(samples, NgsHoPsfSamples):
         raise TypeError("samples must be an NgsHoPsfSamples instance.")
     coordinates = field_coordinates(samples.x, samples.y)
-    psfs = np.asarray(samples.psfs, dtype=np.float32)
+    psfs = np.asarray(samples.psfs, dtype=dtype)
     if psfs.ndim == 3:
         psfs = psfs[np.newaxis, ...]
-    psfs = validate_psf_array(psfs, label="psfs", ndim=4)
+    psfs = validate_psf_array(psfs, label="psfs", ndim=4, dtype=dtype)
     if psfs.shape[1] != coordinates.shape[0]:
         raise ValueError(
             "psfs point dimension must match field coordinates; "
             f"got {psfs.shape} for {coordinates.shape[0]} points."
         )
-    zenith_angle = _prepare_optional_plane_values(samples.zenith_angle, label="zenith_angle", length=psfs.shape[0])
-    _expand_psf_metadata(samples.wavelength, psfs.shape[:2], unit=u.um, label="wavelength")
-    _expand_psf_metadata(samples.pixel_scale, psfs.shape[:2], unit=u.mas, label="pixel_scale")
+    zenith_angle = _prepare_optional_plane_values(
+        samples.zenith_angle, label="zenith_angle", length=psfs.shape[0], dtype=dtype
+    )
+    _expand_psf_metadata(
+        samples.wavelength, psfs.shape[:2], unit=u.um, label="wavelength"
+    )
+    _expand_psf_metadata(
+        samples.pixel_scale, psfs.shape[:2], unit=u.mas, label="pixel_scale"
+    )
     return NgsHoPsfSamples(
         zenith_angle=zenith_angle,
-        x=quantity_value(samples.x, u.arcsec, label="x", dtype=float).reshape(-1) * u.arcsec,
-        y=quantity_value(samples.y, u.arcsec, label="y", dtype=float).reshape(-1) * u.arcsec,
+        x=quantity_value(samples.x, u.arcsec, label="x", dtype=dtype).reshape(-1)
+        * u.arcsec,
+        y=quantity_value(samples.y, u.arcsec, label="y", dtype=dtype).reshape(-1)
+        * u.arcsec,
         psfs=psfs,
         wavelength=require_quantity(samples.wavelength, u.um, label="wavelength"),
         pixel_scale=require_quantity(samples.pixel_scale, u.mas, label="pixel_scale"),
-        tel_diameter=require_positive_scalar(quantity_value(samples.tel_diameter, u.m, label="tel_diameter"), label="tel_diameter") * u.m,
-        tel_pupil=require_pupil(quantity_value(samples.tel_pupil, u.dimensionless_unscaled, label="tel_pupil")) * u.dimensionless_unscaled,
+        tel_diameter=require_positive_scalar(
+            quantity_value(samples.tel_diameter, u.m, label="tel_diameter"),
+            label="tel_diameter",
+        )
+        * u.m,
+        tel_pupil=require_pupil(
+            quantity_value(
+                samples.tel_pupil, u.dimensionless_unscaled, label="tel_pupil"
+            ),
+            dtype=dtype,
+        )
+        * u.dimensionless_unscaled,
         provenance=tuple(str(value) for value in samples.provenance),
     )
 
@@ -542,14 +675,20 @@ def _infer_metric_plane_count(samples: NgsHoMetricSamples, n_points: int) -> int
         )
         if metric.ndim == 1:
             if metric.shape[0] != n_points:
-                raise ValueError(f"{name} must have length {n_points}; got shape {metric.shape}.")
+                raise ValueError(
+                    f"{name} must have length {n_points}; got shape {metric.shape}."
+                )
             counts.append(1)
         elif metric.ndim == 2:
             if metric.shape[1] != n_points:
-                raise ValueError(f"{name} second dimension must be {n_points}; got shape {metric.shape}.")
+                raise ValueError(
+                    f"{name} second dimension must be {n_points}; got shape {metric.shape}."
+                )
             counts.append(int(metric.shape[0]))
         else:
-            raise ValueError(f"{name} must have shape (points,) or (planes, points); got {metric.shape}.")
+            raise ValueError(
+                f"{name} must have shape (points,) or (planes, points); got {metric.shape}."
+            )
     if samples.zenith_angle is not None:
         zenith = quantity_value(
             samples.zenith_angle, u.deg, label="zenith_angle", dtype=float
@@ -558,31 +697,46 @@ def _infer_metric_plane_count(samples: NgsHoMetricSamples, n_points: int) -> int
             counts.append(int(zenith.reshape(-1).size))
     n_planes = max(counts) if counts else 1
     if any(count not in {1, n_planes} for count in counts):
-        raise ValueError("NGS HO metric plane counts must match across metrics and zenith_angle.")
+        raise ValueError(
+            "NGS HO metric plane counts must match across metrics and zenith_angle."
+        )
     return int(n_planes)
 
 
-def _prepare_optional_plane_values(value: Any, *, label: str, length: int) -> u.Quantity | None:
+def _prepare_optional_plane_values(
+    value: Any, *, label: str, length: int, dtype=np.float64
+) -> u.Quantity | None:
     if value is None:
         return None
-    array = quantity_value(value, u.deg, label=label, dtype=float)
+    array = quantity_value(value, u.deg, label=label, dtype=dtype)
     if array.ndim == 0:
-        vector = np.full(int(length), float(array), dtype=float)
+        vector = np.full(int(length), float(array), dtype=dtype)
     else:
         vector = array.reshape(-1)
         if vector.size != int(length):
-            raise ValueError(f"{label} must be scalar or have one value per plane; got length {vector.size}.")
+            raise ValueError(
+                f"{label} must be scalar or have one value per plane; got length {vector.size}."
+            )
     return require_finite_vector(vector, label=label, length=length) * u.deg
 
 
-def _prepare_metric_array(value: Any, *, unit: u.UnitBase, label: str, expected_shape: tuple[int, int]) -> u.Quantity:
+def _prepare_metric_array(
+    value: Any,
+    *,
+    unit: u.UnitBase,
+    label: str,
+    expected_shape: tuple[int, int],
+    dtype=np.float64,
+) -> u.Quantity:
     if value is None:
         raise ValueError(f"{label} is required.")
-    metric = quantity_value(value, unit, label=label, dtype=float)
+    metric = quantity_value(value, unit, label=label, dtype=dtype)
     if metric.ndim == 1 and expected_shape[0] == 1:
         metric = metric[np.newaxis, :]
     if metric.shape != expected_shape:
-        raise ValueError(f"{label} must have shape {expected_shape}, got {metric.shape}.")
+        raise ValueError(
+            f"{label} must have shape {expected_shape}, got {metric.shape}."
+        )
     if not np.all(np.isfinite(metric)):
         raise ValueError(f"{label} must contain only finite values.")
     if np.any(metric <= 0.0):
@@ -592,7 +746,9 @@ def _prepare_metric_array(value: Any, *, unit: u.UnitBase, label: str, expected_
     return metric * unit
 
 
-def _expand_psf_metadata(value: Any, shape: tuple[int, int], *, unit: u.UnitBase, label: str) -> float | np.ndarray:
+def _expand_psf_metadata(
+    value: Any, shape: tuple[int, int], *, unit: u.UnitBase, label: str
+) -> float | np.ndarray:
     n_planes, n_points = shape
     array = quantity_value(value, unit, label=label, dtype=float)
     if array.ndim == 0:
@@ -602,12 +758,16 @@ def _expand_psf_metadata(value: Any, shape: tuple[int, int], *, unit: u.UnitBase
         vector = require_positive_vector(array, label=label, length=n_planes)
         return np.repeat(vector, n_points)
     if array.shape == shape:
-        flat = require_positive_vector(array.reshape(-1), label=label, length=n_planes * n_points)
+        flat = require_positive_vector(
+            array.reshape(-1), label=label, length=n_planes * n_points
+        )
         return flat
     flat = np.asarray(array, dtype=float).reshape(-1)
     if flat.size == n_planes * n_points:
         return require_positive_vector(flat, label=label, length=n_planes * n_points)
-    raise ValueError(f"{label} must be scalar, per-plane, or per-PSF; got shape {array.shape}.")
+    raise ValueError(
+        f"{label} must be scalar, per-plane, or per-PSF; got shape {array.shape}."
+    )
 
 
 # Build helpers
@@ -625,8 +785,16 @@ def _coordinate_order_for_config(
 ) -> tuple[str, ...]:
     has_airmass = zenith_axis.size > 1
     if isinstance(config, RegularGridInterpolationConfig):
-        return (NGS_COORD_AIRMASS, *NGS_REGULAR_GRID_FIELD_ORDER) if has_airmass else NGS_REGULAR_GRID_FIELD_ORDER
-    return (NGS_COORD_AIRMASS, *NGS_RBF_FIELD_ORDER) if has_airmass else NGS_RBF_FIELD_ORDER
+        return (
+            (NGS_COORD_AIRMASS, *NGS_REGULAR_GRID_FIELD_ORDER)
+            if has_airmass
+            else NGS_REGULAR_GRID_FIELD_ORDER
+        )
+    return (
+        (NGS_COORD_AIRMASS, *NGS_RBF_FIELD_ORDER)
+        if has_airmass
+        else NGS_RBF_FIELD_ORDER
+    )
 
 
 def _validate_interpolation_config(
@@ -636,10 +804,14 @@ def _validate_interpolation_config(
         return validate_regular_grid_config(config)
     if isinstance(config, RbfInterpolationConfig):
         return validate_rbf_config(config)
-    raise TypeError("interpolation_config must be a RegularGridInterpolationConfig or RbfInterpolationConfig instance.")
+    raise TypeError(
+        "interpolation_config must be a RegularGridInterpolationConfig or RbfInterpolationConfig instance."
+    )
 
 
-def _interpolation_strategy(config: RegularGridInterpolationConfig | RbfInterpolationConfig) -> str:
+def _interpolation_strategy(
+    config: RegularGridInterpolationConfig | RbfInterpolationConfig,
+) -> str:
     config = _validate_interpolation_config(config)
     if isinstance(config, RegularGridInterpolationConfig):
         return NGS_HO_METRIC_STRATEGY_REGULAR_GRID
@@ -653,19 +825,30 @@ def _make_regular_grid_metric_model(
     coordinate_order: tuple[str, ...],
     zenith_axis: np.ndarray,
 ) -> tuple[np.ndarray, np.ndarray, dict[str, Any]]:
+    dtype = samples.ee.dtype
     config = validate_regular_grid_config(config)
-    _validate_coordinate_order_for_strategy(coordinate_order, NGS_HO_METRIC_STRATEGY_REGULAR_GRID)
+    _validate_coordinate_order_for_strategy(
+        coordinate_order, NGS_HO_METRIC_STRATEGY_REGULAR_GRID
+    )
     if NGS_COORD_AIRMASS in coordinate_order:
         if zenith_axis.size != samples.ee.shape[0]:
-            raise ValueError("NGS HO metric samples contain duplicate zenith-angle planes.")
+            raise ValueError(
+                "NGS HO metric samples contain duplicate zenith-angle planes."
+            )
     elif samples.ee.shape[0] != 1:
-        raise ValueError("Field-only NGS HO metric artifacts require exactly one source plane.")
-    x_axis, y_axis = rectangular_field_axes(samples.x, samples.y, label="NGS HO metric samples")
+        raise ValueError(
+            "Field-only NGS HO metric artifacts require exactly one source plane."
+        )
+    x_axis, y_axis = rectangular_field_axes(
+        samples.x, samples.y, label="NGS HO metric samples"
+    )
     metric_grids: dict[str, np.ndarray] = {}
     active_shape = (zenith_axis.size,) if NGS_COORD_AIRMASS in coordinate_order else ()
     for name, values in values_by_name.items():
-        values = np.asarray(values, dtype=float)
-        metric_grid = np.full((*active_shape, y_axis.size, x_axis.size), np.nan, dtype=float)
+        values = np.asarray(values, dtype=dtype)
+        metric_grid = np.full(
+            (*active_shape, y_axis.size, x_axis.size), np.nan, dtype=dtype
+        )
         for plane_index in range(values.shape[0]):
             grid_index = (
                 (
@@ -685,27 +868,33 @@ def _make_regular_grid_metric_model(
                 x_axis,
                 y_axis,
                 label=f"NGS HO metric {name}",
-                dtype=float,
+                dtype=dtype,
             )
         if not np.all(np.isfinite(metric_grid)):
             raise ValueError(f"NGS HO metric {name} grid is incomplete.")
         metric_grids[str(name)] = metric_grid
     return (
-        np.asarray(x_axis, dtype=float),
-        np.asarray(y_axis, dtype=float),
+        np.asarray(x_axis, dtype=dtype),
+        np.asarray(y_axis, dtype=dtype),
         {"metric_grids": metric_grids, "method": config.method},
     )
 
 
-def _training_coordinates(samples: NgsHoMetricSamples, coordinate_order: tuple[str, ...]) -> np.ndarray:
+def _training_coordinates(
+    samples: NgsHoMetricSamples, coordinate_order: tuple[str, ...]
+) -> np.ndarray:
     columns: list[np.ndarray] = []
     n_planes = samples.ee.shape[0]
     n_points = samples.x.size
     for name in coordinate_order:
         if name == NGS_COORD_AIRMASS:
             if samples.zenith_angle is None:
-                raise ValueError("zenith_angle is required for active airmass interpolation.")
-            airmasses = zenith_angle_to_airmass(samples.zenith_angle).to_value(u.dimensionless_unscaled)
+                raise ValueError(
+                    "zenith_angle is required for active airmass interpolation."
+                )
+            airmasses = zenith_angle_to_airmass(samples.zenith_angle).to_value(
+                u.dimensionless_unscaled
+            )
             columns.append(np.repeat(airmasses, n_points))
         elif name == NGS_COORD_X:
             columns.append(np.tile(samples.x.to_value(u.arcsec), n_planes))
@@ -719,16 +908,41 @@ def _training_coordinates(samples: NgsHoMetricSamples, coordinate_order: tuple[s
 # Query helpers
 
 
-def _query_values(interpolator: NgsHoMetricInterpolator, zenith_angle: Any, x: Any, y: Any) -> dict[str, np.ndarray]:
+def _query_values(
+    interpolator: NgsHoMetricInterpolator, zenith_angle: Any, x: Any, y: Any
+) -> dict[str, np.ndarray]:
     x = require_finite_vector(quantity_value(x, u.arcsec, label="x"), label="x")
     if x.size == 0:
         raise ValueError("At least one query field coordinate is required.")
-    y = require_finite_vector(quantity_value(y, u.arcsec, label="y"), label="y", length=x.size)
+    y = require_finite_vector(
+        quantity_value(y, u.arcsec, label="y"), label="y", length=x.size
+    )
+    precision = support_dtype(
+        interpolator.dtype,
+        interpolator.builder.get(
+            "support_precision", interpolator.builder.get("precision")
+        ),
+    )
+    x = clip_support(
+        x,
+        np.unique(interpolator.x.to_value(u.arcsec)),
+        dtype=precision,
+        label="field x",
+    )
+    y = clip_support(
+        y,
+        np.unique(interpolator.y.to_value(u.arcsec)),
+        dtype=precision,
+        label="field y",
+    )
     query: dict[str, np.ndarray] = {NGS_COORD_X: x, NGS_COORD_Y: y}
     if NGS_COORD_AIRMASS in interpolator.coordinate_order:
         if zenith_angle is None:
             raise ValueError("zenith_angle is required by this NGS HO metric artifact.")
-        zenith = require_finite_vector(quantity_value(zenith_angle, u.deg, label="zenith_angle"), label="zenith_angle")
+        zenith = require_finite_vector(
+            quantity_value(zenith_angle, u.deg, label="zenith_angle"),
+            label="zenith_angle",
+        )
         if zenith.size == 1 and x.size != 1:
             zenith = np.full(x.shape, float(zenith[0]), dtype=float)
         if zenith.size != x.size:
@@ -736,13 +950,33 @@ def _query_values(interpolator: NgsHoMetricInterpolator, zenith_angle: Any, x: A
                 "zenith_angle, x, and y must have matching lengths; "
                 f"got {zenith.size}, {x.size}, {y.size}."
             )
-        airmass = zenith_angle_to_airmass(zenith * u.deg).to_value(u.dimensionless_unscaled)
-        _validate_airmass_support(interpolator, airmass, zenith)
+        airmass = zenith_angle_to_airmass(zenith * u.deg).to_value(
+            u.dimensionless_unscaled
+        )
+        airmass = _validate_airmass_support(interpolator, airmass, zenith)
         query[NGS_COORD_AIRMASS] = airmass
     elif zenith_angle is not None and interpolator.zenith_angle_axis.size == 1:
-        zenith = require_finite_vector(quantity_value(zenith_angle, u.deg, label="zenith_angle"), label="zenith_angle")
+        zenith = require_finite_vector(
+            quantity_value(zenith_angle, u.deg, label="zenith_angle"),
+            label="zenith_angle",
+        )
         fixed_zenith = float(interpolator.zenith_angle_axis[0].to_value(u.deg))
-        if not np.all(np.isclose(zenith, fixed_zenith, rtol=0.0, atol=_FIELD_ATOL)):
+        if not np.all(
+            np.isclose(
+                zenith,
+                fixed_zenith,
+                rtol=2
+                * np.finfo(
+                    support_dtype(
+                        interpolator.dtype,
+                        interpolator.builder.get(
+                            "support_precision", interpolator.builder.get("precision")
+                        ),
+                    )
+                ).eps,
+                atol=_FIELD_ATOL,
+            )
+        ):
             raise ValueError(
                 "zenith_angle query does not match this interpolator's "
                 f"fixed zenith_angle={fixed_zenith}."
@@ -750,8 +984,15 @@ def _query_values(interpolator: NgsHoMetricInterpolator, zenith_angle: Any, x: A
     return query
 
 
-def _query_coordinates(interpolator: NgsHoMetricInterpolator, query: Mapping[str, np.ndarray]) -> np.ndarray:
-    return np.column_stack([np.asarray(query[name], dtype=float) for name in interpolator.coordinate_order])
+def _query_coordinates(
+    interpolator: NgsHoMetricInterpolator, query: Mapping[str, np.ndarray]
+) -> np.ndarray:
+    return np.column_stack(
+        [
+            np.asarray(query[name], dtype=interpolator.dtype)
+            for name in interpolator.coordinate_order
+        ]
+    )
 
 
 def _evaluate_regular_grid_metric_model(
@@ -761,8 +1002,14 @@ def _evaluate_regular_grid_metric_model(
     query: Mapping[str, np.ndarray],
 ) -> dict[str, np.ndarray]:
     config = validate_regular_grid_config(config)
-    coordinates = field_coordinates(query[NGS_COORD_X] * u.arcsec, query[NGS_COORD_Y] * u.arcsec)
-    coordinates = snap_rectangular_field_query(interpolator.x.to_value(u.arcsec), interpolator.y.to_value(u.arcsec), coordinates)
+    coordinates = field_coordinates(
+        query[NGS_COORD_X] * u.arcsec, query[NGS_COORD_Y] * u.arcsec
+    )
+    coordinates = snap_rectangular_field_query(
+        interpolator.x.to_value(u.arcsec),
+        interpolator.y.to_value(u.arcsec),
+        coordinates,
+    )
     query = dict(query)
     query[NGS_COORD_X] = coordinates[:, 0]
     query[NGS_COORD_Y] = coordinates[:, 1]
@@ -772,7 +1019,11 @@ def _evaluate_regular_grid_metric_model(
         name: np.asarray(
             RegularGridInterpolator(
                 axes,
-                quantity_value(grid, dict(interpolator.model["metric_units"])[name], label=f"metric grid {name}"),
+                quantity_value(
+                    grid,
+                    dict(interpolator.model["metric_units"])[name],
+                    label=f"metric grid {name}",
+                ),
                 method=config.method,
                 bounds_error=True,
             )(points),
@@ -798,24 +1049,50 @@ def _regular_grid_axes(interpolator: NgsHoMetricInterpolator) -> tuple[np.ndarra
 
 def _validate_airmass_support(
     interpolator: NgsHoMetricInterpolator, airmass: np.ndarray, zenith_angle: np.ndarray
-) -> None:
+) -> np.ndarray:
     axis = interpolator.airmass_axis.to_value(u.dimensionless_unscaled).reshape(-1)
+    airmass = np.asarray(airmass, dtype=axis.dtype)
     minimum = float(np.min(axis))
     maximum = float(np.max(axis))
-    outside = (
-        ((airmass < minimum) & ~np.isclose(airmass, minimum, rtol=0.0, atol=_FIELD_ATOL))
-        | ((airmass > maximum) & ~np.isclose(airmass, maximum, rtol=0.0, atol=_FIELD_ATOL))
-    )
-    if np.any(outside):
-        requested = float(zenith_angle[np.flatnonzero(outside)[0]])
-        supported = interpolator.zenith_angle_axis.to_value(u.deg)
-        raise ValueError(
-            f"zenith_angle={requested} deg is outside this interpolator's "
-            f"supported zenith_angle range [{supported[0]}, {supported[-1]}] deg."
+    try:
+        airmass[...] = clip_support(
+            airmass,
+            [minimum, maximum],
+            dtype=support_dtype(
+                interpolator.dtype,
+                interpolator.builder.get(
+                    "support_precision", interpolator.builder.get("precision")
+                ),
+            ),
+            label="zenith_angle",
         )
+    except ValueError as error:
+        supported = interpolator.zenith_angle_axis.to_value(u.deg)
+        tolerance = (
+            2
+            * np.finfo(
+                support_dtype(
+                    interpolator.dtype,
+                    interpolator.builder.get(
+                        "support_precision", interpolator.builder.get("precision")
+                    ),
+                )
+            ).eps
+            * max(1.0, abs(minimum), abs(maximum))
+        )
+        outside = (airmass < minimum - tolerance) | (airmass > maximum + tolerance)
+        requested = float(
+            np.asarray(zenith_angle).reshape(-1)[np.flatnonzero(outside)[0]]
+        )
+        raise ValueError(
+            f"zenith_angle={requested} deg is outside this interpolator's supported zenith_angle range [{supported[0]}, {supported[-1]}] deg."
+        ) from error
+    return airmass
 
 
-def _validate_regular_grid_field_support(interpolator: NgsHoMetricInterpolator, x: np.ndarray, y: np.ndarray) -> None:
+def _validate_regular_grid_field_support(
+    interpolator: NgsHoMetricInterpolator, x: np.ndarray, y: np.ndarray
+) -> None:
     validate_rectangular_field_query(
         interpolator.x.to_value(u.arcsec),
         interpolator.y.to_value(u.arcsec),
@@ -825,10 +1102,15 @@ def _validate_regular_grid_field_support(interpolator: NgsHoMetricInterpolator, 
     )
 
 
-def _validate_rbf_field_support(interpolator: NgsHoMetricInterpolator, x: np.ndarray, y: np.ndarray) -> None:
+def _validate_rbf_field_support(
+    interpolator: NgsHoMetricInterpolator, x: np.ndarray, y: np.ndarray
+) -> None:
     source = np.unique(field_coordinates(interpolator.x, interpolator.y), axis=0)
     query = np.column_stack([x, y])
-    if source.shape[0] < 3 or np.linalg.matrix_rank(source - np.mean(source, axis=0), tol=_FIELD_ATOL) < 2:
+    if (
+        source.shape[0] < 3
+        or np.linalg.matrix_rank(source - np.mean(source, axis=0), tol=_FIELD_ATOL) < 2
+    ):
         _validate_degenerate_field_support(source, query)
         return
     try:
@@ -837,13 +1119,17 @@ def _validate_rbf_field_support(interpolator: NgsHoMetricInterpolator, x: np.nda
         _validate_degenerate_field_support(source, query)
         return
     if np.any(simplex < 0):
-        raise ValueError("NGS field query coordinates are outside the source field support.")
+        raise ValueError(
+            "NGS field query coordinates are outside the source field support."
+        )
 
 
 def _validate_degenerate_field_support(source: np.ndarray, query: np.ndarray) -> None:
     if source.shape[0] == 1:
         if not np.all(np.isclose(query, source[0], rtol=0.0, atol=_FIELD_ATOL)):
-            raise ValueError("NGS field query coordinates are outside the single-point source field support.")
+            raise ValueError(
+                "NGS field query coordinates are outside the single-point source field support."
+            )
         return
 
     center = np.mean(source, axis=0)
@@ -856,11 +1142,15 @@ def _validate_degenerate_field_support(source: np.ndarray, query: np.ndarray) ->
     query_projection = query_centered @ direction
     perpendicular = query_centered - np.outer(query_projection, direction)
     if np.any(np.linalg.norm(perpendicular, axis=1) > _FIELD_ATOL):
-        raise ValueError("NGS field query coordinates are outside the line source field support.")
+        raise ValueError(
+            "NGS field query coordinates are outside the line source field support."
+        )
     if np.any(query_projection < np.min(source_projection) - _FIELD_ATOL) or np.any(
         query_projection > np.max(source_projection) + _FIELD_ATOL
     ):
-        raise ValueError("NGS field query coordinates are outside the line source field support.")
+        raise ValueError(
+            "NGS field query coordinates are outside the line source field support."
+        )
 
 
 def _validate_predicted_metrics(metrics: Mapping[str, np.ndarray]) -> None:
@@ -885,6 +1175,7 @@ def _ngs_to_payload(interpolator: NgsHoMetricInterpolator) -> dict[str, Any]:
         "kind": NGS_HO_METRIC_ARTIFACT_KIND,
         "version": NGS_HO_METRIC_ARTIFACT_VERSION,
         "builder": dict(interpolator.builder),
+        "precision": interpolator.dtype.name,
         "strategy": _interpolation_strategy(interpolator.interpolation_config),
         "interpolation_config": interpolator.interpolation_config,
         "interpolation": {"coordinate_order": tuple(interpolator.coordinate_order)},
@@ -910,19 +1201,28 @@ def _ngs_from_payload(payload: Mapping[str, Any]) -> NgsHoMetricInterpolator:
     config = _payload_interpolation_config(payload)
     strategy = _interpolation_strategy(config)
     interpolation = dict(payload.get("interpolation", {}))
-    coordinate_order = tuple(str(value) for value in interpolation.get("coordinate_order", ()))
+    coordinate_order = tuple(
+        str(value) for value in interpolation.get("coordinate_order", ())
+    )
     _validate_coordinate_order_for_strategy(coordinate_order, strategy)
     metric_names = tuple(str(value) for value in metadata.get("metric_names", ()))
     _validate_metric_names(metric_names, label="NGS HO metric artifact")
     interpolator = NgsHoMetricInterpolator(
         coordinate_order=coordinate_order,
-        zenith_angle_axis=require_quantity(metadata.get("zenith_angle_axis"), u.deg, label="metadata.zenith_angle_axis"),
-        airmass_axis=require_quantity(metadata.get("airmass_axis"), u.dimensionless_unscaled, label="metadata.airmass_axis"),
+        zenith_angle_axis=require_quantity(
+            metadata.get("zenith_angle_axis"), u.deg, label="metadata.zenith_angle_axis"
+        ),
+        airmass_axis=require_quantity(
+            metadata.get("airmass_axis"),
+            u.dimensionless_unscaled,
+            label="metadata.airmass_axis",
+        ),
         x=require_quantity(metadata.get("x"), u.arcsec, label="metadata.x"),
         y=require_quantity(metadata.get("y"), u.arcsec, label="metadata.y"),
         metric_names=metric_names,
         interpolation_config=config,
         model=dict(payload.get("model", {})),
+        dtype=payload.get("precision", "float64"),
         provenance=tuple(str(value) for value in metadata.get("provenance", ())),
         builder=dict(payload.get("builder", {})),
     )
@@ -930,7 +1230,9 @@ def _ngs_from_payload(payload: Mapping[str, Any]) -> NgsHoMetricInterpolator:
     return interpolator
 
 
-def _payload_interpolation_config(payload: Mapping[str, Any]) -> RegularGridInterpolationConfig | RbfInterpolationConfig:
+def _payload_interpolation_config(
+    payload: Mapping[str, Any],
+) -> RegularGridInterpolationConfig | RbfInterpolationConfig:
     raw_config = payload.get("interpolation_config")
     strategy = payload.get("strategy")
     if strategy == NGS_HO_METRIC_STRATEGY_REGULAR_GRID:
@@ -940,17 +1242,29 @@ def _payload_interpolation_config(payload: Mapping[str, Any]) -> RegularGridInte
     raise ValueError(f"Unsupported NGS HO metric interpolation strategy: {strategy!r}.")
 
 
-def _validate_coordinate_order_for_strategy(coordinate_order: tuple[str, ...], strategy: str) -> None:
-    valid = NGS_REGULAR_GRID_COORDINATE_ORDERS if strategy == NGS_HO_METRIC_STRATEGY_REGULAR_GRID else NGS_RBF_COORDINATE_ORDERS
+def _validate_coordinate_order_for_strategy(
+    coordinate_order: tuple[str, ...], strategy: str
+) -> None:
+    valid = (
+        NGS_REGULAR_GRID_COORDINATE_ORDERS
+        if strategy == NGS_HO_METRIC_STRATEGY_REGULAR_GRID
+        else NGS_RBF_COORDINATE_ORDERS
+    )
     if tuple(coordinate_order) not in valid:
-        raise ValueError(f"Unsupported NGS HO metric coordinate_order for {strategy}: {tuple(coordinate_order)!r}.")
+        raise ValueError(
+            f"Unsupported NGS HO metric coordinate_order for {strategy}: {tuple(coordinate_order)!r}."
+        )
     if "wavelength" in coordinate_order:
-        raise ValueError("NGS HO metric artifacts must not use wavelength as an interpolation coordinate.")
+        raise ValueError(
+            "NGS HO metric artifacts must not use wavelength as an interpolation coordinate."
+        )
 
 
 def _validate_interpolator(interpolator: NgsHoMetricInterpolator) -> None:
     require_quantity(interpolator.zenith_angle_axis, u.deg, label="zenith_angle_axis")
-    require_quantity(interpolator.airmass_axis, u.dimensionless_unscaled, label="airmass_axis")
+    require_quantity(
+        interpolator.airmass_axis, u.dimensionless_unscaled, label="airmass_axis"
+    )
     require_quantity(interpolator.x, u.arcsec, label="x")
     require_quantity(interpolator.y, u.arcsec, label="y")
     if interpolator.airmass_axis.shape != interpolator.zenith_angle_axis.shape:
@@ -958,18 +1272,28 @@ def _validate_interpolator(interpolator: NgsHoMetricInterpolator) -> None:
     _validate_metric_names(interpolator.metric_names, label="NGS HO metric artifact")
     config = _validate_interpolation_config(interpolator.interpolation_config)
     strategy = _interpolation_strategy(config)
-    _validate_coordinate_order_for_strategy(tuple(interpolator.coordinate_order), strategy)
+    _validate_coordinate_order_for_strategy(
+        tuple(interpolator.coordinate_order), strategy
+    )
     if NGS_COORD_AIRMASS in interpolator.coordinate_order:
         if interpolator.zenith_angle_axis.size <= 1:
-            raise ValueError("active airmass coordinate requires multiple zenith_angle_axis values.")
+            raise ValueError(
+                "active airmass coordinate requires multiple zenith_angle_axis values."
+            )
     elif interpolator.zenith_angle_axis.size > 1:
-        raise ValueError("multiple zenith_angle_axis values require active airmass coordinate.")
+        raise ValueError(
+            "multiple zenith_angle_axis values require active airmass coordinate."
+        )
     if isinstance(config, RegularGridInterpolationConfig):
         if interpolator.x.ndim != 1 or interpolator.y.ndim != 1:
-            raise ValueError("x and y must be 1-D rectangular field axes for regular-grid artifacts.")
+            raise ValueError(
+                "x and y must be 1-D rectangular field axes for regular-grid artifacts."
+            )
         if interpolator.x.size == 0 or interpolator.y.size == 0:
             raise ValueError("x and y field axes must not be empty.")
-        if np.any(np.diff(interpolator.x) <= 0.0) or np.any(np.diff(interpolator.y) <= 0.0):
+        if np.any(np.diff(interpolator.x) <= 0.0) or np.any(
+            np.diff(interpolator.y) <= 0.0
+        ):
             raise ValueError("x and y field axes must be strictly increasing.")
         _validate_regular_grid_metric_model(interpolator)
         return
@@ -993,10 +1317,14 @@ def _validate_rbf_metric_model(interpolator: NgsHoMetricInterpolator) -> None:
             details.append(f"missing model metrics: {', '.join(sorted(missing))}")
         if extra:
             details.append(f"extra model metrics: {', '.join(sorted(extra))}")
-        raise ValueError(f"NGS HO metric artifact model does not match metric_names ({'; '.join(details)}).")
+        raise ValueError(
+            f"NGS HO metric artifact model does not match metric_names ({'; '.join(details)})."
+        )
     coord_mean = np.asarray(model.get("coord_mean"), dtype=float)
     if coord_mean.shape != (len(interpolator.coordinate_order),):
-        raise ValueError("NGS HO metric RBF coord_mean shape must match coordinate_order.")
+        raise ValueError(
+            "NGS HO metric RBF coord_mean shape must match coordinate_order."
+        )
 
 
 def _validate_regular_grid_metric_model(interpolator: NgsHoMetricInterpolator) -> None:
@@ -1012,29 +1340,45 @@ def _validate_regular_grid_metric_model(interpolator: NgsHoMetricInterpolator) -
             details.append(f"missing model metrics: {', '.join(sorted(missing))}")
         if extra:
             details.append(f"extra model metrics: {', '.join(sorted(extra))}")
-        raise ValueError(f"NGS HO metric artifact model does not match metric_names ({'; '.join(details)}).")
+        raise ValueError(
+            f"NGS HO metric artifact model does not match metric_names ({'; '.join(details)})."
+        )
     expected_shape = _expected_regular_grid_shape(interpolator)
     for name, grid in metric_grids.items():
-        grid = quantity_value(grid, metric_units[name], label=f"metric grid {name}", dtype=float)
+        grid = quantity_value(
+            grid, metric_units[name], label=f"metric grid {name}", dtype=float
+        )
         if grid.shape != expected_shape:
-            raise ValueError(f"NGS HO metric artifact grid {name!r} must have shape {expected_shape}; got {grid.shape}.")
+            raise ValueError(
+                f"NGS HO metric artifact grid {name!r} must have shape {expected_shape}; got {grid.shape}."
+            )
         if not np.all(np.isfinite(grid)):
-            raise ValueError(f"NGS HO metric artifact grid {name!r} must contain only finite values.")
+            raise ValueError(
+                f"NGS HO metric artifact grid {name!r} must contain only finite values."
+            )
 
 
 def _validate_model_metric_units(model: Mapping[str, Any]) -> dict[str, u.UnitBase]:
     """Validate the fixed units carried by an NGS metric model."""
-    expected = {"ee": u.dimensionless_unscaled, "fwhm": u.mas, "sr": u.dimensionless_unscaled}
+    expected = {
+        "ee": u.dimensionless_unscaled,
+        "fwhm": u.mas,
+        "sr": u.dimensionless_unscaled,
+    }
     raw = model.get("metric_units")
     if not isinstance(raw, Mapping) or set(raw) != set(expected):
-        raise ValueError("NGS HO metric artifact model must declare units for ee, fwhm, and sr.")
+        raise ValueError(
+            "NGS HO metric artifact model must declare units for ee, fwhm, and sr."
+        )
     for name, unit in expected.items():
         if u.Unit(raw[name]) != unit:
             raise ValueError(f"NGS HO metric artifact {name!r} unit must be {unit}.")
     return expected
 
 
-def _expected_regular_grid_shape(interpolator: NgsHoMetricInterpolator) -> tuple[int, ...]:
+def _expected_regular_grid_shape(
+    interpolator: NgsHoMetricInterpolator,
+) -> tuple[int, ...]:
     sizes = {
         NGS_COORD_AIRMASS: interpolator.airmass_axis.size,
         NGS_COORD_Y: interpolator.y.size,
@@ -1048,7 +1392,13 @@ def _validate_metric_names(metric_names: tuple[str, ...], *, label: str) -> None
         raise ValueError(f"{label} contains duplicate metrics.")
     missing = set(REQUIRED_NGS_HO_METRICS) - set(metric_names)
     if missing:
-        raise ValueError(f"{label} is missing required metrics: {', '.join(sorted(missing))}.")
-    unsupported = set(metric_names) - set(REQUIRED_NGS_HO_METRICS) - set(OPTIONAL_NGS_HO_METRICS)
+        raise ValueError(
+            f"{label} is missing required metrics: {', '.join(sorted(missing))}."
+        )
+    unsupported = (
+        set(metric_names) - set(REQUIRED_NGS_HO_METRICS) - set(OPTIONAL_NGS_HO_METRICS)
+    )
     if unsupported:
-        raise ValueError(f"{label} contains unsupported metrics: {', '.join(sorted(unsupported))}.")
+        raise ValueError(
+            f"{label} contains unsupported metrics: {', '.join(sorted(unsupported))}."
+        )

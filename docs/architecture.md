@@ -37,7 +37,8 @@ re-exports every supported user-facing contract and operation. The
 `hybrid_ao_psf.interpolation` submodule is also public for focused
 interpolation workflows, and its public names are the same names re-exported
 from the package root. Other submodules are implementation details; storage
-mechanics, MASTSEL adaptation, and runtime preparation are private. The
+mechanics and MASTSEL adaptation are private. Concrete fitted providers expose
+immutable public `prepare(dtype=...)` conversion. The
 package-root OTF helpers are the supported numerical primitives for external
 finite-field blur comparisons; other numerical helpers remain private.
 
@@ -56,8 +57,9 @@ The public contract names are `HybridRequest`, `SciencePsfProvider`,
 `NgsMetricProvider`, `HybridResult`, and `HybridDiagnostics`. Provider
 predictions use `ScienceHoPsfPrediction` and `NgsHoMetricPrediction`. The
 immutable concrete provider types are
-`ScienceHoPsfInterpolator` and `NgsHoMetricInterpolator`; loading and runtime
-preparation remain outside the stateless engine operation. The combined
+`ScienceHoPsfInterpolator` and `NgsHoMetricInterpolator`; file loading remains outside
+the stateless engine. The engine prepares concrete providers at request precision
+when needed; callers may prepare and reuse them beforehand. The combined
 configuration boundary is `HybridConfiguration` plus `load_configuration()`;
 standalone results use `save_result()` and `load_result()`.
 
@@ -144,4 +146,5 @@ destination's existing mode.
 
 The standalone result keeps quantities, provenance, effective configuration,
 and optional diagnostics together without imposing a batch dataset structure.
-Its root schema identity is `hybrid-ao-psf-result`, currently at version 1.
+Its root schema identity is `hybrid-ao-psf-result`, currently at version 2. It records the effective precision. Version-1 mixed
+arrays load at their stored precision without a uniform arithmetic claim.

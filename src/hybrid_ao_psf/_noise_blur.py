@@ -8,11 +8,13 @@ with no calibration files, E2E software or controller implementation.
 from __future__ import annotations
 
 from collections.abc import Mapping
-from dataclasses import dataclass
+from dataclasses import dataclass, field, replace
 
 import numpy as np
 from astropy import units as u
-from numpy.typing import ArrayLike, NDArray
+from numpy.typing import ArrayLike, DTypeLike, NDArray
+
+from ._validation import validate_psf_dtype
 
 __all__ = ["NoiseBlurModel"]
 
@@ -22,6 +24,7 @@ class NoiseBlurModel:
     """Two centred Gaussian components with an externally supplied covariance.
 
     Attributes:
+        dtype: Real calculation/state precision, float32 by default or float64.
         mixture_weight: Weight of the narrow component, strictly between 0 and 1.
         mixture_single_scale: Narrow covariance multiplier for one NGS, in (0,1].
         mixture_multi_scale: Narrow covariance multiplier for multiple NGS, in (0,1].
@@ -33,10 +36,14 @@ class NoiseBlurModel:
     mixture_weight: float
     mixture_single_scale: float
     mixture_multi_scale: float
+    dtype: DTypeLike = field(default=np.float32, kw_only=True)
 
     def __post_init__(self) -> None:
+        dtype = validate_psf_dtype(self.dtype)
+        object.__setattr__(self, "dtype", dtype)
         values = np.array(
-            [self.mixture_weight, self.mixture_single_scale, self.mixture_multi_scale]
+            [self.mixture_weight, self.mixture_single_scale, self.mixture_multi_scale],
+            dtype=dtype,
         )
         if (
             values.shape != (3,)
@@ -53,7 +60,11 @@ class NoiseBlurModel:
             values,
             strict=True,
         ):
-            object.__setattr__(self, name, float(value))
+            object.__setattr__(self, name, dtype.type(value))
+
+    def prepare(self, *, dtype: DTypeLike = np.float32) -> NoiseBlurModel:
+        """Copy coefficient state for the requested numerical precision."""
+        return replace(self, dtype=validate_psf_dtype(dtype))
 
     def parameters(self) -> dict[str, float]:
         """Return the three named coefficients as ordinary floats."""
@@ -82,7 +93,7 @@ class NoiseBlurModel:
             self.mixture_single_scale if ngs_count == 1 else self.mixture_multi_scale
         )
         broad = (1 - self.mixture_weight * narrow) / (1 - self.mixture_weight)
-        return float(narrow), float(broad)
+        return self.dtype.type(narrow), self.dtype.type(broad)
 
     def radial_cdf(self, squared_radius: ArrayLike, ngs_count: int) -> NDArray:
         """Return the CDF of squared Mahalanobis radius in two dimensions.
@@ -91,7 +102,7 @@ class NoiseBlurModel:
         Scalar/array nonnegative radii, including infinity, are accepted. NaN,
         negative radii and invalid NGS counts raise ValueError.
         """
-        radius = np.asarray(squared_radius, float)
+        radius = np.asarray(squared_radius, dtype=self.dtype)
         if np.isnan(radius).any() or np.any(radius < 0):
             raise ValueError("Squared radius must be nonnegative.")
         narrow, broad = self.scales(ngs_count)
@@ -122,6 +133,7 @@ class NoiseBlurModel:
             ngs_count,
             side,
             pixel_scale.to_value(u.mas),
+            dtype=self.dtype,
         )
 
 
@@ -131,6 +143,8 @@ def _gaussian_mixture_otf(
     ngs_count: int,
     side: int,
     pixel_mas: float,
+    *,
+    dtype=np.float64,
 ) -> NDArray:
     """Evaluate validated ordinary-float coefficients on an angular FFT grid."""
     if (
@@ -141,13 +155,17 @@ def _gaussian_mixture_otf(
         or pixel_mas <= 0
     ):
         raise ValueError("FFT side must be a positive integer and pixel scale positive")
-    covariance = np.asarray(covariance, dtype=float)
+    dtype = validate_psf_dtype(dtype)
+    covariance = np.asarray(covariance, dtype=dtype)
     if covariance.shape != (2, 2) or not np.isfinite(covariance).all():
         raise ValueError("Blur covariance must be finite and two-by-two")
     covariance = (covariance + covariance.T) / 2
     if np.linalg.eigvalsh(covariance).min() < 0:
         raise ValueError("Blur covariance must be positive semidefinite")
-    x, y = np.meshgrid(np.fft.fftfreq(side, pixel_mas), np.fft.fftfreq(side, pixel_mas))
+    x, y = np.meshgrid(
+        np.fft.fftfreq(side, pixel_mas).astype(dtype),
+        np.fft.fftfreq(side, pixel_mas).astype(dtype),
+    )
     exponent = (
         -2
         * np.pi**2
@@ -157,9 +175,9 @@ def _gaussian_mixture_otf(
             + covariance[1, 1] * y**2
         )
     )
-    weight = parameters["mixture_weight"]
-    narrow = parameters[
-        "mixture_single_scale" if ngs_count == 1 else "mixture_multi_scale"
-    ]
+    weight = dtype.type(parameters["mixture_weight"])
+    narrow = dtype.type(
+        parameters["mixture_single_scale" if ngs_count == 1 else "mixture_multi_scale"]
+    )
     broad = (1 - weight * narrow) / (1 - weight)
     return weight * np.exp(narrow * exponent) + (1 - weight) * np.exp(broad * exponent)

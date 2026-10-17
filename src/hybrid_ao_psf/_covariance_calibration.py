@@ -4,12 +4,13 @@ from __future__ import annotations
 
 import json
 from collections.abc import Iterable, Mapping
-from dataclasses import dataclass
+from dataclasses import dataclass, field, replace
 from pathlib import Path
 from types import MappingProxyType
 
 import numpy as np
 from astropy import units as u
+from numpy.typing import DTypeLike
 from scipy.interpolate import RegularGridInterpolator
 
 from ._calibration_config import CovarianceCalibrationSettings
@@ -21,6 +22,7 @@ from ._calibration_contracts import (
     _PhysicalRecord,
     _quantity,
 )
+from ._calibration_io import validate_observation_precision
 from ._calibration_numerics import settling_cut
 from ._calibration_products import (
     controller_header,
@@ -45,6 +47,7 @@ from ._covariance_validation import (
     precision_report,
 )
 from ._io import atomic_output_path
+from ._validation import support_dtype, validate_psf_dtype
 
 _KIND = "hybrid-ao-psf-covariance-functions"
 _MEASUREMENTS = "hybrid-ao-psf-covariance-measurements"
@@ -63,6 +66,7 @@ def _window(controller, settings):
         settings.feedback,
         tolerance=settings.settling_tolerance,
         maximum=settings.maximum_discard,
+        dtype=controller.dtype,
     )
     return FilterSettings(
         settings.feedback, controller.gain, controller.delay, cut
@@ -74,6 +78,7 @@ class CovarianceCalibrationMeasurements(_PhysicalRecord):
     """One numerical covariance plane, independent of native source layout.
 
     Attributes:
+        dtype: Real calculation/state precision, float32 by default or float64.
         zenith_angle: Viewing angle in [0,90) degrees.
         positions: Cartesian angular directions, (directions,2).
         controller: Fixed gain/delay/frame rate used for every independent reset.
@@ -99,10 +104,14 @@ class CovarianceCalibrationMeasurements(_PhysicalRecord):
     realizations: int
     tables: Mapping[str, u.Quantity]
     diagnostics: Mapping
+    dtype: DTypeLike = field(default=np.float32, kw_only=True)
 
     def __post_init__(self):
-        angle = _angle(self.zenith_angle)
-        positions = _quantity(self.positions, u.arcsec, "positions", 2)
+        object.__setattr__(self, "dtype", validate_psf_dtype(self.dtype))
+        angle = _angle(self.zenith_angle, dtype=self.dtype)
+        positions = _quantity(
+            self.positions, u.arcsec, "positions", 2, dtype=self.dtype
+        )
         if positions.shape[1] != 2 or len(np.unique(positions.value, axis=0)) != len(
             positions
         ):
@@ -127,7 +136,9 @@ class CovarianceCalibrationMeasurements(_PhysicalRecord):
                 + ((len(self.settings.feedback),) if right else ())
                 + (2, 2)
             )
-            value = _quantity(self.tables[name], u.Unit(unit), name, len(shape))
+            value = _quantity(
+                self.tables[name], u.Unit(unit), name, len(shape), dtype=self.dtype
+            )
             if value.shape != shape:
                 raise ValueError(
                     f"incorrect covariance table shape for {name}: expected {shape}"
@@ -153,6 +164,7 @@ def measure_covariance_calibration(
     controller: FixedGainIntegrator,
     *,
     settings: CovarianceCalibrationSettings | None = None,
+    dtype=np.float32,
 ) -> CovarianceCalibrationMeasurements:
     """Measure six functions from aligned histories with independent LO resets.
 
@@ -166,6 +178,8 @@ def measure_covariance_calibration(
         controller, FixedGainIntegrator
     ):
         raise TypeError("typed telemetry and controller required")
+    dtype = validate_psf_dtype(dtype)
+    controller = replace(controller, dtype=dtype)
     settings = CovarianceCalibrationSettings() if settings is None else settings
     if not isinstance(settings, CovarianceCalibrationSettings):
         raise TypeError("typed covariance settings required")
@@ -178,9 +192,13 @@ def measure_covariance_calibration(
     def histories():
         for index in range(len(telemetry.tilt)):
             yield HistoryArrays(
-                telemetry.tilt[index].to_value(u.mas).transpose(1, 2, 0),
-                telemetry.coma[index].to_value(u.nm).transpose(1, 2, 0),
-                telemetry.positions.to_value(u.arcsec),
+                np.asarray(
+                    telemetry.tilt[index].to_value(u.mas), dtype=dtype
+                ).transpose(1, 2, 0),
+                np.asarray(telemetry.coma[index].to_value(u.nm), dtype=dtype).transpose(
+                    1, 2, 0
+                ),
+                np.asarray(telemetry.positions.to_value(u.arcsec), dtype=dtype),
             )
 
     # The pilot consumes at most two histories; full histories are not duplicated.
@@ -240,11 +258,12 @@ def measure_covariance_calibration(
             else table.transpose(1, 0, 3, 2)
         )
         diagnostics[name + "_transpose_max_abs"] = float(np.max(abs(table - transpose)))
-        if np.linalg.norm(table - transpose) > 1e-12 * max(
-            np.linalg.norm(table), np.finfo(float).tiny
-        ):
+        if np.linalg.norm(table - transpose) > max(
+            1e-12, 16 * np.finfo(dtype).eps
+        ) * max(np.linalg.norm(table), np.finfo(float).tiny):
             raise ValueError(f"covariance transpose identity failed for {name}")
     return CovarianceCalibrationMeasurements(
+        dtype=dtype,
         zenith_angle=telemetry.zenith_angle,
         positions=telemetry.positions,
         controller=controller,
@@ -262,7 +281,11 @@ def measure_covariance_calibration(
 class _CovarianceBank:
     """Private canonical-unit evaluator used by numerical diagnostics and queries."""
 
-    def __init__(self, arrays):
+    def __init__(self, arrays, support_dtype=None):
+        self.support_dtype = (
+            arrays["C_t_t"].dtype if support_dtype is None else np.dtype(support_dtype)
+        )
+        self.dtype = validate_psf_dtype(arrays["C_t_t"].dtype)
         self.arrays = {name: _readonly(value) for name, value in arrays.items()}
         self.x = self.arrays["x_arcsec"]
         self.y = self.arrays["y_arcsec"]
@@ -281,13 +304,22 @@ class _CovarianceBank:
 
     def evaluate(self, name, coordinates, zenith_deg):
         fields = np.broadcast_arrays(
-            np.asarray(zenith_deg, float), *[np.asarray(x, float) for x in coordinates]
+            np.asarray(zenith_deg, self.dtype),
+            *[np.asarray(x, self.dtype) for x in coordinates],
         )
         if any(not np.isfinite(x).all() for x in fields):
             raise ValueError("covariance query must be finite")
         za, *args = fields
-        if np.any(za < self.zeniths[0]) or np.any(za > self.zeniths[-1]):
+        za_bound = (
+            2
+            * np.finfo(self.support_dtype).eps
+            * max(1.0, abs(float(self.zeniths[0])), abs(float(self.zeniths[-1])))
+        )
+        if np.any(za < self.zeniths[0] - za_bound) or np.any(
+            za > self.zeniths[-1] + za_bound
+        ):
             raise ValueError("zenith outside calibrated support")
+        za = np.clip(za, self.zeniths[0], self.zeniths[-1])
         names = (
             ["x1", "y1", "x2", "y2"]
             + (["b1"] if FUNCTIONS[name][0] else [])
@@ -298,22 +330,39 @@ class _CovarianceBank:
             + ([self.strengths] if FUNCTIONS[name][0] else [])
             + ([self.strengths] if FUNCTIONS[name][1] else [])
         )
-        for label, value, axis in zip(names, args, axes, strict=True):
-            if np.any(value < axis[0]) or np.any(value > axis[-1]):
+        for index, (label, value, axis) in enumerate(
+            zip(names, args, axes, strict=True)
+        ):
+            bound = (
+                2
+                * np.finfo(self.support_dtype).eps
+                * max(1.0, abs(float(axis[0])), abs(float(axis[-1])))
+            )
+            if np.any(value < axis[0] - bound) or np.any(value > axis[-1] + bound):
                 raise ValueError(
                     f"covariance query outside calibrated {label} support [{axis[0]}, {axis[-1]}]"
                 )
+            args[index] = np.clip(value, axis[0], axis[-1])
         points = np.column_stack(
-            [(1 / np.cos(np.deg2rad(za))).reshape(-1), *[x.reshape(-1) for x in args]]
+            [
+                np.clip(
+                    1 / np.cos(np.deg2rad(za)),
+                    self.arrays["airmass"][0],
+                    self.arrays["airmass"][-1],
+                ).reshape(-1),
+                *[x.reshape(-1) for x in args],
+            ]
         )
-        result = self._interpolators[name](points).reshape(*za.shape, 2, 2)
+        result = np.asarray(
+            self._interpolators[name](points), dtype=self.dtype
+        ).reshape(*za.shape, 2, 2)
         left, right, _ = FUNCTIONS[name]
         scaling = 1
         if left:
             scaling = args[4]
         if right:
             scaling = scaling * args[5 if left else 4]
-        return result / np.asarray(scaling)[..., None, None]
+        return result / np.asarray(scaling, dtype=self.dtype)[..., None, None]
 
     def __getattr__(self, name):
         # Only private numerical checks use the six canonical-unit call forms.
@@ -336,6 +385,8 @@ class CovarianceFunctions:
     _bank: _CovarianceBank
     _controller: FixedGainIntegrator
     _discard: int
+    _producer_dtype: np.dtype | None
+    _support_precision: np.dtype
 
     def __init__(self):
         raise TypeError(
@@ -343,7 +394,10 @@ class CovarianceFunctions:
         )
 
     @classmethod
-    def _from_arrays(cls, arrays, controller, discard):
+    def _from_arrays(
+        cls, arrays, controller, discard, producer_dtype=None, support_precision=None
+    ):
+        dtype = validate_psf_dtype(arrays["C_t_t"].dtype)
         if set(arrays) != set(FUNCTIONS) | {
             "x_arcsec",
             "y_arcsec",
@@ -374,8 +428,12 @@ class CovarianceFunctions:
             or len(arrays["y_arcsec"]) < 2
         ):
             raise ValueError("invalid covariance spatial/feedback/zenith support")
+        support_precision = support_dtype(dtype, producer_dtype, support_precision)
         if not np.allclose(
-            arrays["airmass"], 1 / np.cos(np.deg2rad(za)), rtol=1e-12, atol=0
+            arrays["airmass"],
+            1 / np.cos(np.deg2rad(za)),
+            rtol=max(1e-12, 4 * np.finfo(support_precision).eps),
+            atol=0,
         ):
             raise ValueError("airmass and zenith axes disagree")
         FilterSettings(tuple(b), controller.gain, controller.delay, discard)
@@ -405,15 +463,51 @@ class CovarianceFunctions:
             )
             if (
                 arrays[name].shape != expected
-                or arrays[name].dtype != np.float64
+                or arrays[name].dtype != dtype
                 or not np.isfinite(arrays[name]).all()
             ):
                 raise ValueError(f"invalid normalized covariance table {name}")
         result = object.__new__(cls)
-        object.__setattr__(result, "_bank", _CovarianceBank(arrays))
+        object.__setattr__(result, "_support_precision", support_precision)
+        object.__setattr__(result, "_bank", _CovarianceBank(arrays, support_precision))
         object.__setattr__(result, "_controller", controller)
         object.__setattr__(result, "_discard", discard)
+        object.__setattr__(
+            result,
+            "_producer_dtype",
+            None if producer_dtype is None else validate_psf_dtype(producer_dtype),
+        )
         return result
+
+    @property
+    def dtype(self) -> np.dtype:
+        """Numerical precision of this loaded or prepared bank."""
+        return self._bank.dtype
+
+    @property
+    def producer_dtype(self) -> np.dtype | None:
+        """Recorded calibration precision, or None for older unlabelled products."""
+        return self._producer_dtype
+
+    @property
+    def support_precision(self) -> np.dtype:
+        """Coarsest coordinate precision retained through preparation and loading."""
+        return self._support_precision
+
+    def prepare(self, *, dtype=np.float32) -> CovarianceFunctions:
+        """Copy runtime arrays without rewriting the source or producer record."""
+        dtype = validate_psf_dtype(dtype)
+        arrays = {
+            name: value.astype(dtype) if value.dtype.kind == "f" else value.copy()
+            for name, value in self._bank.arrays.items()
+        }
+        return self._from_arrays(
+            arrays,
+            replace(self.controller, dtype=dtype),
+            self.discard,
+            self.producer_dtype,
+            self.support_precision,
+        )
 
     @property
     def controller(self) -> FixedGainIntegrator:
@@ -581,6 +675,8 @@ class CovarianceCalibrationResult:
 
 def build_covariance_calibration(
     planes: Iterable[CovarianceCalibrationMeasurements],
+    *,
+    dtype=np.float32,
 ) -> CovarianceCalibrationResult:
     """Combine compatible measured planes into one rectangular covariance bank.
 
@@ -594,6 +690,12 @@ def build_covariance_calibration(
         not isinstance(plane, CovarianceCalibrationMeasurements) for plane in planes
     ):
         raise ValueError("provide accepted covariance measurement planes")
+    dtype = validate_psf_dtype(dtype)
+    coordinate_precision = support_dtype(dtype, *(plane.dtype for plane in planes))
+    planes = [
+        replace(plane, dtype=dtype, controller=replace(plane.controller, dtype=dtype))
+        for plane in planes
+    ]
     first = planes[0]
     if len({float(p.zenith_angle.value) for p in planes}) != len(planes):
         raise ValueError("duplicate measured zenith planes")
@@ -601,6 +703,7 @@ def build_covariance_calibration(
     for plane in planes:
         if (
             not np.array_equal(plane.positions.value, first.positions.value)
+            or plane.dtype != first.dtype
             or plane.settings != first.settings
             or plane.controller.gain != first.controller.gain
             or plane.controller.delay != first.controller.delay
@@ -616,7 +719,7 @@ def build_covariance_calibration(
                 {
                     **{name: value.value for name, value in plane.tables.items()},
                     "positions_arcsec": plane.positions.value,
-                    "strengths": np.array(plane.settings.feedback),
+                    "strengths": np.array(plane.settings.feedback, dtype=plane.dtype),
                 }
             )
         )
@@ -636,9 +739,11 @@ def build_covariance_calibration(
             )
         }
     )
-    angles = np.array([plane.zenith_angle.value for plane in planes])
+    angles = np.array([plane.zenith_angle.value for plane in planes], dtype=first.dtype)
     arrays.update(zenith_deg=angles, airmass=1 / np.cos(np.deg2rad(angles)))
-    model = CovarianceFunctions._from_arrays(arrays, first.controller, first.discard)
+    model = CovarianceFunctions._from_arrays(
+        arrays, first.controller, first.discard, first.dtype, coordinate_precision
+    )
     errors = {}
     for plane in planes:
         points = plane.positions.value
@@ -661,7 +766,7 @@ def build_covariance_calibration(
                 expected = plane.tables[name].value[tuple(index)]
                 scale = max(float(np.linalg.norm(expected)), np.finfo(float).tiny)
                 maximum = max(maximum, float(np.linalg.norm(actual - expected) / scale))
-            if maximum > 1e-12:
+            if maximum > max(1e-12, 16 * np.finfo(first.dtype).eps):
                 raise ValueError(f"interpolation knot recovery failed for {name}")
             errors[f"za{plane.zenith_angle.value:g}_{name}"] = maximum
     return CovarianceCalibrationResult(
@@ -685,6 +790,11 @@ def save_covariance_calibration(model: CovarianceFunctions, path: str | Path) ->
         _KIND,
         {
             "units": _UNITS,
+            "precision": model.dtype.name,
+            "support_precision": model.support_precision.name,
+            "producer_precision": None
+            if model.producer_dtype is None
+            else model.producer_dtype.name,
             "normalization": NORMALIZATION,
             "controller": controller_header(model.controller),
             "discard": model.discard,
@@ -697,7 +807,7 @@ def load_covariance_calibration(path: str | Path) -> CovarianceFunctions:
     """Load a strict immutable bank without source histories or E2E software."""
     header, arrays = load_product(path, _KIND)
     if (
-        set(header)
+        (set(header) - {"precision", "producer_precision", "support_precision"})
         != {
             "schema",
             "version",
@@ -713,13 +823,23 @@ def load_covariance_calibration(path: str | Path) -> CovarianceFunctions:
         or set(header["controller"]) != {"gain", "delay", "frame_rate_hz"}
     ):
         raise ValueError("invalid covariance product fields, units or normalization")
+    dtype = validate_psf_dtype(header.get("precision", arrays["C_t_t"].dtype))
+    if dtype != arrays["C_t_t"].dtype:
+        raise ValueError("covariance payload precision disagrees with header")
     controller = FixedGainIntegrator(
+        dtype=dtype,
         gain=header["controller"]["gain"],
         delay=header["controller"]["delay"],
         frame_rate=header["controller"]["frame_rate_hz"] * u.Hz,
     )
     _count(header["discard"], "discard", 0)
-    return CovarianceFunctions._from_arrays(arrays, controller, header["discard"])
+    return CovarianceFunctions._from_arrays(
+        arrays,
+        controller,
+        header["discard"],
+        header.get("producer_precision"),
+        header.get("support_precision"),
+    )
 
 
 def save_covariance_measurements(
@@ -730,7 +850,8 @@ def save_covariance_measurements(
         raise TypeError("unsupported covariance measurement type")
     header = {
         "schema": _MEASUREMENTS,
-        "version": 1,
+        "version": 2,
+        "precision": measurements.dtype.name,
         "units": _UNITS,
         "zenith_angle_deg": float(measurements.zenith_angle.value),
         "controller": controller_header(measurements.controller),
@@ -754,6 +875,7 @@ def load_covariance_measurements(path: str | Path) -> CovarianceCalibrationMeasu
     """Load strict reusable numerical measurements; never open native sources."""
     with np.load(Path(path), allow_pickle=False) as saved:
         header = json.loads(str(saved["__header__"]))
+        validate_observation_precision(header, saved)
         expected = {
             "schema",
             "version",
@@ -767,21 +889,25 @@ def load_covariance_measurements(path: str | Path) -> CovarianceCalibrationMeasu
             "diagnostics",
         }
         if (
-            set(header) != expected
+            set(header)
+            != expected | ({"precision"} if header.get("version") == 2 else set())
             or header["schema"] != _MEASUREMENTS
             or type(header["version"]) is not int
-            or header["version"] != 1
+            or header["version"] not in (1, 2)
             or header["units"] != _UNITS
             or set(saved.files) != set(FUNCTIONS) | {"__header__", "positions_arcsec"}
         ):
             raise ValueError("invalid covariance measurement schema/units/fields")
+        dtype = validate_psf_dtype(header.get("precision", saved["C_t_t"].dtype))
         controller = header["controller"]
         if set(controller) != {"gain", "delay", "frame_rate_hz"}:
             raise ValueError("invalid covariance controller fields")
         return CovarianceCalibrationMeasurements(
+            dtype=dtype,
             zenith_angle=header["zenith_angle_deg"] * u.deg,
             positions=saved["positions_arcsec"] * u.arcsec,
             controller=FixedGainIntegrator(
+                dtype=dtype,
                 gain=controller["gain"],
                 delay=controller["delay"],
                 frame_rate=controller["frame_rate_hz"] * u.Hz,

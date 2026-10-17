@@ -83,9 +83,8 @@ NGS HO PSF interpolator once and measures aligned position/magnitude rows.
 That source artifact must contain fractions per incident photon: native
 normalization and image orientation must be resolved before building it.
 The common operation preserves cropped flux and applies no recentering or
-unit-flux normalization. Build the source provider with `dtype=np.float64`
-when the native WFS calibration requires double-precision pixels; the provider
-otherwise defaults to float32.
+unit-flux normalization. The configured precision applies when preparing the
+loaded source provider. Its original file and producer precision are retained.
 
 Each family has `save_<family>_measurements()` and
 `load_<family>_measurements()` operations. Rebuilding requires these numerical
@@ -162,7 +161,7 @@ with one pooled mean after settling. `save_sensing_replay()` and
 `load_sensing_replay()` retain the histories and numerical inputs for offline
 fitting. Measured v_g supplies loop noise independently of the reconstruction
 prior. Retained histories must agree with recorded covariance and means within
-float32 quantization and float64 reduction bounds; empirical width need not
+the captured history precision and configured reduction roundoff; empirical width need not
 equal the analytical stationary width.
 
 `build_sensing_calibration()` fits the covariance-preserving two-Gaussian shape
@@ -200,3 +199,45 @@ must separately validate their own schema, units, coefficients and support.
 can persist these identities and reject changed products before execution or
 resume, even when paths/settings remain unchanged. A completed result remains
 self-contained; analysis need not reopen those external files.
+
+## Numerical Precision
+
+New calibration work defaults to float32. Select `precision = float64` in
+`[e2e]` or override the parsed configuration with `with_overrides(dtype=...)`.
+The configured workflows resolve this once and pass it into the shared
+calculations and native conversion boundaries. The native WFS keeps its own
+arithmetic. SciPy interpolation, fitting and Lyapunov solver internals may use
+their required precision; callbacks, shared calculations and returned state use
+the selected precision.
+
+Standalone measurement/build operations and physical records accept keyword-only
+`dtype=np.float32` or `np.float64`, including ordinary NumPy dtype/string
+spellings. Other precisions are rejected. Use the same dtype for source records
+and operations: promotion cannot recover values already rounded by a reader.
+Integer indices, counters, boolean masks and native sampling seeds retain their
+nonfloating types. Population divisors, independent resets, equal realization
+weights, one pooled mean, settling requirements and feedback normalization are
+unchanged. Numerical checks account for dtype and operation scale separately
+from physical acceptance criteria.
+
+Fitted products and reusable observations use version 2 with a precision
+declaration. Version-1 inputs remain readable without imposing the new-work
+default. Loaders preserve stored numeric values and do not invent producer
+precision for unlabelled fitted models. Version-2 numeric payloads must match
+their declared dtype. Old replay files may contain float32 histories alongside
+float64 moments; their captured history precision is retained for quantization
+checks.
+
+`CovarianceFunctions`, `ReconstructorNoiseModel`, `ComaResponseModel` and
+`SensingCalibration` offer `prepare(dtype=...)` for immutable runtime conversion.
+Their producer-precision record remains unchanged, and the original artifact
+is neither mutated nor rewritten. This conversion does not run calibration.
+`support_precision` separately retains the coarsest coordinate rounding across
+conversion and save/load, so promotion keeps the original boundary queries
+valid without changing the producer record. It does not permit extrapolation.
+
+The blur fit supplies an analytic gradient to L-BFGS-B, differentiating the
+broad component through the unit-covariance constraint. It retains the binned
+likelihood, family weights, bounds and four starting points. Callbacks use the
+selected precision; convergence status alone is not a distribution-accuracy
+check, particularly for nearly Gaussian mixtures at float32.

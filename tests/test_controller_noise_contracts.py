@@ -26,7 +26,9 @@ def test_lyapunov_covariance_matches_direct_delayed_impulse_filtering(delay):
             impulse[k] += gain * np.eye(2)
     expected = np.sum(impulse @ noise @ impulse.swapaxes(-1, -2), axis=0)
     actual = (
-        FixedGainIntegrator(gain=gain, delay=delay, frame_rate=500 * u.Hz)
+        FixedGainIntegrator(
+            dtype=np.float64, gain=gain, delay=delay, frame_rate=500 * u.Hz
+        )
         .noise_covariance(response, noise * u.mas**2)
         .value
     )
@@ -40,7 +42,7 @@ def test_transition_matches_newest_first_command_history():
     history = np.array([[1.0, 2.0], [3.0, 5.0], [7.0, 11.0]])
     expected = np.vstack([history[0] - 0.1 * response @ history[-1], history[:-1]])
     transition = FixedGainIntegrator(
-        gain=0.1, delay=3, frame_rate=500 * u.Hz
+        dtype=np.float64, gain=0.1, delay=3, frame_rate=500 * u.Hz
     ).transition(response)
     np.testing.assert_allclose(transition @ history.ravel(), expected.ravel())
 
@@ -48,29 +50,29 @@ def test_transition_matches_newest_first_command_history():
 @pytest.mark.parametrize("delay", [0, True, 1.5])
 def test_invalid_frame_delays_are_rejected(delay):
     with pytest.raises(ValueError, match="delay"):
-        FixedGainIntegrator(gain=0.3, delay=delay, frame_rate=500 * u.Hz).transition(
-            np.eye(2)
-        )
+        FixedGainIntegrator(
+            dtype=np.float64, gain=0.3, delay=delay, frame_rate=500 * u.Hz
+        ).transition(np.eye(2))
 
 
 def test_unstable_loop_and_nonphysical_noise_are_rejected():
     with pytest.raises(ValueError, match="Unstable"):
-        FixedGainIntegrator(gain=3.0, delay=1, frame_rate=500 * u.Hz).noise_covariance(
-            np.eye(2), np.eye(2) * u.mas**2
-        )
+        FixedGainIntegrator(
+            dtype=np.float64, gain=3.0, delay=1, frame_rate=500 * u.Hz
+        ).noise_covariance(np.eye(2), np.eye(2) * u.mas**2)
     with pytest.raises(ValueError, match="positive semidefinite"):
-        FixedGainIntegrator(gain=0.3, delay=1, frame_rate=500 * u.Hz).noise_covariance(
-            np.eye(2), np.diag([-1, 2]) * u.mas**2
-        )
+        FixedGainIntegrator(
+            dtype=np.float64, gain=0.3, delay=1, frame_rate=500 * u.Hz
+        ).noise_covariance(np.eye(2), np.diag([-1, 2]) * u.mas**2)
     with pytest.raises(ValueError, match="symmetric"):
-        FixedGainIntegrator(gain=0.3, delay=1, frame_rate=500 * u.Hz).noise_covariance(
-            np.eye(2), np.array([[1, 2], [0, 1]]) * u.mas**2
-        )
+        FixedGainIntegrator(
+            dtype=np.float64, gain=0.3, delay=1, frame_rate=500 * u.Hz
+        ).noise_covariance(np.eye(2), np.array([[1, 2], [0, 1]]) * u.mas**2)
 
 
 @pytest.mark.parametrize("count", [1, 2, 3])
 def test_blur_preserves_covariance_and_matches_gaussian_characteristic_function(count):
-    model = NoiseBlurModel(0.72, 0.32, 0.63)
+    model = NoiseBlurModel(0.72, 0.32, 0.63, dtype=np.float64)
     covariance = np.array([[4.0, 1.0], [1.0, 2.0]])
     before = covariance.copy()
     narrow, broad = model.scales(count)
@@ -126,7 +128,7 @@ def test_nonphysical_mixture_coefficients_are_rejected(values):
 
 
 def test_invalid_blur_inputs_are_rejected():
-    model = NoiseBlurModel(0.72, 0.32, 0.63)
+    model = NoiseBlurModel(0.72, 0.32, 0.63, dtype=np.float64)
     for count in (0, True, 1.5):
         with pytest.raises(ValueError, match="NGS count"):
             model.otf(np.eye(2) * u.mas**2, count, 8, 5.0 * u.mas)
@@ -160,4 +162,4 @@ def test_mixture_coefficients_own_immutable_scalar_values():
     model = NoiseBlurModel(weight, 0.32, 0.63)
     weight[...] = 0.1
     assert model.mixture_weight == 0.72
-    assert isinstance(model.mixture_weight, float)
+    assert isinstance(model.mixture_weight, np.float32)

@@ -51,7 +51,7 @@ def save_product(path, kind, metadata, arrays=None):
     path = Path(path).expanduser().resolve()
     if path.name != "model.json":
         raise ValueError("calibration product path must name model.json")
-    header = {"schema": kind, "version": 1, **json_metadata(metadata)}
+    header = {"schema": kind, "version": 2, **json_metadata(metadata)}
     if set(metadata) & {"schema", "version", "payload", "payload_sha256"}:
         raise ValueError("product metadata cannot replace envelope fields")
     path.parent.mkdir(parents=True, exist_ok=True)
@@ -147,13 +147,35 @@ def load_product(path, kind):
     if (
         header.get("schema") != kind
         or type(header.get("version")) is not int
-        or header["version"] != 1
+        or header["version"] not in (1, 2)
     ):
         raise ValueError(f"unsupported {kind} product schema")
+    if header["version"] == 2:
+        if (
+            header.get("precision") not in ("float32", "float64")
+            or header.get("support_precision", header.get("precision"))
+            not in ("float32", "float64")
+            or "producer_precision" not in header
+            or header["producer_precision"] not in (None, "float32", "float64")
+        ):
+            raise ValueError("invalid calibration precision declaration")
+    elif {"precision", "producer_precision", "support_precision"} & header.keys():
+        raise ValueError("version 1 does not declare calibration precision")
     arrays = None
     if "payload" in header:
         with np.load(path.parent / header["payload"], allow_pickle=False) as saved:
             arrays = {key: saved[key] for key in saved.files}
+        if header["version"] == 2 and any(
+            (
+                value.dtype != np.dtype(bool)
+                if name in {"measured_mask", "support"}
+                else value.dtype.kind not in "iu"
+                if name == "source_mapping"
+                else value.dtype != np.dtype(header["precision"])
+            )
+            for name, value in arrays.items()
+        ):
+            raise ValueError("calibration payload precision disagrees with header")
     identity.verify()
     return header, arrays
 
@@ -169,7 +191,7 @@ def controller_header(controller):
     }
 
 
-def read_controller_header(header):
+def read_controller_header(header, *, dtype=np.float64):
     """Validate the exact common numerical controller declaration."""
     from astropy import units as u
 
@@ -178,6 +200,7 @@ def read_controller_header(header):
     if set(header) != {"gain", "delay", "frame_rate_hz"}:
         raise ValueError("invalid numerical controller fields")
     return FixedGainIntegrator(
+        dtype=dtype,
         gain=header["gain"],
         delay=header["delay"],
         frame_rate=header["frame_rate_hz"] * u.Hz,
@@ -194,7 +217,7 @@ def photometry_header(photometry):
     }
 
 
-def read_photometry_header(header):
+def read_photometry_header(header, *, dtype=np.float64):
     """Validate the exact common photometric conversion declaration."""
     from astropy import units as u
 
@@ -203,6 +226,7 @@ def read_photometry_header(header):
     if set(header) != {"magnitude_band", "photons_per_frame_zeropoint"}:
         raise ValueError("invalid photometry fields")
     return CalibrationPhotometry(
+        dtype=dtype,
         magnitude_band=header["magnitude_band"],
         photons_per_frame_zeropoint=header["photons_per_frame_zeropoint"] * u.photon,
     )

@@ -34,7 +34,9 @@ def test_matrix_response_matches_direct_independent_resets(delay):
     rng = np.random.default_rng(110)
     histories = rng.normal(size=(3, 120, 2)) + np.arange(3)[:, None, None] * 4
     response = np.array([[0.8, 0.16], [-0.12, 1.1]])
-    controller = FixedGainIntegrator(gain=0.2, delay=delay, frame_rate=500 * u.Hz)
+    controller = FixedGainIntegrator(
+        dtype=np.float64, gain=0.2, delay=delay, frame_rate=500 * u.Hz
+    )
     expected = np.stack([direct_response(h, response, 0.2, delay) for h in histories])
     actual = controller.filter(histories * u.arcsec, response)
     np.testing.assert_allclose(
@@ -62,7 +64,9 @@ def test_accepted_settling_window_unchanged():
 def test_lyapunov_covariance_matches_independent_impulse_accumulation():
     response = np.array([[0.8, 0.1], [-0.2, 1.0]])
     noise = np.array([[3.0, 0.6], [0.6, 2.0]])
-    controller = FixedGainIntegrator(gain=0.2, delay=2, frame_rate=500 * u.Hz)
+    controller = FixedGainIntegrator(
+        dtype=np.float64, gain=0.2, delay=2, frame_rate=500 * u.Hz
+    )
     impulse = np.zeros((2, 1000, 2))
     impulse[:, 0, :] = np.eye(2)
     outputs = np.stack([direct_response(h, response, 0.2, 2) for h in impulse])
@@ -108,7 +112,9 @@ def test_noise_blur_has_requested_covariance(count):
 
 
 def test_kernel_public_units_and_unstable_loop_rejection():
-    controller = FixedGainIntegrator(gain=0.3, delay=2, frame_rate=500 * u.Hz)
+    controller = FixedGainIntegrator(
+        dtype=np.float64, gain=0.3, delay=2, frame_rate=500 * u.Hz
+    )
     with pytest.raises(ValueError, match="Unstable"):
         controller.transition(np.eye(2) * 10)
     with pytest.raises(TypeError):
@@ -120,7 +126,9 @@ def test_kernel_public_units_and_unstable_loop_rejection():
 def test_matrix_first_input_equilibrium_matches_direct_recurrence():
     histories = np.random.default_rng(239).normal(size=(3, 120, 2)) + 4
     response = np.array([[0.8, 0.16], [-0.12, 1.1]])
-    controller = FixedGainIntegrator(gain=0.2, delay=2, frame_rate=500 * u.Hz)
+    controller = FixedGainIntegrator(
+        dtype=np.float64, gain=0.2, delay=2, frame_rate=500 * u.Hz
+    )
     expected = np.stack([direct_response(h, response, 0.2, 2, True) for h in histories])
     np.testing.assert_allclose(
         controller.filter(histories * u.mas, response, equilibrium=True).value,

@@ -44,7 +44,7 @@ stages, physical conventions, configuration and product contracts.
 ## Results
 
 `HybridResult` is the immutable standard result. It carries the final
-`float32` PSF cube, neutral `ao_stats.PsfMetadata`, source metadata, NGS
+selected-precision PSF cube, neutral `ao_stats.PsfMetadata`, source metadata, NGS
 metrics, Ctot in wavefront and angular units, conversion scale, effective NGS
 flux and frame rates, optional supplied magnitudes and zeropoint,
 jitter, effective MASTSEL configuration, PSD-clipping mask, and provenance.

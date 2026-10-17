@@ -31,7 +31,7 @@ class SyntheticCalibration(E2ECalibration):
             / (inputs.photons_per_frame.to_value(u.photon) * inputs.ee.value)
         )
         return ReconstructorNoiseMeasurements(
-            covariance=variance[:, None, None] * np.eye(2) * u.mas**2
+            covariance=variance[:, None, None] * np.eye(2) * u.mas**2, dtype=np.float64
         )
 
     def controller(self, zenith_angle):
@@ -65,6 +65,7 @@ def calibration(tmp_path):
         ngs_psf=tmp_path / "absent/ngs.pkl",
         ngs_metrics=tmp_path / "absent/metrics.pkl",
         reconstructor=ReconstructorCalibrationSettings(holdouts=11),
+        dtype=np.float64,
     )
     return SyntheticCalibration(config)
 
@@ -81,7 +82,7 @@ def test_measure_offline_build_roundtrip_and_support(calibration, tmp_path, sepa
     save_reconstructor_measurements(measured, measurement)
     restored = load_reconstructor_measurements(measurement)
     np.testing.assert_array_equal(restored.covariance, measured.covariance)
-    built = build_reconstructor_calibration(restored)
+    built = build_reconstructor_calibration(restored, dtype=np.float64)
     assert built.diagnostics["product_reduction_verified"]
     if not separate:
         assert built.diagnostics["holdout_max_abs_percent"] < 1e-10
@@ -127,7 +128,7 @@ def test_interrupted_manifest_publication_preserves_accepted_prior(
     measured = calibration.measure_reconstructor(
         20 * u.deg, photons_per_frame=[1, 1000] * u.photon, fwhm=[80, 200] * u.mas
     )
-    model = build_reconstructor_calibration(measured).model
+    model = build_reconstructor_calibration(measured, dtype=np.float64).model
     path = tmp_path / "model.json"
     save_reconstructor_calibration(model, path)
     before = path.read_bytes()
@@ -155,7 +156,7 @@ def test_wrong_product_units_are_rejected(calibration, tmp_path):
     )
     path = tmp_path / "model.json"
     save_reconstructor_calibration(
-        build_reconstructor_calibration(measured).model, path
+        build_reconstructor_calibration(measured, dtype=np.float64).model, path
     )
     header = json.loads(path.read_text())
     header["units"]["variance"] = "arcsec2"
@@ -192,10 +193,12 @@ def test_public_explicit_covariance_solver_preserves_absolute_weights_and_units(
     css = np.diag([3.0, 4.0, 5.0, 6.0])
     noise = np.diag([1.0, 2.0, 3.0, 4.0])
     cas = np.array([[1.0, 0.0, 0.5, 0.0], [0.0, 2.0, 0.0, 0.7]])
-    weights = solve_lo_reconstructor(css * u.mas**2, cas * u.mas**2, noise * u.mas**2)
+    weights = solve_lo_reconstructor(
+        css * u.mas**2, cas * u.mas**2, noise * u.mas**2, dtype=np.float64
+    )
     np.testing.assert_array_equal(weights.value, cas / np.diag(css + noise))
     assert weights.unit == u.one
     with pytest.raises(ValueError):
         weights.value.flags.writeable = True
     with pytest.raises(TypeError):
-        solve_lo_reconstructor(css, cas * u.mas**2, noise * u.mas**2)
+        solve_lo_reconstructor(css, cas * u.mas**2, noise * u.mas**2, dtype=np.float64)

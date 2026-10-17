@@ -39,6 +39,7 @@ def telemetry(zenith=20, realizations=3):
         frame_rate=500 * u.Hz,
         tilt=tilt * u.mas,
         coma=coma * u.nm,
+        dtype=np.float64,
     )
 
 
@@ -91,11 +92,15 @@ def independent_tables(record, settings, cut):
 @pytest.fixture
 def measured():
     record = telemetry()
-    controller = FixedGainIntegrator(gain=0.3, delay=2, frame_rate=500 * u.Hz)
+    controller = FixedGainIntegrator(
+        gain=0.3, delay=2, frame_rate=500 * u.Hz, dtype=np.float64
+    )
     settings = CovarianceCalibrationSettings(
         feedback=(0.5, 1.0, 1.5), bootstrap_draws=11
     )
-    return record, measure_covariance_calibration(record, controller, settings=settings)
+    return record, measure_covariance_calibration(
+        record, controller, settings=settings, dtype=np.float64
+    )
 
 
 def test_six_functions_match_independent_recurrence_and_pooled_mean(measured):
@@ -117,13 +122,13 @@ def test_six_functions_match_independent_recurrence_and_pooled_mean(measured):
 def test_measurement_and_model_roundtrip_unequal_realizations(measured, tmp_path):
     record, first = measured
     other = measure_covariance_calibration(
-        telemetry(40, 2), first.controller, settings=first.settings
+        telemetry(40, 2), first.controller, settings=first.settings, dtype=np.float64
     )
     path = tmp_path / "measurements.npz"
     save_covariance_measurements(first, path)
     loaded = load_covariance_measurements(path)
     np.testing.assert_array_equal(loaded.tables["C_t_Tc"], first.tables["C_t_Tc"])
-    built = build_covariance_calibration([other, loaded])
+    built = build_covariance_calibration([other, loaded], dtype=np.float64)
     model_path = tmp_path / "model.json"
     save_covariance_calibration(built.model, model_path)
     model = load_covariance_calibration(model_path)
@@ -154,7 +159,11 @@ def test_cadence_and_insufficient_settled_window_rejected():
     record = telemetry()
     with pytest.raises(ValueError, match="frame rates"):
         measure_covariance_calibration(
-            record, FixedGainIntegrator(gain=0.3, delay=2, frame_rate=100 * u.Hz)
+            record,
+            FixedGainIntegrator(
+                gain=0.3, delay=2, frame_rate=100 * u.Hz, dtype=np.float64
+            ),
+            dtype=np.float64,
         )
     short = CovarianceTelemetry(
         zenith_angle=record.zenith_angle,
@@ -162,8 +171,13 @@ def test_cadence_and_insufficient_settled_window_rejected():
         frame_rate=record.frame_rate,
         tilt=record.tilt[:, :20],
         coma=record.coma[:, :20],
+        dtype=np.float64,
     )
     with pytest.raises(ValueError, match="insufficient frames"):
         measure_covariance_calibration(
-            short, FixedGainIntegrator(gain=0.3, delay=2, frame_rate=500 * u.Hz)
+            short,
+            FixedGainIntegrator(
+                gain=0.3, delay=2, frame_rate=500 * u.Hz, dtype=np.float64
+            ),
+            dtype=np.float64,
         )

@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 from collections.abc import Callable, Mapping
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from enum import StrEnum
 from types import MappingProxyType
 from typing import TYPE_CHECKING, Protocol, runtime_checkable
@@ -65,11 +65,15 @@ class ScienceHoPsfPrediction:
         object.__setattr__(self, "dtype", dtype)
         if np.any(psfs < 0.0):
             raise ValueError("psfs must be non-negative.")
-        flux = np.sum(psfs, axis=(-2, -1), dtype=np.float64)
+        flux = np.sum(psfs, axis=(-2, -1), dtype=dtype)
         if np.any(flux <= 0.0):
             raise ValueError("psfs must have positive flux.")
-        pixel_scale = _positive_scalar(self.pixel_scale, u.mas, "pixel_scale")
-        metadata = _readonly_metadata(self.metadata, num_psfs=psfs.shape[0])
+        pixel_scale = _positive_scalar(
+            self.pixel_scale, u.mas, "pixel_scale", dtype=dtype
+        )
+        metadata = _readonly_metadata(
+            self.metadata, num_psfs=psfs.shape[0], dtype=dtype
+        )
         if metadata.pixel_scale.ndim != 0 or not np.isclose(
             metadata.pixel_scale.to_value(u.mas), pixel_scale.to_value(u.mas)
         ):
@@ -86,6 +90,8 @@ class NgsHoMetricPrediction:
     """NGS high-order metrics returned by a loaded provider.
 
     Attributes:
+        dtype: float32 by default or explicit float64. None preserves individual
+            stored array precisions when reconstructing a legacy result.
         ee: Encircled-energy fraction for each requested NGS coordinate.
         fwhm: Full width at half maximum for each requested NGS coordinate.
         sr: Strehl ratio for each requested NGS coordinate.
@@ -94,11 +100,18 @@ class NgsHoMetricPrediction:
     ee: u.Quantity
     fwhm: u.Quantity
     sr: u.Quantity
+    dtype: DTypeLike | None = field(default=np.float32, kw_only=True)
 
     def __post_init__(self) -> None:
-        ee = _readonly_quantity(self.ee, u.dimensionless_unscaled, "ee", ndim=1)
-        fwhm = _readonly_quantity(self.fwhm, u.mas, "fwhm", ndim=1)
-        sr = _readonly_quantity(self.sr, u.dimensionless_unscaled, "sr", ndim=1)
+        dtype = None if self.dtype is None else validate_psf_dtype(self.dtype)
+        object.__setattr__(self, "dtype", dtype)
+        ee = _readonly_quantity(
+            self.ee, u.dimensionless_unscaled, "ee", ndim=1, dtype=dtype
+        )
+        fwhm = _readonly_quantity(self.fwhm, u.mas, "fwhm", ndim=1, dtype=dtype)
+        sr = _readonly_quantity(
+            self.sr, u.dimensionless_unscaled, "sr", ndim=1, dtype=dtype
+        )
         if not (ee.shape == fwhm.shape == sr.shape):
             raise ValueError("NGS metric vectors must have identical shapes.")
         if ee.size == 0:
@@ -148,6 +161,7 @@ class HybridRequest:
     """Inputs for one stateless Hybrid AO PSF simulation.
 
     Attributes:
+        dtype: Real calculation/state precision, float32 by default or float64.
         science_x: Science field x-coordinates in arcseconds.
         science_y: Science field y-coordinates in arcseconds.
         ngs_x: Natural-guide-star x-coordinates in arcseconds.
@@ -179,11 +193,19 @@ class HybridRequest:
     non_psd_policy: NonPsdPolicy | str = NonPsdPolicy.ERROR
     diagnostics_level: DiagnosticsLevel | str = DiagnosticsLevel.NONE
 
+    dtype: DTypeLike = field(default=np.float32, kw_only=True)
+
     def __post_init__(self) -> None:
-        science_x = _readonly_quantity(self.science_x, u.arcsec, "science_x", ndim=1)
-        science_y = _readonly_quantity(self.science_y, u.arcsec, "science_y", ndim=1)
-        ngs_x = _readonly_quantity(self.ngs_x, u.arcsec, "ngs_x", ndim=1)
-        ngs_y = _readonly_quantity(self.ngs_y, u.arcsec, "ngs_y", ndim=1)
+        dtype = validate_psf_dtype(self.dtype)
+        object.__setattr__(self, "dtype", dtype)
+        science_x = _readonly_quantity(
+            self.science_x, u.arcsec, "science_x", ndim=1, dtype=dtype
+        )
+        science_y = _readonly_quantity(
+            self.science_y, u.arcsec, "science_y", ndim=1, dtype=dtype
+        )
+        ngs_x = _readonly_quantity(self.ngs_x, u.arcsec, "ngs_x", ndim=1, dtype=dtype)
+        ngs_y = _readonly_quantity(self.ngs_y, u.arcsec, "ngs_y", ndim=1, dtype=dtype)
         if (self.ngs_flux is None) == (self.ngs_magnitude is None):
             raise ValueError("Supply exactly one of ngs_flux or ngs_magnitude.")
         ngs_flux = None
@@ -193,18 +215,19 @@ class HybridRequest:
             if self.ngs_magnitude_zeropoint is not None:
                 raise ValueError("ngs_magnitude_zeropoint requires ngs_magnitude.")
             ngs_flux = _readonly_quantity(
-                self.ngs_flux, u.photon / u.s, "ngs_flux", ndim=1
+                self.ngs_flux, u.photon / u.s, "ngs_flux", ndim=1, dtype=dtype
             )
             if np.any(ngs_flux.value <= 0.0):
                 raise ValueError("ngs_flux must be positive.")
         else:
             ngs_magnitude = _readonly_quantity(
-                self.ngs_magnitude, u.mag, "ngs_magnitude", ndim=1
+                self.ngs_magnitude, u.mag, "ngs_magnitude", ndim=1, dtype=dtype
             )
             zeropoint = _positive_scalar(
                 self.ngs_magnitude_zeropoint,
                 u.photon / (u.m**2 * u.s),
                 "ngs_magnitude_zeropoint",
+                dtype=dtype,
             )
         if science_x.size == 0:
             raise ValueError("At least one science coordinate is required.")
@@ -217,8 +240,8 @@ class HybridRequest:
             raise ValueError(
                 "NGS coordinates and flux or magnitude vectors must have identical shapes."
             )
-        wavelength = _positive_scalar(self.wavelength, u.um, "wavelength")
-        zenith_angle = _scalar(self.zenith_angle, u.deg, "zenith_angle")
+        wavelength = _positive_scalar(self.wavelength, u.um, "wavelength", dtype=dtype)
+        zenith_angle = _scalar(self.zenith_angle, u.deg, "zenith_angle", dtype=dtype)
         if not 0.0 <= zenith_angle.to_value(u.deg) < 90.0:
             raise ValueError("zenith_angle must be in [0, 90) deg.")
         mastsel_ini = str(self.mastsel_ini).strip()
@@ -412,6 +435,8 @@ class HybridDiagnostics:
     """Optional scientific validation summaries and debug products.
 
     Attributes:
+        dtype: Real calculation/state precision, float32 by default or float64.
+            None preserves stored per-array precision when loading legacy results.
         psd_valid_mask: Per-field mask identifying nonzero PSD covariance matrices.
         ctot_angle_trace_min: Minimum angular Ctot trace.
         ctot_angle_trace_max: Maximum angular Ctot trace.
@@ -431,32 +456,43 @@ class HybridDiagnostics:
     ctot_angle_determinant_mean: u.Quantity
     pre_blur_psfs: np.ndarray | None = None
 
+    dtype: DTypeLike | None = field(default=np.float32, kw_only=True)
+
     def __post_init__(self) -> None:
+        dtype = None if self.dtype is None else validate_psf_dtype(self.dtype)
+        object.__setattr__(self, "dtype", dtype)
         psd_valid_mask = _readonly_array(
             self.psd_valid_mask,
             dtype=bool,
             label="psd_valid_mask",
             ndim=1,
         )
-        trace_min = _scalar(self.ctot_angle_trace_min, u.mas**2, "ctot_angle_trace_min")
-        trace_max = _scalar(self.ctot_angle_trace_max, u.mas**2, "ctot_angle_trace_max")
+        trace_min = _scalar(
+            self.ctot_angle_trace_min, u.mas**2, "ctot_angle_trace_min", dtype=dtype
+        )
+        trace_max = _scalar(
+            self.ctot_angle_trace_max, u.mas**2, "ctot_angle_trace_max", dtype=dtype
+        )
         trace_mean = _scalar(
-            self.ctot_angle_trace_mean, u.mas**2, "ctot_angle_trace_mean"
+            self.ctot_angle_trace_mean, u.mas**2, "ctot_angle_trace_mean", dtype=dtype
         )
         determinant_min = _scalar(
             self.ctot_angle_determinant_min,
             u.mas**4,
             "ctot_angle_determinant_min",
+            dtype=dtype,
         )
         determinant_max = _scalar(
             self.ctot_angle_determinant_max,
             u.mas**4,
             "ctot_angle_determinant_max",
+            dtype=dtype,
         )
         determinant_mean = _scalar(
             self.ctot_angle_determinant_mean,
             u.mas**4,
             "ctot_angle_determinant_mean",
+            dtype=dtype,
         )
         if not trace_min <= trace_mean <= trace_max:
             raise ValueError("Ctot trace summaries must satisfy min <= mean <= max.")
@@ -477,7 +513,7 @@ class HybridDiagnostics:
                 "pre_blur_psfs",
                 _readonly_array(
                     self.pre_blur_psfs,
-                    dtype=np.float32,
+                    dtype=dtype,
                     label="pre_blur_psfs",
                     ndim=3,
                 ),
@@ -499,6 +535,8 @@ class HybridResult:
     """Immutable standard result of one Hybrid AO PSF simulation.
 
     Attributes:
+        dtype: Real calculation/state precision, float32 by default or float64.
+            None preserves stored per-array precision when loading legacy results.
         psfs: Final PSFs after low-order blurring, in ``(N, y, x)`` order.
         metadata: Physical metadata for ``psfs``.
         source_metadata: Scalar metadata from the science PSF provider.
@@ -535,31 +573,44 @@ class HybridResult:
     ngs_magnitude: u.Quantity | None = None
     ngs_magnitude_zeropoint: u.Quantity | None = None
 
+    dtype: DTypeLike | None = field(default=np.float32, kw_only=True)
+
     def __post_init__(self) -> None:
-        psfs = _readonly_array(self.psfs, dtype=np.float32, label="psfs", ndim=3)
+        dtype = None if self.dtype is None else validate_psf_dtype(self.dtype)
+        object.__setattr__(self, "dtype", dtype)
+        psfs = _readonly_array(self.psfs, dtype=dtype, label="psfs", ndim=3)
         if np.any(psfs < 0.0):
             raise ValueError("psfs must be non-negative.")
-        flux = np.sum(psfs, axis=(-2, -1), dtype=np.float64)
+        flux = np.sum(psfs, axis=(-2, -1), dtype=psfs.dtype)
         if np.any(flux <= 0.0):
             raise ValueError("psfs must have positive flux.")
         num_science = psfs.shape[0]
-        metadata = _readonly_metadata(self.metadata, num_psfs=num_science)
+        metadata = _readonly_metadata(self.metadata, num_psfs=num_science, dtype=dtype)
         source_metadata = _quantity_mapping(
-            self.source_metadata, label="source_metadata", scalar_only=True
+            self.source_metadata, label="source_metadata", scalar_only=True, dtype=dtype
         )
         if not isinstance(self.ngs_metrics, NgsHoMetricPrediction):
             raise TypeError("ngs_metrics must be an NgsHoMetricPrediction.")
+        if dtype is not None:
+            object.__setattr__(
+                self, "ngs_metrics", replace(self.ngs_metrics, dtype=dtype)
+            )
+            if self.diagnostics is not None:
+                object.__setattr__(
+                    self, "diagnostics", replace(self.diagnostics, dtype=dtype)
+                )
         num_ngs = self.ngs_metrics.ee.size
         ctot_wavefront = _ctot_quantity(
-            self.ctot_wavefront, u.nm**2, "ctot_wavefront", num_science
+            self.ctot_wavefront, u.nm**2, "ctot_wavefront", num_science, dtype=dtype
         )
         ctot_angle = _ctot_quantity(
-            self.ctot_angle, u.mas**2, "ctot_angle", num_science
+            self.ctot_angle, u.mas**2, "ctot_angle", num_science, dtype=dtype
         )
         angle_to_wavefront_scale = _positive_scalar(
             self.angle_to_wavefront_scale,
             u.nm / u.mas,
             "angle_to_wavefront_scale",
+            dtype=dtype,
         )
         expected_ctot_angle = (
             ctot_wavefront.to_value(u.nm**2)
@@ -568,7 +619,7 @@ class HybridResult:
         if not np.allclose(
             ctot_angle.to_value(u.mas**2),
             expected_ctot_angle,
-            rtol=1.0e-10,
+            rtol=max(1.0e-10, 8 * np.finfo(psfs.dtype).eps),
             atol=1.0e-9,
         ):
             raise ValueError(
@@ -584,7 +635,12 @@ class HybridResult:
                 f"{CTOT_PSD_TOLERANCE_NM2:.6g} nm2 tolerance."
             )
         ngs_flux = _vector_with_length(
-            self.ngs_flux, u.photon / u.s, "ngs_flux", num_ngs, positive=True
+            self.ngs_flux,
+            u.photon / u.s,
+            "ngs_flux",
+            num_ngs,
+            positive=True,
+            dtype=dtype,
         )
         if (self.ngs_magnitude is None) != (self.ngs_magnitude_zeropoint is None):
             raise ValueError(
@@ -594,18 +650,29 @@ class HybridResult:
         zeropoint = None
         if self.ngs_magnitude is not None:
             ngs_magnitude = _vector_with_length(
-                self.ngs_magnitude, u.mag, "ngs_magnitude", num_ngs, positive=False
+                self.ngs_magnitude,
+                u.mag,
+                "ngs_magnitude",
+                num_ngs,
+                positive=False,
+                dtype=dtype,
             )
             zeropoint = _positive_scalar(
                 self.ngs_magnitude_zeropoint,
                 u.photon / (u.m**2 * u.s),
                 "ngs_magnitude_zeropoint",
+                dtype=dtype,
             )
         ngs_frame_rate = _vector_with_length(
-            self.ngs_frame_rate, u.Hz, "ngs_frame_rate", num_ngs, positive=True
+            self.ngs_frame_rate,
+            u.Hz,
+            "ngs_frame_rate",
+            num_ngs,
+            positive=True,
+            dtype=dtype,
         )
         jitter = _vector_with_length(
-            self.jitter, u.mas, "jitter", num_science, positive=False
+            self.jitter, u.mas, "jitter", num_science, positive=False, dtype=dtype
         )
         if np.any(jitter.value < 0.0):
             raise ValueError("jitter must be non-negative.")
@@ -699,11 +766,16 @@ def _readonly_quantity(
     label: str,
     *,
     ndim: int,
+    dtype=float,
 ) -> u.Quantity:
     if not isinstance(value, u.Quantity):
         raise TypeError(f"{label} must be an Astropy Quantity.")
     try:
-        array = np.array(value.to_value(unit), dtype=float, copy=True)
+        array = np.array(
+            (value if dtype is None else value.astype(dtype)).to_value(unit),
+            dtype=dtype,
+            copy=True,
+        )
     except u.UnitConversionError as exc:
         raise u.UnitConversionError(f"{label} must be convertible to {unit}.") from exc
     if array.ndim != ndim or any(size == 0 for size in array.shape):
@@ -714,13 +786,15 @@ def _readonly_quantity(
     return u.Quantity(array, unit, copy=False)
 
 
-def _scalar(value: object, unit: u.UnitBase, label: str) -> u.Quantity:
-    quantity = _readonly_quantity(value, unit, label, ndim=0)
+def _scalar(value: object, unit: u.UnitBase, label: str, *, dtype=float) -> u.Quantity:
+    quantity = _readonly_quantity(value, unit, label, ndim=0, dtype=dtype)
     return quantity
 
 
-def _positive_scalar(value: object, unit: u.UnitBase, label: str) -> u.Quantity:
-    quantity = _scalar(value, unit, label)
+def _positive_scalar(
+    value: object, unit: u.UnitBase, label: str, *, dtype=float
+) -> u.Quantity:
+    quantity = _scalar(value, unit, label, dtype=dtype)
     if quantity.value <= 0.0:
         raise ValueError(f"{label} must be positive.")
     return quantity
@@ -733,8 +807,9 @@ def _vector_with_length(
     length: int,
     *,
     positive: bool,
+    dtype=float,
 ) -> u.Quantity:
-    quantity = _readonly_quantity(value, unit, label, ndim=1)
+    quantity = _readonly_quantity(value, unit, label, ndim=1, dtype=dtype)
     if quantity.shape != (length,):
         raise ValueError(f"{label} must have shape ({length},), got {quantity.shape}.")
     if positive and np.any(quantity.value <= 0.0):
@@ -747,8 +822,10 @@ def _ctot_quantity(
     unit: u.UnitBase,
     label: str,
     num_science: int,
+    *,
+    dtype=float,
 ) -> u.Quantity:
-    quantity = _readonly_quantity(value, unit, label, ndim=3)
+    quantity = _readonly_quantity(value, unit, label, ndim=3, dtype=dtype)
     expected = (num_science, 2, 2)
     if quantity.shape != expected:
         raise ValueError(f"{label} must have shape {expected}, got {quantity.shape}.")
@@ -787,21 +864,26 @@ def _ctot_angle_summaries(ctot_angle: u.Quantity) -> dict[str, u.Quantity]:
     }
 
 
-def _readonly_metadata(metadata: PsfMetadata, *, num_psfs: int) -> PsfMetadata:
+def _readonly_metadata(
+    metadata: PsfMetadata, *, num_psfs: int, dtype=float
+) -> PsfMetadata:
     if not isinstance(metadata, PsfMetadata):
         raise TypeError("metadata must be an ao_stats.PsfMetadata instance.")
     wavelength = _shared_or_vector(
-        metadata.wavelength, u.um, "metadata.wavelength", num_psfs
+        metadata.wavelength, u.um, "metadata.wavelength", num_psfs, dtype=dtype
     )
     pixel_scale = _shared_or_vector(
-        metadata.pixel_scale, u.mas, "metadata.pixel_scale", num_psfs
+        metadata.pixel_scale, u.mas, "metadata.pixel_scale", num_psfs, dtype=dtype
     )
-    tel_diameter = _positive_scalar(metadata.tel_diameter, u.m, "metadata.tel_diameter")
+    tel_diameter = _positive_scalar(
+        metadata.tel_diameter, u.m, "metadata.tel_diameter", dtype=dtype
+    )
     tel_pupil = _readonly_quantity(
         metadata.tel_pupil,
         u.dimensionless_unscaled,
         "metadata.tel_pupil",
         ndim=2,
+        dtype=dtype,
     )
     if np.any(tel_pupil.value < 0.0):
         raise ValueError("metadata.tel_pupil must be non-negative.")
@@ -820,13 +902,15 @@ def _shared_or_vector(
     unit: u.UnitBase,
     label: str,
     length: int,
+    *,
+    dtype=float,
 ) -> u.Quantity:
     if not isinstance(value, u.Quantity):
         raise TypeError(f"{label} must be an Astropy Quantity.")
     ndim = np.asarray(value.value).ndim
     if ndim not in (0, 1):
         raise ValueError(f"{label} must be scalar or one-dimensional.")
-    quantity = _readonly_quantity(value, unit, label, ndim=ndim)
+    quantity = _readonly_quantity(value, unit, label, ndim=ndim, dtype=dtype)
     if ndim == 1 and quantity.shape != (length,):
         raise ValueError(f"{label} must have shape ({length},), got {quantity.shape}.")
     if np.any(quantity.value <= 0.0):
@@ -839,6 +923,7 @@ def _quantity_mapping(
     *,
     label: str,
     scalar_only: bool,
+    dtype=None,
 ) -> Mapping[str, u.Quantity]:
     normalized: dict[str, u.Quantity] = {}
     for raw_name, raw_value in value.items():
@@ -849,7 +934,7 @@ def _quantity_mapping(
             )
         if not isinstance(raw_value, u.Quantity):
             raise TypeError(f"{label}[{name!r}] must be an Astropy Quantity.")
-        array = np.array(raw_value.value, copy=True)
+        array = np.array(raw_value.value, dtype=dtype, copy=True)
         if scalar_only and array.ndim != 0:
             raise ValueError(f"{label}[{name!r}] must be scalar.")
         if not np.all(np.isfinite(array)):
