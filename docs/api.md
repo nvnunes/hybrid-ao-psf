@@ -8,16 +8,23 @@ This guide defines the supported public Python surface of Hybrid AO PSF.
 with the NGS flux, magnitude, and zeropoint fields grouped after `ngs_y`.
 Cartesian science and NGS coordinates, physical scalars, and NGS inputs are
 Astropy quantities.
-Array-valued inputs are copied and exposed read-only. The request also contains
-the MASTSEL INI text plus the selected non-PSD and diagnostics policies. The
-engine reads `RTC.SensorFrameRate_LO` from that INI for every active NGS.
+Array-valued inputs are copied and exposed read-only. `lo_model` accepts
+`LowOrderModel.MASTSEL` (the default) or `LowOrderModel.E2E_CALIBRATED`, also
+available as `"mastsel"` and `"e2e-calibrated"`.
+
+MASTSEL requests require INI text plus the selected non-PSD and diagnostics
+policies. The engine reads `RTC.SensorFrameRate_LO` from that INI for every active NGS.
 Supply exactly one of `ngs_flux` (effective `photon / s`) or
 `ngs_magnitude` (one `mag` value per active NGS). Magnitudes require a
 positive, scalar `ngs_magnitude_zeropoint` in `photon / (m2 s)` supplied by
 the caller, not stored in the MASTSEL INI. The engine uses
 `telescope.TelescopeDiameter`, the first `sensor_LO.NumberLenslets` value,
 and `RTC.SensorFrameRate_LO` with NGS Photometry to resolve effective flux
-once before MASTSEL. Calibration selection remains the caller's responsibility.
+once before MASTSEL.
+
+E2E requests require magnitudes and use the calibrated model's photometry.
+They reject MASTSEL INI text, flux, an external magnitude zeropoint and the
+`clip` policy. Product selection remains the caller's responsibility.
 Coordinates, Ctot axes, and PSF image orientation follow the
 [coordinate contract](architecture.md#coordinate-and-image-orientation).
 
@@ -54,9 +61,14 @@ for loading, support, units and the boundary with complete PSF simulation.
 
 `HybridResult` is the immutable standard result. It carries the final
 selected-precision PSF cube, neutral `ao_stats.PsfMetadata`, source metadata, NGS
-metrics, Ctot in wavefront and angular units, conversion scale, effective NGS
-flux and frame rates, optional supplied magnitudes and zeropoint,
-jitter, effective MASTSEL configuration, PSD-clipping mask, and provenance.
+metrics, angular Ctot, frame rates, jitter, PSD-clipping mask, provenance, model
+identity and the applied `LowOrderDistribution`. Its weights and covariances
+have shapes `(component,)` and `(science, component, 2, 2)`; their weighted
+covariance equals angular Ctot. Execution records field/NGS positions and ZA.
+MASTSEL additionally retains wavefront Ctot, angular conversion, effective flux
+and INI, and optional supplied magnitudes/zeropoint. Those MASTSEL-only fields
+are `None` for E2E, which instead retains magnitudes and a complete
+`E2ELowOrderPrediction` with component diagnostics.
 `HybridDiagnostics` carries the selected validation summaries. At the debug
 level it also carries the large pre-blur PSF cube.
 
@@ -68,16 +80,18 @@ contract described in [Result files](results.md).
 
 ## Simulation
 
-`simulate(request, science_provider, ngs_provider, *, ctot_correction=None)` is the one stateless
-scientific operation. It evaluates both loaded providers, creates the effective
-MASTSEL configuration, computes and validates Ctot, applies the finite-field
-blur, derives jitter, and returns `HybridResult`. Providers are borrowed and
+`simulate(request, science_provider, ngs_provider=None, *, ctot_correction=None,
+e2e_model=None)` is the one stateless scientific operation. MASTSEL requires
+`ngs_provider`; E2E requires `e2e_model` and rejects an external NGS provider or
+correction callback. The engine evaluates the selected LO prediction, applies
+the corresponding Gaussian or full mixture blur, derives jitter and returns
+`HybridResult`. Providers are borrowed and
 may be reused across calls. See [Engine](engine.md) for the Ctot and diagnostic
 policies.
 
 ### Covariance Corrections
 
-Supply a `HybridCtotCorrection` to replace the field-wide baseline covariance
+On the MASTSEL path, supply a `HybridCtotCorrection` to replace the field-wide baseline covariance
 before conditioning and the existing single Gaussian blur. The callable receives
 `(Nscience, 2, 2)` unconditioned Ctot in `nm2` and a `HybridCtotContext`.
 Return a new Quantity convertible to `nm2` with the same shape/order, or `None`
@@ -146,12 +160,13 @@ application crops and clips numerical negatives without renormalizing flux.
 
 ## Configuration
 
-`load_configuration()` reads one combined Hybrid-and-MASTSEL INI, resolves
-paths relative to the INI, converts familiar polar source coordinates into a
-Cartesian `HybridRequest`, and returns `HybridConfiguration`. See
+`load_configuration()` reads one model-specific INI and returns
+`HybridConfiguration`. It resolves paths relative to the INI. MASTSEL uses
+familiar polar source fields; E2E uses Cartesian `[hybrid]` inputs and the shared
+`[e2e]` product/provider paths. See
 [Configuration](configuration.md) for the field contract.
 
-`simulate_configuration()` loads the two configured artifacts and calls
+`simulate_configuration()` loads the selected model/providers and calls
 `simulate()`. `run_configuration()` additionally writes the configured HDF5
 result and is the operation used by the CLI.
 

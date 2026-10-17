@@ -10,13 +10,15 @@ from .standalone import run_configuration
 
 
 def main(argv: Sequence[str] | None = None) -> int:
-    """Run one combined INI file and write one HDF5 result."""
+    """Run one selected-model INI file and write one HDF5 result."""
     parser = argparse.ArgumentParser(
         prog="hybrid-ao-psf",
-        description="Run one MASTSEL-backed Hybrid AO PSF simulation.",
+        description="Run one Hybrid AO PSF simulation with the selected low-order model.",
     )
     parser.add_argument(
-        "configuration", type=Path, help="combined Hybrid-and-MASTSEL INI"
+        "configuration",
+        type=Path,
+        help="Hybrid INI with MASTSEL or E2E-calibrated inputs",
     )
     parser.add_argument(
         "--output",
@@ -31,7 +33,7 @@ def main(argv: Sequence[str] | None = None) -> int:
     parser.add_argument(
         "--precision",
         choices=("float32", "float64"),
-        help="override [hybrid] precision",
+        help="override configured precision",
     )
     arguments = parser.parse_args(argv)
     try:

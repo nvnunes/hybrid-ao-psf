@@ -8,7 +8,7 @@ from __future__ import annotations
 
 import hashlib
 from collections.abc import Mapping
-from dataclasses import dataclass, field, replace
+from dataclasses import dataclass, field, fields, replace
 from pathlib import Path
 from types import MappingProxyType
 
@@ -123,15 +123,236 @@ class E2ELowOrderPrediction(_PhysicalRecord):
 
     @classmethod
     def _create(cls, dtype, **values):
+        """Validate self-contained prediction state for runtime and I/O.
+
+        Check feedback/reconstruction, scalar decomposition, covariance priors
+        and displacement-mixture identities without modifying stored values.
+        """
+        dtype = validate_psf_dtype(dtype)
+        expected = {item.name for item in fields(cls)} - {"dtype"}
+        if set(values) != expected:
+            raise ValueError(
+                "prediction state must contain exactly its declared fields"
+            )
         result = object.__new__(cls)
         object.__setattr__(result, "dtype", dtype)
+        units = {
+            "photons_per_frame": u.photon,
+            "coma_response": u.mas / u.nm,
+            "gains": u.one,
+            "noise_variances": u.mas**2,
+            "noise_prior": u.mas**2,
+            **{
+                name: u.mas**2
+                for name in (
+                    "atmospheric_command",
+                    "ho_command",
+                    "atmospheric_ho_command",
+                    "science_atmospheric_command",
+                    "science_ho_command",
+                    "uncorrected",
+                    "atmospheric",
+                    "ho",
+                    "noiseless",
+                    "noise",
+                    "total",
+                    "mixture_covariances",
+                )
+            },
+        }
         for name, value in values.items():
-            if isinstance(value, u.Quantity):
-                value = _quantity(value, value.unit, name, value.ndim, dtype=dtype)
-            elif isinstance(value, np.ndarray):
+            if name in units:
+                if not isinstance(value, u.Quantity):
+                    raise TypeError(f"{name} must be a quantity")
+                value = _quantity(value, units[name], name, value.ndim, dtype=dtype)
+            elif name == "metrics":
+                if not isinstance(value, NgsHoMetricPrediction):
+                    raise TypeError("metrics must be NgsHoMetricPrediction")
+                value = replace(value, dtype=dtype)
+            elif name == "symmetric_feedback_fallback":
+                if not isinstance(value, (bool, np.bool_)):
+                    raise TypeError("feedback fallback must be boolean")
+                value = bool(value)
+            elif name in (
+                "feedback_approximation_relative_error",
+                "eigenbasis_condition",
+            ):
+                if np.ndim(value) != 0 or not np.isfinite(value) or value < 0:
+                    raise ValueError(f"invalid {name}")
+                value = float(value)
+            else:
+                if np.asarray(value).dtype.kind not in "fiu":
+                    raise ValueError(f"{name} must be real")
                 value = _array(value, dtype)
             object.__setattr__(result, name, value)
+        n = len(result.metrics.ee)
+        if result.uncorrected.ndim != 3:
+            raise ValueError("uncorrected covariance must be (science,2,2)")
+        count = len(result.uncorrected)
+        shapes = {
+            **{
+                key: (n,)
+                for key in (
+                    "photons_per_frame",
+                    "coma_response",
+                    "gains",
+                    "noise_variances",
+                )
+            },
+            "noise_prior": (2 * n, 2 * n),
+            "reconstructor": (2, 2 * n),
+            "feedback": (2, 2),
+            "effective_feedback": (2, 2),
+            "strengths": (2,),
+            "projectors": (2, 2, 2),
+            "mixture_weights": (2,),
+            "noise_scales": (2,),
+            **{
+                key: (2, 2)
+                for key in (
+                    "atmospheric_command",
+                    "ho_command",
+                    "atmospheric_ho_command",
+                    "noise",
+                )
+            },
+            **{
+                key: (count, 2, 2)
+                for key in (
+                    "science_atmospheric_command",
+                    "science_ho_command",
+                    "uncorrected",
+                    "atmospheric",
+                    "ho",
+                    "noiseless",
+                    "total",
+                )
+            },
+            "mixture_covariances": (count, 2, 2, 2),
+        }
+        for name, shape in shapes.items():
+            if getattr(result, name).shape != shape:
+                raise ValueError(f"prediction {name} must have shape {shape}")
+        if any(
+            np.any(getattr(result, key).value <= 0)
+            for key in (
+                "photons_per_frame",
+                "coma_response",
+                "gains",
+                "noise_variances",
+            )
+        ):
+            raise ValueError(
+                "positive photon counts and WFS response/noise values required"
+            )
+        tolerance = max(1e-10, 32 * np.finfo(dtype).eps)
+        blocks = result.reconstructor.reshape(2, n, 2).transpose(1, 0, 2)
+        if not np.allclose(
+            result.feedback,
+            np.einsum("g,gab->ab", result.gains.value, blocks),
+            rtol=tolerance,
+            atol=tolerance,
+        ):
+            raise ValueError("feedback must equal the gain-weighted reconstructor sum")
+        _validate_scalar_decomposition(
+            result.feedback,
+            result.effective_feedback,
+            result.strengths,
+            result.projectors,
+            result.symmetric_feedback_fallback,
+        )
+        if not np.allclose(
+            result.noiseless.value,
+            result.atmospheric.value + result.ho.value,
+            rtol=tolerance,
+            atol=1e-8,
+        ):
+            raise ValueError("noiseless covariance must equal atmospheric plus HO")
+        if not np.allclose(
+            result.total.value,
+            result.noiseless.value + result.noise.value,
+            rtol=tolerance,
+            atol=1e-8,
+        ):
+            raise ValueError("total covariance must equal noiseless plus noise")
+        if np.any(result.mixture_weights <= 0) or not np.isclose(
+            result.mixture_weights.sum(), 1, rtol=tolerance
+        ):
+            raise ValueError("positive mixture weights must sum to one")
+        if np.any(result.noise_scales <= 0) or not np.isclose(
+            result.mixture_weights @ result.noise_scales, 1, rtol=tolerance
+        ):
+            raise ValueError("noise mixture must preserve covariance")
+        expected = (
+            result.noiseless.value[:, None]
+            + result.noise_scales[None, :, None, None] * result.noise.value
+        )
+        if not np.allclose(
+            result.mixture_covariances.value, expected, rtol=tolerance, atol=1e-8
+        ):
+            raise ValueError(
+                "mixture covariances differ from noiseless and scaled noise"
+            )
+        for name in (
+            "noise_prior",
+            "uncorrected",
+            "atmospheric",
+            "noiseless",
+            "noise",
+            "total",
+            "mixture_covariances",
+        ):
+            value = getattr(result, name).value
+            if (
+                not np.allclose(
+                    value, value.swapaxes(-1, -2), rtol=tolerance, atol=1e-8
+                )
+                or np.linalg.eigvalsh(value).min() < -1e-8
+            ):
+                raise ValueError(
+                    f"prediction {name} must be symmetric positive semidefinite"
+                )
         return result
+
+
+def _validate_scalar_decomposition(
+    feedback, effective, strengths, projectors, fallback
+):
+    """Check the scalar representation shared by runtime prediction and loading.
+
+    The effective matrix must equal the actual feedback, or its symmetric part
+    when the fallback is declared. Projectors must be idempotent, resolve identity
+    and reproduce that matrix with the stored strengths. The idempotence check
+    allows two-term matrix-product roundoff for non-orthogonal projectors.
+    Values are checked, never conditioned.
+    """
+    tolerance = max(1e-10, 32 * np.finfo(feedback.dtype).eps)
+    expected = (feedback + feedback.T) / 2 if fallback else feedback
+    if not np.allclose(effective, expected, rtol=tolerance, atol=tolerance):
+        raise ValueError("effective feedback must match the declared feedback response")
+    if not np.allclose(
+        projectors.sum(0), np.eye(2), rtol=tolerance, atol=tolerance
+    ) or not np.allclose(
+        np.einsum("p,pab->ab", strengths, projectors),
+        effective,
+        rtol=tolerance,
+        atol=tolerance,
+    ):
+        raise ValueError("feedback scalar decomposition failed reconstruction")
+    eps = np.finfo(feedback.dtype).eps
+    # Each 2x2 product entry is a two-term dot product, with error bounded
+    # componentwise by gamma_2 * (abs(P) @ abs(P)).
+    gamma_2 = 2 * eps / (1 - 2 * eps)
+    with np.errstate(over="ignore", invalid="ignore"):
+        products = projectors @ projectors
+        product_roundoff = gamma_2 * (np.abs(projectors) @ np.abs(projectors))
+        allowed = tolerance + tolerance * np.abs(projectors) + product_roundoff
+    if (
+        not np.isfinite(products).all()
+        or not np.isfinite(allowed).all()
+        or not np.all(np.abs(products - projectors) <= allowed)
+    ):
+        raise ValueError("feedback scalar decomposition requires idempotent projectors")
 
 
 def _scalar_decomposition(feedback):
@@ -164,16 +385,7 @@ def _scalar_decomposition(feedback):
             raise ValueError("feedback has an ill-conditioned or defective eigenbasis")
     inverse = np.linalg.inv(basis)
     projections = np.stack([np.outer(basis[:, p], inverse[p]) for p in range(2)])
-    tolerance = max(1e-10, 32 * eps)
-    if not np.allclose(
-        projections.sum(0), np.eye(2), rtol=tolerance, atol=tolerance
-    ) or not np.allclose(
-        np.einsum("p,pab->ab", values, projections),
-        effective,
-        rtol=tolerance,
-        atol=tolerance,
-    ):
-        raise ValueError("feedback scalar decomposition failed reconstruction")
+    _validate_scalar_decomposition(feedback, effective, values, projections, fallback)
     return {
         "strengths": values,
         "projectors": projections,

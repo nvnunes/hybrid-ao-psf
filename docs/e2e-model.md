@@ -3,8 +3,8 @@
 `E2ECalibratedModel` composes the four fitted calibration products into the
 centred LO image-displacement distribution. It predicts covariance components
 and the full two-Gaussian distribution parameters without loading native
-sources or constructing a MASTSEL model. It does not construct science PSFs;
-`simulate()` remains the complete MASTSEL-backed PSF execution path.
+sources or constructing a MASTSEL model. `model.predict()` supplies standalone LO
+statistics; `simulate()` combines the same model with science HO PSFs.
 
 ## Load And Evaluate
 
@@ -67,6 +67,30 @@ The weighted mixture covariance equals `total`. All covariance axes are physical
 x/y and angular covariances are in mas squared; coma response is in mas/nm OPD.
 
 Queries must lie within all applicable spatial, magnitude, zenith and feedback
-supports. No extrapolation, native acquisition, MASTSEL fallback or production
-PSF integration occurs in this operation. See the [Python reference](reference/api.md)
+supports. No extrapolation, native acquisition, MASTSEL fallback or
+PSF construction occurs in `model.predict()`. See the [Python reference](reference/api.md)
 for the result fields and constructor contracts.
+
+## Complete PSF Execution
+
+Pass the loaded model to the same engine used for MASTSEL:
+
+```python
+from hybrid_ao_psf import HybridRequest, load_science_ho_psf_interpolator, simulate
+
+science = load_science_ho_psf_interpolator("science.pkl")
+request = HybridRequest(
+    lo_model="e2e-calibrated",
+    science_x=[0, 12] * u.arcsec, science_y=[0, 12] * u.arcsec,
+    ngs_x=[12, -24] * u.arcsec, ngs_y=[-24, 12] * u.arcsec,
+    ngs_magnitude=[15, 17] * u.mag,
+    zenith_angle=20 * u.deg, wavelength=2.179 * u.um,
+)
+result = simulate(request, science, e2e_model=model)
+```
+
+The request's explicit model selector controls execution. Do not supply a
+MASTSEL INI, external NGS provider, magnitude zeropoint or Ctot correction on
+this path. The result retains the applied distribution and fitted LO diagnostics,
+without retaining the model object. See [Engine](engine.md),
+[Configuration](configuration.md) and [Result files](results.md).

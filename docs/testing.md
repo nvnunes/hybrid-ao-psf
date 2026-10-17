@@ -83,4 +83,16 @@ preparation of mixed-precision providers, rounding-time validation, content-boun
 INI loading without native imports, missing products, numerical conflicts and
 support rejection. `test_contracts.py` additionally checks shared metric numeric
 backing and unit metadata throughout the backing chain, including preserved
-legacy precision. PSF construction remains an engine concern.
+legacy precision. PSF construction is covered separately below.
+
+## Peer-Model Engine Coverage
+
+`test_e2e_engine.py` checks one-, two- and three-NGS calibrated PSFs in both
+precisions against independent FFT mixture convolution on odd rectangular
+images. A discriminating fixture rejects substituting a Gaussian with the same
+Ctot. Tests cover explicit peer selection, incompatible request/configuration
+inputs, unchanged provider state, immutable result state and schema-3 round trips.
+Corrupted model-specific fields and declared precision mismatches are rejected.
+A fresh-process CLI test forbids MASTSEL and native imports; saved results load
+after removing the fitted product/provider files. Existing MASTSEL golden,
+correction, standalone and legacy-result tests protect that peer path.

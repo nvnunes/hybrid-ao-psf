@@ -9,16 +9,16 @@ Hybrid AO PSF owns:
 
 - science-HO-PSF and NGS-HO-metric interpolation products;
 - translation of Hybrid inputs into MASTSEL configuration;
-- MASTSEL low-order execution and Ctot interpretation;
+- explicit MASTSEL and E2E-Calibrated low-order execution;
 - a downstream field-wide Ctot hook with transient runtime/statistics context;
-- finite-field Ctot blur, jitter, and engine-level diagnostics;
+- finite-field Gaussian/mixture blur, jitter, and engine-level diagnostics;
 - standalone combined-INI and versioned HDF5 result contracts; and
 - common E2E calibration, fixed-integrator/reconstruction/noise-blur kernels and
   immutable calibrated products.
 
 Hybrid AO PSF does not own batch simulation orchestration, external dataset
 schemas, instrument calibration selection, instrument-specific policy, or
-final PSF statistics. Callers may supply effective NGS flux directly or
+final PSF statistics. On the MASTSEL path, callers may supply effective NGS flux directly or
 provide magnitudes with an explicit caller-owned zeropoint. Hybrid converts
 the latter to WFS-effective rates using MASTSEL geometry and NGS Photometry.
 
@@ -54,7 +54,9 @@ state behind immutable interfaces so reuse cannot be altered through exposed
 SciPy objects or writable arrays.
 
 The public contract names are `HybridRequest`, `SciencePsfProvider`,
-`NgsMetricProvider`, `HybridResult`, and `HybridDiagnostics`. Provider
+`NgsMetricProvider`, `HybridResult`, and `HybridDiagnostics`. `LowOrderModel`
+selects the LO peer; `LowOrderDistribution` records the applied centred Gaussian
+mixture in angular x/y coordinates. Provider
 predictions use `ScienceHoPsfPrediction` and `NgsHoMetricPrediction`. The
 immutable concrete provider types are
 `ScienceHoPsfInterpolator` and `NgsHoMetricInterpolator`; file loading remains outside
@@ -73,16 +75,22 @@ callback before conditioning and its single Gaussian blur; it persists only the
 supplied static provenance. See the [API guide](api.md#covariance-corrections).
 
 `simulate()` is the sole complete scientific simulation path. It is stateless,
-borrows its immutable providers, owns MASTSEL translation and execution, and
+borrows its immutable providers, dispatches the explicitly selected LO model, and
 returns a new result. `simulate_configuration()`, `run_configuration()`, and the
 CLI call this operation rather than defining separate scientific behavior.
-The engine reads the active NGS frame rate from `RTC.SensorFrameRate_LO` in the
+The MASTSEL path reads the active NGS frame rate from `RTC.SensorFrameRate_LO` in the
 effective MASTSEL configuration and reports the applied rates in the result.
 For magnitude requests it also reads `telescope.TelescopeDiameter` and the
 first `sensor_LO.NumberLenslets` value, converts once before MASTSEL, and
 reports both the effective flux and the supplied magnitudes and zeropoint.
 The MASTSEL INI contains no instrument zeropoint; the standalone command
 supplies resolved flux through its `[hybrid]` section.
+The E2E path receives a prepared `E2ECalibratedModel` with its own metrics,
+photometry and controller settings. It convolves the science PSFs with the full
+calibrated Gaussian mixture; it does not construct MASTSEL or accept its INI,
+external metric provider, zeropoint or correction callback. Both paths share
+science-provider preparation, physical axes, finite-field FFT/crop and result
+contracts. Preparation may be reused; simulation does not mutate providers.
 `blur_psfs_with_ctot()` is a focused operation for externally supplied PSFs
 and already-conditioned Ctot; it uses the same finite-field blur without
 running MASTSEL or producing a complete simulation result.
@@ -109,7 +117,8 @@ It owns immutable prepared providers and standalone scientific LO composition,
 including reconstructor weights, scalar-bank assembly, actual-feedback noise
 propagation and displacement-mixture parameters. Its INI loader exposes
 validated product-content identities without acquisition metadata. It does not
-construct science PSFs or alter the MASTSEL-backed engine. See
+construct science PSFs itself. The canonical engine combines its prediction
+with a science provider. See
 [Calibrated LO prediction](e2e-model.md) for this runtime boundary. See [Calibration](calibration.md) for lifecycle and scientific contracts.
 
 ## Coordinate And Image Orientation
@@ -151,5 +160,9 @@ destination's existing mode.
 
 The standalone result keeps quantities, provenance, effective configuration,
 and optional diagnostics together without imposing a batch dataset structure.
-Its root schema identity is `hybrid-ao-psf-result`, currently at version 2. It records the effective precision. Version-1 mixed
-arrays load at their stored precision without a uniform arithmetic claim.
+Its root schema identity is `hybrid-ao-psf-result`, currently at version 3. It
+records explicit model identity, effective precision, the applied distribution
+and model-specific scientific state. Versions 1 and 2 load as MASTSEL results;
+legacy mixed arrays retain their stored precision without a uniform arithmetic
+claim. Results load without fitted products or native sources. See
+[Result files](results.md) for the layout and validation contract.

@@ -1,4 +1,4 @@
-"""Stateless MASTSEL-backed Hybrid AO PSF simulation engine."""
+"""Stateless Hybrid AO PSF execution with explicit peer low-order models."""
 
 from __future__ import annotations
 
@@ -14,6 +14,7 @@ from ngs_photometry import (
 )
 from scipy.fft import fft2, ifft2
 
+from ._e2e_model import E2ECalibratedModel
 from ._mastsel import (
     _capture_mastsel,
     _complete_mastsel_context,
@@ -29,6 +30,8 @@ from .contracts import (
     HybridDiagnostics,
     HybridRequest,
     HybridResult,
+    LowOrderDistribution,
+    LowOrderModel,
     NgsMetricProvider,
     NonPsdPolicy,
     SciencePsfProvider,
@@ -41,36 +44,56 @@ from .contracts import (
 def simulate(
     request: HybridRequest,
     science_provider: SciencePsfProvider,
-    ngs_provider: NgsMetricProvider,
+    ngs_provider: NgsMetricProvider | None = None,
     *,
     ctot_correction: HybridCtotCorrection | None = None,
+    e2e_model: E2ECalibratedModel | None = None,
 ) -> HybridResult:
-    """Run one Hybrid AO PSF simulation.
+    """Run the selected LO model and blur one field of science HO PSFs.
 
-    The request supplies effective NGS flux or magnitudes with a caller-owned
-    zeropoint. Magnitudes are converted using MASTSEL telescope/WFS geometry
-    before Ctot evaluation. Providers are borrowed and reusable. The result
-    owns its arrays, and the engine retains no mutable per-run state.
+    MASTSEL (the request default) requires ngs_provider and the request's INI,
+    with effective flux or caller-zero-point magnitudes. E2E-Calibrated requires
+    e2e_model, calibrated-convention magnitudes and no external NGS provider or
+    correction. It uses the full calibrated two-Gaussian displacement mixture,
+    without constructing MASTSEL. Both paths use the science provider's physical
+    sampling and flux convention, and share finite-field convolution.
 
-    An optional correction receives the unconditioned whole-field covariance
-    and a borrowed live runtime context. It returns a replacement in compatible
-    wavefront covariance units, or None. The engine conditions and blurs once;
-    exceptions propagate. Static correction provenance is merged with provider
-    identities; collisions are errors. The context is not retained or persisted.
+    Providers/models are borrowed and reusable. Concrete state is prepared at
+    request dtype; the result owns its arrays and retains no runtime/model object.
+    Unsupported model-specific inputs fail; no model selection is inferred.
+
+    ctot_correction is MASTSEL-only: it receives unconditioned field covariance
+    and a borrowed transient context, returning replacement wavefront covariance
+    or None. Conditioning remains in the MASTSEL path. Static provenance is
+    retained; runtime context is not. Exceptions propagate.
     """
     if not isinstance(request, HybridRequest):
         raise TypeError("request must be a HybridRequest.")
     if not isinstance(science_provider, SciencePsfProvider):
         raise TypeError("science_provider must implement SciencePsfProvider.")
-    if not isinstance(ngs_provider, NgsMetricProvider):
-        raise TypeError("ngs_provider must implement NgsMetricProvider.")
+    if request.lo_model is LowOrderModel.MASTSEL:
+        if not isinstance(ngs_provider, NgsMetricProvider):
+            raise TypeError("ngs_provider must implement NgsMetricProvider.")
+        if e2e_model is not None:
+            raise ValueError("MASTSEL execution does not accept e2e_model")
+    else:
+        if not isinstance(e2e_model, E2ECalibratedModel):
+            raise TypeError("E2E-calibrated execution requires e2e_model")
+        if ngs_provider is not None or ctot_correction is not None:
+            raise ValueError(
+                "E2E-calibrated execution owns its NGS metrics and does not accept a Ctot correction"
+            )
     if ctot_correction is not None and not isinstance(
         ctot_correction, HybridCtotCorrection
     ):
         raise TypeError("ctot_correction must be HybridCtotCorrection or None.")
     provenance = {
         "science_provider": _type_identity(science_provider),
-        "ngs_provider": _type_identity(ngs_provider),
+        **(
+            {"ngs_provider": _type_identity(ngs_provider)}
+            if ngs_provider is not None
+            else {}
+        ),
     }
     if ctot_correction is not None:
         collisions = provenance.keys() & ctot_correction.provenance.keys()
@@ -100,6 +123,8 @@ def simulate(
     )
     if science.psfs.shape[0] != request.science_x.size:
         raise ValueError("Science provider output length does not match the request.")
+    if request.lo_model is LowOrderModel.E2E_CALIBRATED:
+        return _simulate_calibrated(request, science, e2e_model, provenance)
     metrics = ngs_provider.predict(
         zenith_angle=request.zenith_angle,
         x=request.ngs_x,
@@ -182,18 +207,135 @@ def simulate(
         psd_clipped=psd_clipped,
         provenance=provenance,
         diagnostics=diagnostics,
+        science_positions=np.column_stack(
+            (request.science_x.value, request.science_y.value)
+        )
+        * u.arcsec,
+        ngs_positions=np.column_stack((request.ngs_x.value, request.ngs_y.value))
+        * u.arcsec,
+        zenith_angle=request.zenith_angle,
+    )
+
+
+def _simulate_calibrated(request, science, model, provenance):
+    """Apply the validated calibrated distribution without extra conditioning."""
+    import json
+    from dataclasses import replace
+
+    model = model.prepare(dtype=request.dtype)
+    science = replace(science, dtype=request.dtype)
+    positions = np.column_stack((request.ngs_x.value, request.ngs_y.value)) * u.arcsec
+    field = (
+        np.column_stack((request.science_x.value, request.science_y.value)) * u.arcsec
+    )
+    prediction = model.predict(
+        ngs_positions=positions,
+        magnitudes=request.ngs_magnitude,
+        science_positions=field,
+        zenith_angle=request.zenith_angle,
+    )
+    distribution = LowOrderDistribution(
+        weights=prediction.mixture_weights,
+        covariances=prediction.mixture_covariances,
+        dtype=request.dtype,
+    )
+    pre_blur = science.psfs.copy()
+    psfs = pre_blur.copy()
+    work_shape = tuple(2 * size for size in psfs.shape[-2:])
+    pixel = request.dtype.type(science.pixel_scale.to_value(u.mas))
+    otfs = np.stack(
+        [
+            sum(
+                weight
+                * image_plane_gaussian_otf(
+                    covariance / pixel**2, work_shape, dtype=request.dtype
+                )
+                for weight, covariance in zip(
+                    distribution.weights, matrices, strict=True
+                )
+            )
+            for matrices in distribution.covariances.value
+        ]
+    )
+    apply_finite_fov_otfs(psfs, otfs)
+    total = distribution.covariance
+    diagnostics = None
+    if request.diagnostics_level is not DiagnosticsLevel.NONE:
+        diagnostics = _build_diagnostics(
+            None,
+            total,
+            pre_blur_psfs=pre_blur
+            if request.diagnostics_level is DiagnosticsLevel.DEBUG
+            else None,
+        )
+    identities = {}
+    for name, identity in model.product_identities.items():
+        if hasattr(identity, "entrypoint"):
+            identities[name] = {
+                "entrypoint": str(identity.entrypoint.path),
+                "sha256": identity.entrypoint.sha256,
+                "payloads": [
+                    {"path": str(item.path), "sha256": item.sha256}
+                    for item in identity.payloads
+                ],
+            }
+        else:
+            identities[name] = {"path": str(identity.path), "sha256": identity.sha256}
+    provenance = {
+        **provenance,
+        "e2e_model": _type_identity(model),
+        "e2e_model_inputs": json.dumps(identities, sort_keys=True),
+        "e2e_controller_gain": str(model.covariance.controller.gain),
+        "e2e_controller_delay_frames": str(model.covariance.controller.delay),
+        "e2e_magnitude_band": model.coma.photometry.magnitude_band,
+    }
+    rate = (
+        np.full(
+            len(positions),
+            model.covariance.controller.frame_rate.to_value(u.Hz),
+            dtype=request.dtype,
+        )
+        * u.Hz
+    )
+    return HybridResult(
+        dtype=request.dtype,
+        psfs=psfs,
+        metadata=science.metadata,
+        source_metadata=science.meta,
+        ngs_metrics=prediction.metrics,
+        ctot_wavefront=None,
+        ctot_angle=total,
+        angle_to_wavefront_scale=None,
+        ngs_flux=None,
+        ngs_frame_rate=rate,
+        jitter=_jitter_from_ctot(total),
+        effective_mastsel_ini=None,
+        psd_clipped=np.zeros(len(field), dtype=bool),
+        provenance=provenance,
+        diagnostics=diagnostics,
+        ngs_magnitude=request.ngs_magnitude,
+        lo_model=request.lo_model,
+        lo_distribution=distribution,
+        e2e_prediction=prediction,
+        science_positions=field,
+        ngs_positions=positions,
+        zenith_angle=request.zenith_angle,
     )
 
 
 def _build_diagnostics(
-    ctot_wavefront: u.Quantity,
+    ctot_wavefront: u.Quantity | None,
     ctot_angle: u.Quantity,
     *,
     pre_blur_psfs: np.ndarray | None,
 ) -> HybridDiagnostics:
     return HybridDiagnostics(
-        dtype=ctot_wavefront.dtype,
-        psd_valid_mask=psd_valid_mask(ctot_wavefront),
+        dtype=ctot_angle.dtype,
+        psd_valid_mask=(
+            psd_valid_mask(ctot_wavefront)
+            if ctot_wavefront is not None
+            else _psd_valid_mask(ctot_angle, unit=u.mas**2, tolerance=1e-8)
+        ),
         **_ctot_angle_summaries(ctot_angle),
         pre_blur_psfs=pre_blur_psfs,
     )

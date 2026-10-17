@@ -1,14 +1,16 @@
 # Engine
 
 `simulate()` accepts one `HybridRequest`, one loaded
-`SciencePsfProvider`, and one loaded `NgsMetricProvider`. It returns one
+`SciencePsfProvider`, and either an NGS metric provider for MASTSEL or an
+`E2ECalibratedModel` for E2E. `request.lo_model` selects the path explicitly;
+MASTSEL remains the default. It returns one
 immutable `HybridResult` and retains no mutable run state. Loading and provider
 reuse remain the caller's responsibility, so fitted products can be reused
 efficiently across repeated simulations.
 
 ## Scientific Path
 
-One call:
+For MASTSEL, one call:
 
 1. evaluates the science-HO-PSF and NGS-HO-metric providers;
 2. translates Cartesian request coordinates into an effective MASTSEL INI and
@@ -23,7 +25,14 @@ One call:
 7. constructs the standard result, jitter, PSD facts, effective configuration,
    provenance, and selected diagnostics.
 
-The finite-field crop is not renormalized. Energy blurred beyond the retained
+For E2E, the engine evaluates the calibrated model at the requested NGS
+positions/magnitudes and science positions. It adds the noiseless Gaussian
+covariance to each calibrated noise component, builds their weighted Gaussian
+OTF sum and applies that full mixture. The weighted covariance supplies Ctot
+and jitter; a single Gaussian with the same Ctot is not substituted.
+
+Both paths use the provider-owned pixel scale, physical x/y axes and the same
+finite-field FFT/crop on a private selected-precision PSF copy. The crop is not renormalized. Energy blurred beyond the retained
 PSF support remains absent from the result.
 
 The optional `ctot_correction` receives baseline Ctot and a transient context
@@ -54,7 +63,7 @@ mutates the supplied PSF cube and preserves the same finite-field convention.
 
 ## Ctot Policy
 
-Zero Ctot is valid and leaves its PSF unchanged. Ctot is symmetrized before
+MASTSEL conditioning applies to its wavefront Ctot. Zero Ctot is valid and leaves its PSF unchanged. Ctot is symmetrized before
 eigendecomposition. Negative eigenvalues with magnitude no greater than
 `1e-9 nm2` are treated as floating-point roundoff and clipped to zero.
 
@@ -67,12 +76,19 @@ raises before blur and is the default. `non_psd_policy = clip` clips negative
 eigenvalues to zero. `HybridResult.psd_clipped` reports every science point
 whose covariance required numerical or selected policy clipping.
 
+The E2E path uses the validated calibrated distribution unchanged. It rejects
+the `clip` policy, does not condition covariance components and reports an
+all-false clipping mask. Its covariance checks follow
+[Calibrated LO prediction](e2e-model.md#composition).
+
 ## Diagnostics
 
-The standard result always retains NGS metrics, Ctot in wavefront and angular
-units, angular conversion, effective NGS flux and frame rates, jitter,
-effective MASTSEL configuration, and PSD-clipping facts.
-Magnitude requests also retain the supplied magnitudes and zeropoint.
+Both models retain identity, NGS metrics, angular Ctot, applied distribution,
+frame rates, jitter, coordinates, provenance and PSD-clipping facts. MASTSEL
+also retains wavefront Ctot, angular conversion, effective flux and INI, with
+magnitudes/zeropoint when supplied. E2E retains magnitudes and its complete
+`E2ELowOrderPrediction`, including component covariances, reconstructor,
+feedback matrix/decomposition and symmetric-approximation diagnostics.
 
 `diagnostics_level = none` adds nothing to that standard result.
 `diagnostics_level = validation` retains a per-field nonzero-PSD mask, its

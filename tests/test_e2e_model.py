@@ -349,6 +349,53 @@ def test_feedback_limits_and_scalar_closed_form():
         _scalar_decomposition(np.array([[0.8, 1.0], [0, 0.8]]))
 
 
+@pytest.mark.parametrize(
+    "dtype,feedback",
+    [
+        (
+            np.float32,
+            [
+                [-62.42650604248047, 7.819972991943359],
+                [-514.409912109375, 64.42650604248047],
+            ],
+        ),
+        (
+            np.float64,
+            [
+                [509028.38564056694, 806947.8356399821],
+                [-321097.4339206497, -509026.38564056694],
+            ],
+        ),
+    ],
+)
+def test_nonorthogonal_projectors_allow_matrix_product_roundoff(dtype, feedback):
+    feedback = np.array(feedback, dtype=dtype)
+    controller = FixedGainIntegrator(
+        gain=0.3, delay=2, frame_rate=500 * u.Hz, dtype=dtype
+    )
+    assert np.max(np.abs(np.linalg.eigvals(controller.transition(feedback)))) < 1
+    decomposition = _scalar_decomposition(feedback)
+    projectors = decomposition["projectors"]
+    tolerance = max(1e-10, 32 * np.finfo(dtype).eps)
+    assert not decomposition["symmetric_feedback_fallback"]
+    assert decomposition["eigenbasis_condition"] < min(
+        1e10, 1 / (100 * np.finfo(dtype).eps)
+    )
+    np.testing.assert_allclose(
+        projectors.sum(0), np.eye(2), rtol=tolerance, atol=tolerance
+    )
+    np.testing.assert_allclose(
+        np.einsum("p,pab->ab", decomposition["strengths"], projectors),
+        feedback,
+        rtol=tolerance,
+        atol=tolerance,
+    )
+    # Multiplying large non-orthogonal projectors needs a product-roundoff allowance.
+    assert not np.allclose(
+        projectors @ projectors, projectors, rtol=tolerance, atol=tolerance
+    )
+
+
 def test_configured_native_free_loading_and_conflicts(synthetic, tmp_path, monkeypatch):
     model, record = synthetic
     families = ("covariance", "coma", "sensing", "reconstructor")

@@ -23,6 +23,8 @@ def test_package_root_exports_supported_contracts() -> None:
         "HybridMastselStatistics",
         "HybridRequest",
         "HybridResult",
+        "LowOrderModel",
+        "LowOrderDistribution",
         "NgsHoMetricPrediction",
         "NgsMetricProvider",
         "NonPsdPolicy",

@@ -1,11 +1,11 @@
 # Hybrid AO PSF
 
 Hybrid AO PSF is a standalone Python engine for producing adaptive-optics
-science PSFs by combining interpolated high-order PSFs with MASTSEL low-order
-residuals. Researchers can run one simulation directly from a combined INI
-file or use the typed Python API from a larger orchestration system.
+science PSFs by combining interpolated high-order PSFs with either MASTSEL or
+E2E-calibrated low-order motion. Researchers can run one simulation directly
+from an INI file or use the typed Python API from a larger orchestration system.
 
-The project owns Hybrid-specific interpolation products, MASTSEL-backed
+The project owns Hybrid-specific interpolation products, both low-order models,
 scientific execution, engine diagnostics, and standalone results. It depends
 on [AO Stats](https://github.com/nvnunes/ao-stats) for neutral PSF metadata and
 measurements, and [NGS Photometry](https://github.com/nvnunes/ngs-photometry)
@@ -36,7 +36,7 @@ For repository-local development and source overrides, see
 
 ## Python Quick Start
 
-Run a combined Hybrid-and-MASTSEL INI and receive the validated immutable
+Run a selected-model Hybrid INI and receive the validated immutable
 result:
 
 ```python
@@ -48,7 +48,9 @@ print(result.psfs.shape)
 
 The configured HDF5 result is written at the same time. For callers that
 already manage loaded interpolation providers, `simulate()` is the lower-level
-stateless operation.
+stateless operation. MASTSEL is the default; see
+[Calibrated prediction](docs/e2e-model.md) for the calibrated model and
+[Configuration](docs/configuration.md) for both INI formats.
 
 ## Development Setup
 
