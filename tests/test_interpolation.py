@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import pickle
+from dataclasses import replace
 from pathlib import Path
 
 import numpy as np
@@ -971,6 +972,52 @@ def test_ngs_ho_psfs_feed_metric_samples_then_metric_interpolator() -> None:
     assert np.all(np.isfinite(metric_samples.ee))
     assert np.all(np.isfinite(metric_samples.fwhm))
     assert np.all(np.isfinite(metric_samples.sr))
+
+
+@pytest.mark.parametrize("dtype", [np.float32, np.float64])
+def test_ngs_metric_normalization_is_preserved_only_when_requested(tmp_path, dtype) -> None:
+    samples = _ngs_psf_samples()
+    scaled = replace(samples, psfs=0.4 * samples.psfs)
+    default = build_ngs_ho_metric_samples_from_psfs(scaled, dtype=dtype)
+    explicit_default = build_ngs_ho_metric_samples_from_psfs(
+        scaled, preserve_normalization=False, dtype=dtype
+    )
+    preserved = build_ngs_ho_metric_samples_from_psfs(
+        scaled, preserve_normalization=True, dtype=dtype
+    )
+    for name in ("ee", "sr", "fwhm"):
+        np.testing.assert_array_equal(getattr(default, name), getattr(explicit_default, name))
+        factor = 1.0 if name == "fwhm" else 0.4
+        np.testing.assert_allclose(
+            getattr(preserved, name).value,
+            factor * getattr(default, name).value,
+            rtol=2e-6,
+        )
+    artifact = build_ngs_ho_metric_interpolator_from_psfs(
+        scaled, preserve_normalization=True, dtype=dtype,
+        interpolation_config=RbfInterpolationConfig(smoothing=0.0),
+    )
+    prediction = artifact.predict(
+        zenith_angle=20.0 * u.deg, x=samples.x, y=samples.y
+    )
+    for name in ("ee", "sr", "fwhm"):
+        np.testing.assert_allclose(
+            getattr(prediction, name).value, getattr(preserved, name).value[0], rtol=2e-6
+        )
+    output = tmp_path / "full-flux.pkl"
+    save_ngs_ho_metric_interpolator(artifact, output)
+    loaded = load_ngs_ho_metric_interpolator(output)
+    query = {"zenith_angle": 25*u.deg, "x": np.array([-1., 0., 1.])*u.arcsec,
+             "y": np.array([-1., 0., 1.])*u.arcsec}
+    before, after = artifact.predict(**query), loaded.predict(**query)
+    legacy = build_ngs_ho_metric_interpolator_from_psfs(
+        scaled, dtype=dtype, interpolation_config=artifact.interpolation_config
+    ).predict(**query)
+    for name in ("ee", "sr", "fwhm"):
+        np.testing.assert_array_equal(getattr(before, name), getattr(after, name))
+        factor = 1.0 if name == "fwhm" else 0.4
+        np.testing.assert_allclose(getattr(after, name).value,
+                                   factor * getattr(legacy, name).value, rtol=2e-6)
 
 
 def test_ngs_ho_psf_samples_require_full_psf_metadata() -> None:

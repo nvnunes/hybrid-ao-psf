@@ -248,13 +248,22 @@ class NgsHoMetricInterpolator:
 
 
 def build_ngs_ho_metric_samples_from_psfs(
-    samples: NgsHoPsfSamples, *, dtype: DTypeLike = np.float32
+    samples: NgsHoPsfSamples,
+    *,
+    dtype: DTypeLike = np.float32,
+    preserve_normalization: bool = False,
 ) -> NgsHoMetricSamples:
-    """Measure NGS-HO metrics from NGS-HO PSF samples."""
+    """Measure NGS-HO metrics from PSFs with explicit preprocessing control.
+
+    By default, clip negative pixels and normalize each crop to unit sum.
+    Set ``preserve_normalization=True`` for already-normalized source PSFs;
+    metrics then retain their supplied flux without clipping or rescaling.
+    """
 
     dtype = validate_psf_dtype(dtype)
     prepared = _prepare_psf_samples(samples, dtype=dtype)
     psfs = prepared.psfs.reshape((-1, *prepared.psfs.shape[2:]))
+    preprocess = None if preserve_normalization else "default"
     metadata = PsfMetadata(
         wavelength=_expand_psf_metadata(
             prepared.wavelength, prepared.psfs.shape[:2], unit=u.um, label="wavelength"
@@ -271,10 +280,10 @@ def build_ngs_ho_metric_samples_from_psfs(
         tel_pupil=prepared.tel_pupil,
     )
     sr = np.asarray(
-        compute_psf_sr(psfs, metadata, preprocess="default", dtype=dtype), dtype=dtype
+        compute_psf_sr(psfs, metadata, preprocess=preprocess, dtype=dtype), dtype=dtype
     )
     fwhm = np.asarray(
-        compute_psf_fwhm(psfs, metadata, preprocess="default", dtype=dtype), dtype=dtype
+        compute_psf_fwhm(psfs, metadata, preprocess=preprocess, dtype=dtype), dtype=dtype
     )
     ee_aperture_diameters = np.asarray(2.0 * fwhm, dtype=dtype).reshape(-1, 1) * u.mas
     ee = np.asarray(
@@ -283,7 +292,7 @@ def build_ngs_ho_metric_samples_from_psfs(
             metadata,
             ee_apertures=ee_aperture_diameters,
             ee_geometry=EE_GEOMETRY_ENCIRCLED,
-            preprocess="default",
+            preprocess=preprocess,
             dtype=dtype,
         ),
         dtype=dtype,
@@ -304,14 +313,22 @@ def build_ngs_ho_metric_interpolator_from_psfs(
     samples: NgsHoPsfSamples,
     *,
     dtype: DTypeLike = np.float32,
+    preserve_normalization: bool = False,
     interpolation_config: RegularGridInterpolationConfig
     | RbfInterpolationConfig
     | None = None,
 ) -> NgsHoMetricInterpolator:
-    """Build an NGS-HO-metric artifact from NGS-HO PSF samples."""
+    """Build an NGS-HO-metric artifact from PSFs.
+
+    ``preserve_normalization=True`` measures already-normalized source PSFs
+    without clipping or rescaling. The default retains crop normalization.
+    This option affects metric construction, not artifact loading or evaluation.
+    """
 
     return build_ngs_ho_metric_interpolator(
-        build_ngs_ho_metric_samples_from_psfs(samples, dtype=dtype),
+        build_ngs_ho_metric_samples_from_psfs(
+            samples, dtype=dtype, preserve_normalization=preserve_normalization
+        ),
         dtype=dtype,
         interpolation_config=interpolation_config,
     )
