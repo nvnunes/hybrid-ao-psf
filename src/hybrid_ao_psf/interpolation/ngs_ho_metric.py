@@ -6,10 +6,13 @@ from collections.abc import Mapping
 from dataclasses import dataclass, field, replace
 from datetime import UTC, datetime
 from pathlib import Path
-from typing import Any
+from typing import Any, Literal
 
 import numpy as np
 from ao_stats import (
+    DEFAULT_EE_CENTER,
+    DEFAULT_FWHM_METHOD,
+    DEFAULT_FWHM_REFINEMENT_FACTOR,
     EE_GEOMETRY_ENCIRCLED,
     PsfMetadata,
     compute_psf_ee,
@@ -252,12 +255,17 @@ def build_ngs_ho_metric_samples_from_psfs(
     *,
     dtype: DTypeLike = np.float32,
     preserve_normalization: bool = False,
+    fwhm_method: str = DEFAULT_FWHM_METHOD,
+    fwhm_refinement_factor: int = DEFAULT_FWHM_REFINEMENT_FACTOR,
+    ee_center: Literal["peak", "image"] = DEFAULT_EE_CENTER,
 ) -> NgsHoMetricSamples:
     """Measure NGS-HO metrics from PSFs with explicit preprocessing control.
 
     By default, clip negative pixels and normalize each crop to unit sum.
     Set ``preserve_normalization=True`` for already-normalized source PSFs;
     metrics then retain their supplied flux without clipping or rescaling.
+    The FWHM method and refinement set the width and thus the diameter of the
+    circular EE aperture, which is centered on the peak or the image midpoint.
     """
 
     dtype = validate_psf_dtype(dtype)
@@ -283,7 +291,15 @@ def build_ngs_ho_metric_samples_from_psfs(
         compute_psf_sr(psfs, metadata, preprocess=preprocess, dtype=dtype), dtype=dtype
     )
     fwhm = np.asarray(
-        compute_psf_fwhm(psfs, metadata, preprocess=preprocess, dtype=dtype), dtype=dtype
+        compute_psf_fwhm(
+            psfs,
+            metadata,
+            fwhm_method=fwhm_method,
+            fwhm_refinement_factor=fwhm_refinement_factor,
+            preprocess=preprocess,
+            dtype=dtype,
+        ),
+        dtype=dtype,
     )
     ee_aperture_diameters = np.asarray(2.0 * fwhm, dtype=dtype).reshape(-1, 1) * u.mas
     ee = np.asarray(
@@ -292,6 +308,7 @@ def build_ngs_ho_metric_samples_from_psfs(
             metadata,
             ee_apertures=ee_aperture_diameters,
             ee_geometry=EE_GEOMETRY_ENCIRCLED,
+            ee_center=ee_center,
             preprocess=preprocess,
             dtype=dtype,
         ),
