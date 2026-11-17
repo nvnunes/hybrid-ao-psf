@@ -106,13 +106,25 @@ def estimate_sensing_statistics(
     *,
     displacement: u.Quantity,
     block_draws: int,
-    dtype=np.float32,
+    dtype: DTypeLike = np.float32,
 ) -> WfsSensingStatistics:
     """Estimate gain/noise while preserving signed pairing and population divisors.
 
     Remove the mean conditionally at this fixed input for the noise covariance,
     retaining paired x/y draws and +x,-x,+y,-y ordering. All reductions use
     the selected precision; whitened samples retain that precision.
+
+    Args:
+        samples: Zero-displacement and paired signed-shift WFS tilt draws.
+        displacement: Positive angular amplitude of each applied shift.
+        block_draws: Batch length for independent conditional-noise estimates.
+        dtype: Calculation precision, either float32 or float64.
+
+    Returns:
+        Mean, gain, covariance and paired dimensionless simulation noise samples.
+
+    Raises:
+        ValueError: If draws, displacement or batch controls are invalid.
     """
     if not isinstance(samples, SensingWfsMeasurements):
         raise TypeError("samples must be SensingWfsMeasurements")
@@ -158,7 +170,7 @@ class SensingCalibrationMeasurements(_PhysicalRecord):
         samples: Zero and signed-displacement angular WFS draws, retaining means.
         displacement: Positive scalar angular displacement amplitude.
         sampling: Effective native draw/batch counts and point seed.
-        controller: Fixed delayed-integrator settings for subsequent replay.
+        controller: Fixed delayed-integrator settings for subsequent simulation.
         photometry: Explicit incident-count conversion for this measured magnitude.
 
     No native setup or image is needed for offline statistics or rebuilding.
@@ -199,6 +211,8 @@ class SensingCalibrationMeasurements(_PhysicalRecord):
             raise TypeError(
                 "typed samples, sampling, controller and photometry required"
             )
+        if self.samples.dtype != self.dtype:
+            raise ValueError("samples precision must match measurement dtype")
         if self.samples.zero.shape != (
             self.sampling.zero_draws,
             2,
@@ -210,7 +224,12 @@ class SensingCalibrationMeasurements(_PhysicalRecord):
             object.__setattr__(self, name, value)
 
     def statistics(self) -> WfsSensingStatistics:
-        """Calculate conditional noise and paired gain estimates without native I/O."""
+        """Calculate conditional noise and paired gain estimates without native I/O.
+
+        Returns:
+            Conditional noise covariance and scalar and matrix gain estimates
+            computed from the retained draws, plus the simulation noise bank.
+        """
         return estimate_sensing_statistics(
             self.samples,
             displacement=self.displacement,
@@ -222,7 +241,16 @@ class SensingCalibrationMeasurements(_PhysicalRecord):
 def save_sensing_measurements(
     measurements: SensingCalibrationMeasurements, path: str | Path
 ) -> None:
-    """Atomically retain zero/signed draws, coordinates and effective controls."""
+    """Atomically retain zero/signed draws, coordinates and effective controls.
+
+    Args:
+        measurements: Fixed-spot WFS draws with their physical labels and controls.
+        path: Destination NPZ file. Create its parent directories if
+            needed. Atomically replace any existing destination.
+
+    Raises:
+        TypeError: If the input is not the expected calibration record.
+    """
     if not isinstance(measurements, SensingCalibrationMeasurements):
         raise TypeError("unsupported sensing measurement type")
     header = {
@@ -254,7 +282,18 @@ def save_sensing_measurements(
 
 
 def load_sensing_measurements(path: str | Path) -> SensingCalibrationMeasurements:
-    """Load strict physical WFS observations without any E2E files/software."""
+    """Load strict physical WFS observations without any E2E files/software.
+
+    Args:
+        path: Path to the saved NPZ file.
+
+    Returns:
+        Fixed-spot WFS draws with their physical labels and controls reconstructed at its stored precision.
+
+    Raises:
+        FileNotFoundError: If a required file is missing.
+        ValueError: If its schema or numerical contents are invalid.
+    """
     with np.load(Path(path), allow_pickle=False) as saved:
         header = json.loads(str(saved["__header__"]))
         validate_observation_precision(header, saved)

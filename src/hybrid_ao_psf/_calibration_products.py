@@ -5,16 +5,27 @@ from __future__ import annotations
 import hashlib
 import json
 import os
+import re
 import shutil
 import stat
 from collections.abc import Mapping
+from itertools import count
 from pathlib import Path
 from types import MappingProxyType
 from uuid import uuid4
 
 import numpy as np
 
+from ._calibration_io import _digest
 from ._io import atomic_output_path
+
+_PRODUCT_VERSIONS = {"hybrid-ao-psf-sensing-calibration": 3}
+
+_PAYLOAD_STEMS = {
+    "hybrid-ao-psf-covariance-functions": "covariance-interpolators",
+    "hybrid-ao-psf-sensing-calibration": "sensing-calibration-interpolators",
+    "hybrid-ao-psf-reconstructor-noise": "reconstructor-noise-interpolator",
+}
 
 
 def immutable_metadata(value):
@@ -40,10 +51,41 @@ def json_metadata(value):
     return value
 
 
+def payload_destination(path: Path, kind: str, digest: str) -> tuple[Path, bool]:
+    """Choose a descriptive payload path and report whether it can be reused.
+
+    An identical current payload can be reused after verifying its bytes.
+    Otherwise allocate a new name so the previous manifest stays usable until
+    publication completes. Serialized writers leave existing revisions intact.
+    """
+    stem = _PAYLOAD_STEMS[kind]
+    try:
+        current = json.loads(path.read_text())
+    except (FileNotFoundError, ValueError):
+        current = {}
+    if isinstance(current, dict) and current.get("payload_sha256") == digest:
+        name = current.get("payload")
+        pattern = rf"{re.escape(stem)}(?:-[0-9]+)?\.npz"
+        if isinstance(name, str) and re.fullmatch(pattern, name):
+            payload = path.with_name(name)
+            if (
+                payload.is_file()
+                and not payload.is_symlink()
+                and _digest(payload) == digest
+            ):
+                return payload, True
+
+    for revision in count(1):
+        name = f"{stem}.npz" if revision == 1 else f"{stem}-{revision}.npz"
+        payload = path.with_name(name)
+        if not payload.exists() and not payload.is_symlink():
+            return payload, False
+
+
 def save_product(path, kind, metadata, arrays=None):
     """Publish one model.json after its complete numeric payload is durable.
 
-    Content-named payloads keep the previously accepted manifest usable if
+    Separate payload revisions keep the previously accepted manifest usable if
     writing or replacement is interrupted. Writers must be serialized. Old
     payloads remain available for bound readers; measurements are not replaced.
     Both outputs use the existing atomic writer and file-mode convention.
@@ -51,7 +93,11 @@ def save_product(path, kind, metadata, arrays=None):
     path = Path(path).expanduser().resolve()
     if path.name != "model.json":
         raise ValueError("calibration product path must name model.json")
-    header = {"schema": kind, "version": 2, **json_metadata(metadata)}
+    header = {
+        "schema": kind,
+        "version": _PRODUCT_VERSIONS.get(kind, 2),
+        **json_metadata(metadata),
+    }
     if set(metadata) & {"schema", "version", "payload", "payload_sha256"}:
         raise ValueError("product metadata cannot replace envelope fields")
     path.parent.mkdir(parents=True, exist_ok=True)
@@ -65,12 +111,9 @@ def save_product(path, kind, metadata, arrays=None):
             temporary = Path(work) / "payload.npz"
             with temporary.open("wb") as stream:
                 np.savez_compressed(stream, **arrays)
-            with temporary.open("rb") as stream:
-                digest = hashlib.file_digest(stream, "sha256").hexdigest()
-            payload = path.parent / f"interpolators-{digest}.npz"
-            from ._calibration_io import _digest
-
-            if not payload.exists() or _digest(payload) != digest:
+            digest = _digest(temporary)
+            payload, reused = payload_destination(path, kind, digest)
+            if not reused:
                 with (
                     atomic_output_path(payload) as target,
                     temporary.open("rb") as source,
@@ -91,13 +134,24 @@ def publish_manifest(path, header, *, diagnostics=None):
     Writers must be serialized. This is not a general transaction facility.
     """
     path = Path(path)
-    texts = [(path, json.dumps(header, indent=2, allow_nan=False) + "\n")]
+    model_text = json.dumps(header, indent=2, allow_nan=False) + "\n"
+    texts = [(path, model_text)]
     if diagnostics is not None:
         texts.insert(
             0,
             (
                 path.parent / "diagnostics.json",
-                json.dumps(diagnostics, indent=2, allow_nan=False) + "\n",
+                json.dumps(
+                    {
+                        "model_sha256": hashlib.sha256(
+                            model_text.encode("utf-8")
+                        ).hexdigest(),
+                        "diagnostics": diagnostics,
+                    },
+                    indent=2,
+                    allow_nan=False,
+                )
+                + "\n",
             ),
         )
     previous = {}
@@ -113,7 +167,7 @@ def publish_manifest(path, header, *, diagnostics=None):
                 previous[target] = None
         for target, text in texts:
             with atomic_output_path(target) as temporary:
-                temporary.write_text(text)
+                temporary.write_text(text, encoding="utf-8", newline="\n")
     except BaseException as error:
         recovery = []
         for target, backup in previous.items():
@@ -139,18 +193,19 @@ def publish_manifest(path, header, *, diagnostics=None):
 
 def load_product(path, kind):
     """Read the exact envelope and verify payload identity before numeric loading."""
-    from ._calibration_io import read_calibration_artifact_identity
+    from ._calibration_io import read_calibration_product_identity
 
     path = Path(path).expanduser().resolve()
-    identity = read_calibration_artifact_identity(path)
+    identity = read_calibration_product_identity(path)
     header = json.loads(path.read_text())
+    versions = (_PRODUCT_VERSIONS[kind],) if kind in _PRODUCT_VERSIONS else (1, 2)
     if (
         header.get("schema") != kind
         or type(header.get("version")) is not int
-        or header["version"] not in (1, 2)
+        or header["version"] not in versions
     ):
         raise ValueError(f"unsupported {kind} product schema")
-    if header["version"] == 2:
+    if header["version"] >= 2:
         if (
             header.get("precision") not in ("float32", "float64")
             or header.get("support_precision", header.get("precision"))
@@ -165,7 +220,7 @@ def load_product(path, kind):
     if "payload" in header:
         with np.load(path.parent / header["payload"], allow_pickle=False) as saved:
             arrays = {key: saved[key] for key in saved.files}
-        if header["version"] == 2 and any(
+        if header["version"] >= 2 and any(
             (
                 value.dtype != np.dtype(bool)
                 if name in {"measured_mask", "support"}

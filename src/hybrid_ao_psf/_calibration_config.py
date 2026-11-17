@@ -90,16 +90,16 @@ class ComaCalibrationSettings:
 
 @dataclass(frozen=True, kw_only=True)
 class SensingCalibrationSettings(_PhysicalRecord):
-    """Fixed-spot draw and offline command-replay controls.
+    """Fixed-spot draw and offline command-simulation controls.
 
     Attributes:
         zero_draws: Draws for conditional noise statistics.
         gain_draws: Draws per signed displacement.
         block_draws: Equal native batch length.
-        seed: Native draw/replay seed, below 2**31.
-        replay_realizations: Independent command histories per case.
-        replay_frames: Retained replay frames after settling.
-        discard_frames: Initial replay frames excluded from statistics.
+        seed: Native draw/simulation seed, below 2**31.
+        noise_realizations: Independent command histories per case.
+        noise_frames: Retained simulation frames after settling.
+        discard_frames: Initial simulation frames excluded from statistics.
         displacement: Positive scalar angular imposed displacement amplitude.
     """
 
@@ -107,8 +107,8 @@ class SensingCalibrationSettings(_PhysicalRecord):
     gain_draws: int = 16384
     block_draws: int = 1024
     seed: int = 261013700
-    replay_realizations: int = 8
-    replay_frames: int = 8192
+    noise_realizations: int = 8
+    noise_frames: int = 8192
     discard_frames: int = 512
     displacement: u.Quantity = field(default_factory=lambda: 10.0 * u.mas)
 
@@ -119,11 +119,11 @@ class SensingCalibrationSettings(_PhysicalRecord):
             block_draws=self.block_draws,
             seed=self.seed,
         )
-        for name in ("replay_realizations", "replay_frames", "discard_frames"):
+        for name in ("noise_realizations", "noise_frames", "discard_frames"):
             _count(getattr(self, name), name)
         displacement = _quantity(self.displacement, u.mas, "displacement", 0)
-        if self.replay_frames < 4 or displacement.value <= 0:
-            raise ValueError("need >=4 replay frames and positive finite displacement")
+        if self.noise_frames < 4 or displacement.value <= 0:
+            raise ValueError("need >=4 simulation frames and positive finite displacement")
         object.__setattr__(self, "displacement", displacement)
 
 
@@ -181,7 +181,7 @@ class E2ECalibrationConfiguration:
         ngs_metrics: NGS HO metric interpolator path for reconstruction.
         covariance: Effective common bank controls.
         coma: Effective response controls.
-        sensing: Effective fixed-spot/replay controls.
+        sensing: Effective fixed-spot/simulation controls.
         reconstructor: Effective prior controls.
 
     Paths are resolved relative to the INI, without opening them. Loading this
@@ -252,6 +252,20 @@ class E2ECalibrationConfiguration:
 
         Omit an option to retain its existing value. Unknown fields and explicit
         invalid values raise; callers should omit absent CLI options entirely.
+
+        Args:
+            dtype: Optional calculation precision override.
+            covariance: Overrides for named covariance settings.
+            coma: Overrides for named coma settings.
+            sensing: Overrides for named sensing settings.
+            reconstructor: Overrides for named reconstructor settings.
+
+        Returns:
+            A new validated configuration with the same input and output paths.
+
+        Raises:
+            ValueError: If an override changes a field to an unsupported value.
+            TypeError: If an override names an unsupported setting.
         """
         updates = {} if dtype is None else {"dtype": validate_psf_dtype(dtype)}
         for name, override in [
@@ -290,6 +304,16 @@ def load_e2e_calibration_configuration(path: str | Path) -> E2ECalibrationConfig
     in owned sections raise. Values use Python literals; enum strings may be
     unquoted. Fixed controller and photometry settings are supplied by the
     configured native adapter, then saved with accepted products.
+
+    Args:
+        path: Shared calibration INI. Relative file paths resolve from its directory.
+
+    Returns:
+        Effective settings and resolved file paths for calibration and prediction.
+
+    Raises:
+        FileNotFoundError: If the INI is missing.
+        ValueError: If required keys are missing or owned settings are invalid.
     """
     source = Path(path).expanduser().resolve()
     parser = ConfigParser(interpolation=None)

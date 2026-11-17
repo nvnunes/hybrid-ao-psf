@@ -82,6 +82,8 @@ class ComaCalibrationMeasurements(_PhysicalRecord):
             or not isinstance(self.settings, ComaCalibrationSettings)
         ):
             raise TypeError("typed response, photometry and coma settings required")
+        if self.response.dtype != self.dtype:
+            raise ValueError("response precision must match measurement dtype")
         batches = self.response.tilt_batches.shape[2]
         if (
             len(self.response.coma) != self.settings.samples
@@ -168,8 +170,18 @@ class ComaResponseModel(_PhysicalRecord):
         for name, value in values.items():
             object.__setattr__(self, name, value)
 
-    def prepare(self, *, dtype=np.float32) -> ComaResponseModel:
-        """Copy runtime coefficients while retaining producer precision."""
+    def prepare(self, *, dtype: DTypeLike = np.float32) -> ComaResponseModel:
+        """Copy runtime coefficients while retaining producer precision.
+
+        Args:
+            dtype: Numerical precision, either float32 or float64.
+
+        Returns:
+            A separate response model with the same measured support at the requested precision.
+
+        Raises:
+            ValueError: If the precision is unsupported or conversion invalidates support.
+        """
         return replace(
             self,
             dtype=validate_psf_dtype(dtype),
@@ -181,6 +193,17 @@ class ComaResponseModel(_PhysicalRecord):
 
         Require finite physical magnitude/angle values inside actual measured
         support. The caller uses this model's explicit magnitude convention.
+
+        Args:
+            magnitude: Magnitude quantities in the calibrated photometric convention.
+            zenith_angle: Angular viewing coordinate, broadcast with magnitude.
+
+        Returns:
+            Angular WFS tilt per unit primary-coma OPD, in milliarcseconds per nanometre.
+
+        Raises:
+            TypeError: If a required physical quantity is missing.
+            ValueError: If query values or units are invalid or outside measured support.
         """
         if not isinstance(magnitude, u.Quantity) or not isinstance(
             zenith_angle, u.Quantity
@@ -255,7 +278,7 @@ def build_coma_calibration(
     *,
     heldout_zenith: u.Quantity | None = 30 * u.deg,
     bootstrap_seed: int | None = None,
-    dtype=np.float32,
+    dtype: DTypeLike = np.float32,
 ) -> ComaCalibrationResult:
     """Estimate each plane and fit the retained joint response law offline.
 
@@ -267,6 +290,18 @@ def build_coma_calibration(
     bootstrap_seed=None retains each recorded fit seed; an explicit uint32
     seed changes resampling without reacquiring WFS observations. No wavefront
     images, native files or calibration subclass are required.
+
+    Args:
+        measurements: Compatible paired WFS measurements by zenith plane.
+        heldout_zenith: Optional measured zenith angle for a withheld-plane check.
+        bootstrap_seed: Optional override for the resampling seed.
+        dtype: Numerical precision, either float32 or float64.
+
+    Returns:
+        The fitted response law and fit and resampling diagnostics.
+
+    Raises:
+        ValueError: If the inputs conflict or do not span the response fit.
     """
     if bootstrap_seed is not None:
         from ._calibration_contracts import _count
@@ -365,7 +400,16 @@ def build_coma_calibration(
 
 
 def save_coma_calibration(model: ComaResponseModel, path: str | Path) -> None:
-    """Atomically publish a JSON-only response model with physical support."""
+    """Atomically publish a JSON-only response model with physical support.
+
+    Args:
+        model: The fitted primary-coma response and its measured support.
+        path: Destination model.json manifest. Create its parent directories if
+            needed. Atomically replace any existing destination.
+
+    Raises:
+        TypeError: If the input is not the expected calibration record.
+    """
     if not isinstance(model, ComaResponseModel):
         raise TypeError("model must be ComaResponseModel")
     save_product(
@@ -391,7 +435,18 @@ def save_coma_calibration(model: ComaResponseModel, path: str | Path) -> None:
 
 
 def load_coma_calibration(path: str | Path) -> ComaResponseModel:
-    """Load exactly the shared response schema; never search native output trees."""
+    """Load exactly the shared response schema; never search native output trees.
+
+    Args:
+        path: Path to the saved model.json manifest.
+
+    Returns:
+        The fitted primary-coma response and its measured support reconstructed at its stored precision.
+
+    Raises:
+        FileNotFoundError: If a required file is missing.
+        ValueError: If its schema or numerical contents are invalid.
+    """
     header, arrays = load_product(path, _KIND)
     if (
         arrays is not None
@@ -435,7 +490,16 @@ def load_coma_calibration(path: str | Path) -> ComaResponseModel:
 def save_coma_measurements(
     measurements: ComaCalibrationMeasurements, path: str | Path
 ) -> None:
-    """Atomically save sufficient paired observations and effective numerical controls."""
+    """Atomically save sufficient paired observations and effective numerical controls.
+
+    Args:
+        measurements: Paired coma observations with their fit controls.
+        path: Destination NPZ file. Create its parent directories if
+            needed. Atomically replace any existing destination.
+
+    Raises:
+        TypeError: If the input is not the expected calibration record.
+    """
     if not isinstance(measurements, ComaCalibrationMeasurements):
         raise TypeError("unsupported coma measurement type")
     header = {
@@ -457,7 +521,18 @@ def save_coma_measurements(
 
 
 def load_coma_measurements(path: str | Path) -> ComaCalibrationMeasurements:
-    """Load strict paired response observations without wavefront/native resources."""
+    """Load strict paired response observations without wavefront/native resources.
+
+    Args:
+        path: Path to the saved NPZ file.
+
+    Returns:
+        Paired coma observations with their fit controls reconstructed at its stored precision.
+
+    Raises:
+        FileNotFoundError: If a required file is missing.
+        ValueError: If its schema or numerical contents are invalid.
+    """
     with np.load(Path(path), allow_pickle=False) as saved:
         header = json.loads(str(saved["__header__"]))
         validate_observation_precision(header, saved)

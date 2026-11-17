@@ -82,6 +82,14 @@ def save_calibration_samples(
     units and record kind. It contains no pickle/native setup/source identities.
     It is reusable input, not a fitted model. Existing destinations survive
     failed/interrupted writes and retain their permission bits.
+
+    Args:
+        samples: The typed physical sample record.
+        path: Destination NPZ file. Create its parent directories if
+            needed. Atomically replace any existing destination.
+
+    Raises:
+        TypeError: If the input is not the expected calibration record.
     """
     for kind, (cls, units) in _SAMPLE_SCHEMAS.items():
         if type(samples) is cls:
@@ -112,7 +120,7 @@ def save_calibration_samples(
 def validate_observation_precision(header, saved, *, history_fields=()):
     """Reject missing/mismatched v2 declarations before coercing constructors.
 
-    Replay history fields retain their actual captured precision independently
+    Simulation history fields retain their actual captured precision independently
     of calculation precision, including legacy histories rewritten as v2.
     """
     if not isinstance(header, dict):
@@ -150,6 +158,16 @@ def load_calibration_samples(
     Native and historical measurement formats are rejected. The downstream
     one-time importer owns conversion from accepted older local records.
     Returns the corresponding immutable physical observation type.
+
+    Args:
+        path: Path to the saved NPZ file.
+
+    Returns:
+        The typed physical sample record reconstructed at its stored precision.
+
+    Raises:
+        FileNotFoundError: If a required file is missing.
+        ValueError: If its schema or numerical contents are invalid.
     """
     with np.load(Path(path), allow_pickle=False) as saved:
         if "__header__" not in saved.files or saved["__header__"].ndim != 0:
@@ -216,7 +234,7 @@ class CalibrationFileIdentity:
 
 
 @dataclass(frozen=True)
-class CalibrationArtifactIdentity:
+class CalibrationProductIdentity:
     """Immutable runtime content binding for one fitted product.
 
     Attributes:
@@ -242,7 +260,7 @@ class CalibrationArtifactIdentity:
             raise TypeError("payloads must contain CalibrationFileIdentity values")
         paths = [self.entrypoint.path, *(value.path for value in values)]
         if len(set(paths)) != len(paths):
-            raise ValueError("artifact file identities must be distinct")
+            raise ValueError("product file identities must be distinct")
         object.__setattr__(self, "payloads", values)
 
     def verify(self) -> None:
@@ -252,13 +270,24 @@ class CalibrationArtifactIdentity:
             identity.verify()
 
 
-def read_calibration_artifact_identity(path: str | Path) -> CalibrationArtifactIdentity:
+def read_calibration_product_identity(path: str | Path) -> CalibrationProductIdentity:
     """Read model.json identity and verify its optional relative NPZ payload.
 
     Shared fitted schemas use payload and payload_sha256 together, or neither
     for JSON-only products. This checks content binding, not the scientific
     schema, coefficients, units or support; each fitted loader validates those.
     Changed manifest bytes during the read or mismatched payload digests raise.
+
+    Args:
+        path: Path to the fitted product's model.json manifest.
+
+    Returns:
+        The resolved manifest and optional payload identities with their SHA-256 digests.
+
+    Raises:
+        FileNotFoundError: If the manifest or payload is missing.
+        TypeError: If the manifest does not contain an object.
+        ValueError: If the path, manifest fields or checked content identity is invalid.
     """
     path = Path(path).expanduser().resolve()
     if path.name != "model.json":
@@ -284,7 +313,7 @@ def read_calibration_artifact_identity(path: str | Path) -> CalibrationArtifactI
         if not payload.is_relative_to(path.parent):
             raise ValueError("payload must remain within the product directory")
         payloads = (CalibrationFileIdentity(payload, header["payload_sha256"]),)
-    identity = CalibrationArtifactIdentity(
+    identity = CalibrationProductIdentity(
         CalibrationFileIdentity(path, hashlib.sha256(raw).hexdigest()), payloads
     )
     identity.verify()

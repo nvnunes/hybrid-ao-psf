@@ -79,6 +79,15 @@ class FixedGainIntegrator(_PhysicalRecord):
         response is the finite dimensionless 2-by-2 reconstructed sensing
         matrix. History blocks run newest to oldest. Unstable loops raise
         ValueError; the returned array is newly owned by the caller.
+
+        Args:
+            response: Reconstructed dimensionless feedback matrix of shape ``(2, 2)``.
+
+        Returns:
+            Command-history transition with shape ``(2*delay, 2*delay)``.
+
+        Raises:
+            ValueError: If the response is invalid or the loop is unstable.
         """
         from ._calibration_numerics import integrator_transition
 
@@ -87,7 +96,7 @@ class FixedGainIntegrator(_PhysicalRecord):
     def filter(
         self, history: u.Quantity, response: np.ndarray, *, equilibrium: bool = False
     ) -> u.Quantity:
-        """Replay delayed inputs independently across realizations.
+        """Filter delayed inputs independently across realizations.
 
         history has shape (realizations,frames,2), angular or OPD units.
         response is the dimensionless 2-by-2 feedback matrix. Return commands
@@ -96,6 +105,18 @@ class FixedGainIntegrator(_PhysicalRecord):
         holds each first input constant before the first frame. No centring or
         settling cut is applied. Coupled responses are retained exactly, including
         nonsymmetric terms.
+
+        Args:
+            history: Input history with shape ``(realizations, frames, 2)``.
+            response: Reconstructed dimensionless feedback matrix.
+            equilibrium: Start from steady state under the first input of each realization.
+
+        Returns:
+            Command history with the same shape and physical units as the input.
+
+        Raises:
+            TypeError: If history is not an Astropy quantity.
+            ValueError: If history, response or feedback stability is invalid.
         """
         from ._calibration_numerics import filter_input
 
@@ -138,6 +159,18 @@ class FixedGainIntegrator(_PhysicalRecord):
         reconstructed_noise is a finite symmetric PSD 2-by-2 angular-squared
         quantity, independent between frames. Return command covariance in
         mas squared. The supplied response is the actual feedback matrix.
+
+        Args:
+            response: Actual reconstructed dimensionless feedback matrix.
+            reconstructed_noise: Per-frame stationary x/y input covariance in
+                angular-squared units.
+
+        Returns:
+            A ``(2, 2)`` angular command covariance in square milliarcseconds.
+
+        Raises:
+            TypeError: If reconstructed noise is not an Astropy quantity.
+            ValueError: If covariance, response or feedback stability is invalid.
         """
         from ._calibration_numerics import integrator_noise_covariance
 
@@ -187,10 +220,24 @@ class CalibrationPhotometry(_PhysicalRecord):
         object.__setattr__(self, "photons_per_frame_zeropoint", count)
 
     def photons_per_frame(self, magnitudes: u.Quantity) -> u.Quantity:
-        """Return incident counts for finite magnitude values in this convention."""
+        """Return incident counts for finite magnitude values in this convention.
+
+        Args:
+            magnitudes: Real finite magnitudes in this convention.
+
+        Returns:
+            Incident photon counts per frame, preserving the input shape.
+
+        Raises:
+            TypeError: If magnitudes is not an Astropy quantity.
+            ValueError: If magnitudes or resulting photon counts are invalid.
+        """
         if not isinstance(magnitudes, u.Quantity):
             raise TypeError("magnitudes must be an Astropy Quantity")
-        values = np.asarray(magnitudes.to_value(u.mag), dtype=self.dtype)
+        values = np.asarray(magnitudes.to_value(u.mag))
+        if values.dtype.kind not in "fiu":
+            raise ValueError("magnitudes must be real")
+        values = values.astype(self.dtype, copy=False)
         if not np.isfinite(values).all():
             raise ValueError("magnitudes must be finite")
         result = self.photons_per_frame_zeropoint * 10.0 ** (-0.4 * values)
@@ -381,10 +428,15 @@ class SensingSpot(_PhysicalRecord):
             or min(image.shape) < 2
             or not np.isfinite(image).all()
             or np.any(image < 0)
-            or image.sum() <= 0
         ):
             raise ValueError("image must be a positive finite 2D light-fraction image")
-        image = np.asarray(image, dtype=self.dtype, order="C")
+        with np.errstate(over="ignore", under="ignore"):
+            image = np.asarray(image, dtype=self.dtype, order="C")
+            flux = image.sum()
+        if not np.isfinite(flux) or flux <= 0:
+            raise ValueError(
+                "image flux must be positive and finite at the configured precision"
+            )
         object.__setattr__(
             self,
             "image",

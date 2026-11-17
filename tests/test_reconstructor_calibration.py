@@ -4,6 +4,7 @@ import json
 import subprocess
 import sys
 from contextlib import contextmanager
+from dataclasses import replace
 
 import numpy as np
 import pytest
@@ -78,6 +79,9 @@ def test_measure_offline_build_roundtrip_and_support(calibration, tmp_path, sepa
         fwhm=np.geomspace(0.08, 0.32, 4) * u.arcsec,
         ee=np.array([0.2, 0.5, 1]) * u.one if separate else None,
     )
+    inputs = replace(measured.inputs, dtype=np.float32)
+    with pytest.raises(ValueError, match="inputs precision must match"):
+        replace(measured, inputs=inputs)
     measurement = tmp_path / "measurements.npz"
     save_reconstructor_measurements(measured, measurement)
     restored = load_reconstructor_measurements(measurement)

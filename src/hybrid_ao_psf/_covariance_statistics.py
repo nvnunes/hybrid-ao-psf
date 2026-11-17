@@ -95,7 +95,7 @@ def features(
     differences between the mean displacements of separate realizations.
     """
     if telemetry.tilt.shape[-1] - settings.discard < 3:
-        raise ValueError("Insufficient retained frames after replay settling")
+        raise ValueError("Insufficient retained frames after simulation settling")
     ft = np.stack(
         [
             scalar_filter(telemetry.tilt, b, settings.gain, settings.delay)

@@ -1,5 +1,7 @@
 """Independent response observations and native-free coma law calibration."""
 
+from dataclasses import replace
+
 import numpy as np
 import pytest
 from astropy import units as u
@@ -46,6 +48,11 @@ def measurement(angle):
         settings=ComaCalibrationSettings(samples=32, noise_draws=16),
         dtype=np.float64,
     )
+
+
+def test_coma_measurements_reject_mismatched_response_precision():
+    with pytest.raises(ValueError, match="response precision must match"):
+        replace(measurement(20), dtype=np.float32)
 
 
 def test_offline_coma_build_preserves_scalar_matrix_and_noise_diagnostics(tmp_path):

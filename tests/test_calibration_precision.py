@@ -198,8 +198,8 @@ def test_coma_fit_precision_roundtrip_and_runtime_preparation(tmp_path, dtype):
 def test_noise_blur_analytic_derivatives_and_fit(dtype):
     from hybrid_ao_psf import NoiseBlurModel
     from hybrid_ao_psf._sensing_statistics import (
-        ReplayCase,
-        ReplayStatistics,
+        NoiseDisplacementCase,
+        NoiseDisplacementStatistics,
         _bin_probability,
         _bin_probability_gradient,
         fit_noise_blur,
@@ -237,11 +237,11 @@ def test_noise_blur_analytic_derivatives_and_fit(dtype):
                 )
     truth = NoiseBlurModel(0.7, 0.4, 0.8, dtype=np.float64)
     cases = [
-        ReplayCase(
+        NoiseDisplacementCase(
             str(n),
             n,
             "synthetic",
-            ReplayStatistics(
+            NoiseDisplacementStatistics(
                 _bin_probability(truth, n).astype(dtype),
                 np.zeros((4, 257), dtype=dtype),
                 0.0,

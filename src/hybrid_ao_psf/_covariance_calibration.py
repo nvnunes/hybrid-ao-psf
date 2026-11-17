@@ -10,7 +10,7 @@ from types import MappingProxyType
 
 import numpy as np
 from astropy import units as u
-from numpy.typing import DTypeLike
+from numpy.typing import ArrayLike, DTypeLike, NDArray
 from scipy.interpolate import RegularGridInterpolator
 
 from ._calibration_config import CovarianceCalibrationSettings
@@ -54,23 +54,7 @@ _MEASUREMENTS = "hybrid-ao-psf-covariance-measurements"
 _UNITS = {name: spec[2] for name, spec in FUNCTIONS.items()}
 
 
-def _readonly(value, dtype=None):
-    value = np.ascontiguousarray(value, dtype=dtype)
-    return np.frombuffer(value.tobytes(), dtype=value.dtype).reshape(value.shape)
-
-
-def _window(controller, settings):
-    cut, envelope = settling_cut(
-        controller.gain,
-        controller.delay,
-        settings.feedback,
-        tolerance=settings.settling_tolerance,
-        maximum=settings.maximum_discard,
-        dtype=controller.dtype,
-    )
-    return FilterSettings(
-        settings.feedback, controller.gain, controller.delay, cut
-    ), envelope
+# Measured covariance planes
 
 
 @dataclass(frozen=True, kw_only=True, eq=False)
@@ -159,12 +143,51 @@ class CovarianceCalibrationMeasurements(_PhysicalRecord):
         return value
 
 
+# Measure covariance planes
+
+
+def _window(controller, settings):
+    cut, envelope = settling_cut(
+        controller.gain,
+        controller.delay,
+        settings.feedback,
+        tolerance=settings.settling_tolerance,
+        maximum=settings.maximum_discard,
+        dtype=controller.dtype,
+    )
+    return FilterSettings(
+        settings.feedback, controller.gain, controller.delay, cut
+    ), envelope
+
+
+def _sampling_moments(
+    filtered_histories: tuple[np.ndarray, np.ndarray, np.ndarray],
+    direction_indices: np.ndarray,
+    feedback_indices: list[int],
+) -> tuple[np.ndarray, np.ndarray]:
+    """Retain per-realization moments on a bounded grid for sampling checks."""
+    tilt, filtered_tilt, filtered_coma = (
+        history[direction_indices] for history in filtered_histories
+    )
+    num_frames = tilt.shape[-1]
+    vectors = np.concatenate(
+        [
+            tilt.reshape(-1, num_frames),
+            filtered_tilt[:, feedback_indices].reshape(-1, num_frames),
+            filtered_coma[:, feedback_indices].reshape(-1, num_frames),
+        ]
+    )
+    mean = vectors.mean(axis=-1)
+    centred = vectors - mean[:, None]
+    return centred @ centred.T / num_frames, mean
+
+
 def measure_covariance_calibration(
     telemetry: CovarianceTelemetry,
     controller: FixedGainIntegrator,
     *,
     settings: CovarianceCalibrationSettings | None = None,
-    dtype=np.float32,
+    dtype: DTypeLike = np.float32,
 ) -> CovarianceCalibrationMeasurements:
     """Measure six functions from aligned histories with independent LO resets.
 
@@ -173,6 +196,21 @@ def measure_covariance_calibration(
     terms and one pooled retained-sample mean. Report bounded same-realization
     interpolation errors and whole-realization sampling uncertainty separately.
     No native modules, files or instrument metadata are required.
+
+    Args:
+        telemetry: Aligned atmospheric tilt and residual coma for independent
+            realizations of one zenith plane.
+        controller: Fixed gain, delay and frame rate of the sampled system.
+        settings: Feedback grid and settling and sampling controls. Uses
+            CovarianceCalibrationSettings defaults when omitted.
+        dtype: Precision of filtering, measurement and output.
+
+    Returns:
+        Six measured covariance tables and diagnostics for the plane.
+
+    Raises:
+        TypeError: If inputs are not the required typed records.
+        ValueError: If cadence, settling or numerical checks fail.
     """
     if not isinstance(telemetry, CovarianceTelemetry) or not isinstance(
         controller, FixedGainIntegrator
@@ -187,7 +225,7 @@ def measure_covariance_calibration(
         raise ValueError("telemetry and controller frame rates differ")
     window, _ = _window(controller, settings)
     if telemetry.tilt.shape[1] - window.discard < 3:
-        raise ValueError("insufficient frames after replay settling")
+        raise ValueError("insufficient frames after simulation settling")
 
     def histories():
         for index in range(len(telemetry.tilt)):
@@ -214,27 +252,23 @@ def measure_covariance_calibration(
     grams = []
     means = []
     interpolation = None
+    direction_count = len(telemetry.positions)
+    direction_indices = np.linspace(
+        0, direction_count - 1, min(3, direction_count), dtype=int
+    )
+    feedback_count = len(window.strengths)
+    feedback_indices = sorted({0, feedback_count // 2, feedback_count - 1})
     for source in histories():
         if interpolation is None:
             interpolation = InterpolationDiagnostics(source, window)
-        values = features(source, window)
-        accumulator.add(values)
+        filtered_histories = features(source, window)
+        accumulator.add(filtered_histories)
         interpolation.add(source)
-        selection = np.linspace(
-            0, len(source.positions) - 1, min(3, len(source.positions)), dtype=int
+        gram, mean = _sampling_moments(
+            filtered_histories, direction_indices, feedback_indices
         )
-        b_indices = sorted({0, len(window.strengths) // 2, len(window.strengths) - 1})
-        t, ft, fc = (a[selection] for a in values)
-        vector = np.concatenate(
-            [
-                t.reshape(-1, t.shape[-1]),
-                ft[:, b_indices].reshape(-1, t.shape[-1]),
-                fc[:, b_indices].reshape(-1, t.shape[-1]),
-            ]
-        )
-        means.append(vector.mean(-1))
-        vector = vector - vector.mean(-1, keepdims=True)
-        grams.append(vector @ vector.T / vector.shape[-1])
+        grams.append(gram)
+        means.append(mean)
     tables = accumulator.tables()
     diagnostics = {
         "pilot": pilot,
@@ -244,8 +278,8 @@ def measure_covariance_calibration(
         "precision": precision_report(
             np.array(grams),
             np.array(means),
-            direction_count=len(selection),
-            strength_count=len(b_indices),
+            direction_count=len(direction_indices),
+            strength_count=len(feedback_indices),
             bootstrap_draws=settings.bootstrap_draws,
             seed=settings.seed,
         ),
@@ -276,6 +310,14 @@ def measure_covariance_calibration(
         },
         diagnostics=diagnostics,
     )
+
+
+# Fitted covariance bank and physical queries
+
+
+def _readonly(value, dtype=None):
+    value = np.ascontiguousarray(value, dtype=dtype)
+    return np.frombuffer(value.tobytes(), dtype=value.dtype).reshape(value.shape)
 
 
 class _CovarianceBank:
@@ -395,8 +437,39 @@ class CovarianceFunctions:
 
     @classmethod
     def _from_arrays(
-        cls, arrays, controller, discard, producer_dtype=None, support_precision=None
-    ):
+        cls,
+        arrays: Mapping[str, NDArray],
+        controller: FixedGainIntegrator,
+        discard: int,
+        producer_dtype: DTypeLike | None = None,
+        support_precision: DTypeLike | None = None,
+    ) -> CovarianceFunctions:
+        """Validate and own a rectangular bank for build, load, and preparation.
+
+        Args:
+            arrays: Airmass and zenith-in-degrees axes for the same planes, x/y
+                axes in arcseconds, and dimensionless feedback strengths. The
+                six normalized tables use axis order ``(airmass, x1, y1, x2, y2,
+                [b1], [b2], 2, 2)``. Include a feedback axis for each filtered
+                input, in left-to-right order. The final axes are physical x/y
+                covariance components, with units given by ``FUNCTIONS``. The
+                ``(x, y)`` measured mask and source-index map identify which
+                rectangular nodes come from each measured direction.
+            controller: Fixed integrator used to measure all planes.
+            discard: Number of settling frames removed from each history.
+            producer_dtype: Original calibration precision, if recorded.
+            support_precision: Coarsest precision already retained for support
+                comparisons. The bank uses the coarsest of this, producer
+                precision, and the current table dtype.
+
+        Returns:
+            A provider with read-only array copies and interpolators at the
+            precision of the supplied covariance tables.
+
+        Raises:
+            ValueError: If grid support, mapping, table shapes, precision, or
+                settling metadata are inconsistent.
+        """
         dtype = validate_psf_dtype(arrays["C_t_t"].dtype)
         if set(arrays) != set(FUNCTIONS) | {
             "x_arcsec",
@@ -494,21 +567,6 @@ class CovarianceFunctions:
         """Coarsest coordinate precision retained through preparation and loading."""
         return self._support_precision
 
-    def prepare(self, *, dtype=np.float32) -> CovarianceFunctions:
-        """Copy runtime arrays without rewriting the source or producer record."""
-        dtype = validate_psf_dtype(dtype)
-        arrays = {
-            name: value.astype(dtype) if value.dtype.kind == "f" else value.copy()
-            for name, value in self._bank.arrays.items()
-        }
-        return self._from_arrays(
-            arrays,
-            replace(self.controller, dtype=dtype),
-            self.discard,
-            self.producer_dtype,
-            self.support_precision,
-        )
-
     @property
     def controller(self) -> FixedGainIntegrator:
         """Return the fixed numerical controller shared by every calibrated plane."""
@@ -553,6 +611,32 @@ class CovarianceFunctions:
             }
         )
 
+    def prepare(self, *, dtype: DTypeLike = np.float32) -> CovarianceFunctions:
+        """Copy runtime arrays without rewriting the source or producer record.
+
+        Args:
+            dtype: Float32 or float64 for query calculations.
+
+        Returns:
+            A separate provider with the same support and controller.
+
+        Raises:
+            ValueError: If the precision is unsupported or rounding collapses
+                the calibrated grid.
+        """
+        dtype = validate_psf_dtype(dtype)
+        arrays = {
+            name: value.astype(dtype) if value.dtype.kind == "f" else value.copy()
+            for name, value in self._bank.arrays.items()
+        }
+        return self._from_arrays(
+            arrays,
+            replace(self.controller, dtype=dtype),
+            self.discard,
+            self.producer_dtype,
+            self.support_precision,
+        )
+
     def _evaluate(self, name, coordinates, zenith_angle):
         if not all(
             isinstance(value, u.Quantity) for value in coordinates[:4]
@@ -583,7 +667,24 @@ class CovarianceFunctions:
         *,
         zenith_angle: u.Quantity,
     ) -> u.Quantity:
-        """Return unfiltered atmospheric tilt covariance, in mas squared."""
+        """Return unfiltered atmospheric tilt covariance, in mas squared.
+
+        Args:
+            x1: First field direction's x-coordinate in angular units.
+            y1: First field direction's y-coordinate in angular units.
+            x2: Second field direction's x-coordinate in angular units.
+            y2: Second field direction's y-coordinate in angular units.
+            zenith_angle: Observation zenith angle in angular units.
+
+        Returns:
+            Covariance in square milliarcseconds, with shape
+            ``(*broadcast_shape, 2, 2)``. Matrix rows follow the first direction's
+            x/y components and columns follow the second's.
+
+        Raises:
+            TypeError: If field coordinates or zenith angle lack physical quantities.
+            ValueError: If inputs cannot broadcast or are outside calibrated support.
+        """
         return self._evaluate("C_t_t", [x1, y1, x2, y2], zenith_angle)
 
     def C_Tc_Tc(
@@ -592,12 +693,31 @@ class CovarianceFunctions:
         y1: u.Quantity,
         x2: u.Quantity,
         y2: u.Quantity,
-        b1,
-        b2,
+        b1: ArrayLike | u.Quantity,
+        b2: ArrayLike | u.Quantity,
         *,
         zenith_angle: u.Quantity,
     ) -> u.Quantity:
-        """Return filtered primary-coma covariance, in nm squared OPD."""
+        """Return filtered primary-coma covariance, in nm squared OPD.
+
+        Args:
+            x1: First field direction's x-coordinate in angular units.
+            y1: First field direction's y-coordinate in angular units.
+            x2: Second field direction's x-coordinate in angular units.
+            y2: Second field direction's y-coordinate in angular units.
+            b1: Dimensionless loop feedback for the first direction.
+            b2: Dimensionless loop feedback for the second direction.
+            zenith_angle: Observation zenith angle in angular units.
+
+        Returns:
+            Covariance in square nanometres of OPD, with shape
+            ``(*broadcast_shape, 2, 2)``. Matrix rows follow the first direction's
+            x/y components and columns follow the second's.
+
+        Raises:
+            TypeError: If field coordinates or zenith angle lack physical quantities.
+            ValueError: If inputs cannot broadcast or are outside calibrated support.
+        """
         return self._evaluate("C_Tc_Tc", [x1, y1, x2, y2, b1, b2], zenith_angle)
 
     def C_t_Tc(
@@ -606,11 +726,29 @@ class CovarianceFunctions:
         y1: u.Quantity,
         x2: u.Quantity,
         y2: u.Quantity,
-        b2,
+        b2: ArrayLike | u.Quantity,
         *,
         zenith_angle: u.Quantity,
     ) -> u.Quantity:
-        """Return atmospheric tilt versus filtered coma covariance, in mas*nm."""
+        """Return atmospheric tilt versus filtered coma covariance, in mas*nm.
+
+        Args:
+            x1: First field direction's x-coordinate in angular units.
+            y1: First field direction's y-coordinate in angular units.
+            x2: Second field direction's x-coordinate in angular units.
+            y2: Second field direction's y-coordinate in angular units.
+            b2: Dimensionless loop feedback for the second direction.
+            zenith_angle: Observation zenith angle in angular units.
+
+        Returns:
+            Covariance in milliarcseconds times nanometres of OPD, with shape
+            ``(*broadcast_shape, 2, 2)``. Matrix rows follow the first direction's
+            x/y components and columns follow the second's.
+
+        Raises:
+            TypeError: If field coordinates or zenith angle lack physical quantities.
+            ValueError: If inputs cannot broadcast or are outside calibrated support.
+        """
         return self._evaluate("C_t_Tc", [x1, y1, x2, y2, b2], zenith_angle)
 
     def C_Tt_Tc(
@@ -619,12 +757,31 @@ class CovarianceFunctions:
         y1: u.Quantity,
         x2: u.Quantity,
         y2: u.Quantity,
-        b1,
-        b2,
+        b1: ArrayLike | u.Quantity,
+        b2: ArrayLike | u.Quantity,
         *,
         zenith_angle: u.Quantity,
     ) -> u.Quantity:
-        """Return filtered tilt versus filtered coma covariance, in mas*nm."""
+        """Return filtered tilt versus filtered coma covariance, in mas*nm.
+
+        Args:
+            x1: First field direction's x-coordinate in angular units.
+            y1: First field direction's y-coordinate in angular units.
+            x2: Second field direction's x-coordinate in angular units.
+            y2: Second field direction's y-coordinate in angular units.
+            b1: Dimensionless loop feedback for the first direction.
+            b2: Dimensionless loop feedback for the second direction.
+            zenith_angle: Observation zenith angle in angular units.
+
+        Returns:
+            Covariance in milliarcseconds times nanometres of OPD, with shape
+            ``(*broadcast_shape, 2, 2)``. Matrix rows follow the first direction's
+            x/y components and columns follow the second's.
+
+        Raises:
+            TypeError: If field coordinates or zenith angle lack physical quantities.
+            ValueError: If inputs cannot broadcast or are outside calibrated support.
+        """
         return self._evaluate("C_Tt_Tc", [x1, y1, x2, y2, b1, b2], zenith_angle)
 
     def C_Tt_Tt(
@@ -633,12 +790,31 @@ class CovarianceFunctions:
         y1: u.Quantity,
         x2: u.Quantity,
         y2: u.Quantity,
-        b1,
-        b2,
+        b1: ArrayLike | u.Quantity,
+        b2: ArrayLike | u.Quantity,
         *,
         zenith_angle: u.Quantity,
     ) -> u.Quantity:
-        """Return filtered atmospheric tilt covariance, in mas squared."""
+        """Return filtered atmospheric tilt covariance, in mas squared.
+
+        Args:
+            x1: First field direction's x-coordinate in angular units.
+            y1: First field direction's y-coordinate in angular units.
+            x2: Second field direction's x-coordinate in angular units.
+            y2: Second field direction's y-coordinate in angular units.
+            b1: Dimensionless loop feedback for the first direction.
+            b2: Dimensionless loop feedback for the second direction.
+            zenith_angle: Observation zenith angle in angular units.
+
+        Returns:
+            Covariance in square milliarcseconds, with shape
+            ``(*broadcast_shape, 2, 2)``. Matrix rows follow the first direction's
+            x/y components and columns follow the second's.
+
+        Raises:
+            TypeError: If field coordinates or zenith angle lack physical quantities.
+            ValueError: If inputs cannot broadcast or are outside calibrated support.
+        """
         return self._evaluate("C_Tt_Tt", [x1, y1, x2, y2, b1, b2], zenith_angle)
 
     def C_t_Tt(
@@ -647,12 +823,33 @@ class CovarianceFunctions:
         y1: u.Quantity,
         x2: u.Quantity,
         y2: u.Quantity,
-        b2,
+        b2: ArrayLike | u.Quantity,
         *,
         zenith_angle: u.Quantity,
     ) -> u.Quantity:
-        """Return atmospheric tilt versus filtered tilt covariance, in mas squared."""
+        """Return atmospheric tilt versus filtered tilt covariance, in mas squared.
+
+        Args:
+            x1: First field direction's x-coordinate in angular units.
+            y1: First field direction's y-coordinate in angular units.
+            x2: Second field direction's x-coordinate in angular units.
+            y2: Second field direction's y-coordinate in angular units.
+            b2: Dimensionless loop feedback for the second direction.
+            zenith_angle: Observation zenith angle in angular units.
+
+        Returns:
+            Covariance in square milliarcseconds, with shape
+            ``(*broadcast_shape, 2, 2)``. Matrix rows follow the first direction's
+            x/y components and columns follow the second's.
+
+        Raises:
+            TypeError: If field coordinates or zenith angle lack physical quantities.
+            ValueError: If inputs cannot broadcast or are outside calibrated support.
+        """
         return self._evaluate("C_t_Tt", [x1, y1, x2, y2, b2], zenith_angle)
+
+
+# Build a multi-zenith bank
 
 
 @dataclass(frozen=True, kw_only=True)
@@ -676,7 +873,7 @@ class CovarianceCalibrationResult:
 def build_covariance_calibration(
     planes: Iterable[CovarianceCalibrationMeasurements],
     *,
-    dtype=np.float32,
+    dtype: DTypeLike = np.float32,
 ) -> CovarianceCalibrationResult:
     """Combine compatible measured planes into one rectangular covariance bank.
 
@@ -684,6 +881,17 @@ def build_covariance_calibration(
     realization counts may differ. Nearest-node corner filling, normalization
     and interpolation in airmass preserve the accepted numerical procedure.
     Native metadata and sources are neither inspected nor retained.
+
+    Args:
+        planes: Measurements with distinct zenith angles and compatible support.
+        dtype: Float32 or float64 for fitted state and queries.
+
+    Returns:
+        A read-only six-function bank and numerical validation diagnostics.
+
+    Raises:
+        ValueError: If measurements conflict, precision is unsupported or
+            the bank fails knot recovery.
     """
     planes = sorted(planes, key=lambda plane: plane.zenith_angle.value)
     if not planes or any(
@@ -781,8 +989,20 @@ def build_covariance_calibration(
     )
 
 
+# Save and load fitted banks
+
+
 def save_covariance_calibration(model: CovarianceFunctions, path: str | Path) -> None:
-    """Publish one combined runtime bank at model.json, retaining measurements."""
+    """Publish one combined runtime bank at model.json, retaining measurements.
+
+    Args:
+        model: Fitted covariance bank to publish.
+        path: Destination JSON manifest. The companion array payload is stored
+            beside it. The manifest is replaced after publishing the payload.
+
+    Raises:
+        TypeError: If model is not a CovarianceFunctions bank.
+    """
     if not isinstance(model, CovarianceFunctions):
         raise TypeError("model must be CovarianceFunctions")
     save_product(
@@ -804,7 +1024,18 @@ def save_covariance_calibration(model: CovarianceFunctions, path: str | Path) ->
 
 
 def load_covariance_calibration(path: str | Path) -> CovarianceFunctions:
-    """Load a strict immutable bank without source histories or E2E software."""
+    """Load a strict immutable bank without source histories or E2E software.
+
+    Args:
+        path: JSON manifest identifying the companion array payload.
+
+    Returns:
+        The fitted covariance bank in its stored precision.
+
+    Raises:
+        FileNotFoundError: If the manifest or payload is missing.
+        ValueError: If schema, payload identity, units or support are invalid.
+    """
     header, arrays = load_product(path, _KIND)
     if (
         (set(header) - {"precision", "producer_precision", "support_precision"})
@@ -842,10 +1073,21 @@ def load_covariance_calibration(path: str | Path) -> CovarianceFunctions:
     )
 
 
+# Save and load measured planes
+
+
 def save_covariance_measurements(
     measurements: CovarianceCalibrationMeasurements, path: str | Path
 ) -> None:
-    """Atomically save one measured plane with numerical settings and diagnostics."""
+    """Atomically save one measured plane with numerical settings and diagnostics.
+
+    Args:
+        measurements: Reusable measurement record for one zenith plane.
+        path: Destination NPZ file. An existing file is atomically replaced.
+
+    Raises:
+        TypeError: If measurements is not a covariance measurement record.
+    """
     if not isinstance(measurements, CovarianceCalibrationMeasurements):
         raise TypeError("unsupported covariance measurement type")
     header = {
@@ -872,7 +1114,18 @@ def save_covariance_measurements(
 
 
 def load_covariance_measurements(path: str | Path) -> CovarianceCalibrationMeasurements:
-    """Load strict reusable numerical measurements; never open native sources."""
+    """Load strict reusable numerical measurements; never open native sources.
+
+    Args:
+        path: NPZ file produced by the measurement writer.
+
+    Returns:
+        The stored measured plane with its precision, settings and diagnostics.
+
+    Raises:
+        FileNotFoundError: If the measurements are missing.
+        ValueError: If schema, precision or numerical contents are invalid.
+    """
     with np.load(Path(path), allow_pickle=False) as saved:
         header = json.loads(str(saved["__header__"]))
         validate_observation_precision(header, saved)

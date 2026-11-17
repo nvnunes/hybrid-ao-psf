@@ -8,8 +8,8 @@ import pytest
 from astropy import units as u
 
 from hybrid_ao_psf import (
-    CalibrationArtifactIdentity,
     CalibrationPhotometry,
+    CalibrationProductIdentity,
     ComaResponseMeasurements,
     ComaWavefronts,
     ComaWfsMeasurements,
@@ -22,7 +22,7 @@ from hybrid_ao_psf import (
     SensingWfsMeasurements,
     load_calibration_samples,
     load_e2e_calibration_configuration,
-    read_calibration_artifact_identity,
+    read_calibration_product_identity,
     save_calibration_samples,
 )
 
@@ -203,6 +203,19 @@ def test_owned_section_typo_and_invalid_override_rejected(tmp_path):
         config.with_overrides(sensing={"zero_draws": 0})
 
 
+@pytest.mark.parametrize("pixel_value", [1e40, 1e-50])
+def test_sensing_spot_rejects_unrepresentable_flux(pixel_value):
+    with pytest.raises(ValueError, match="image flux"):
+        SensingSpot(
+            image=np.full((3, 3), pixel_value),
+            pixel_scale=5 * u.mas,
+            wavelength=700 * u.nm,
+            photons_per_frame=100 * u.photon,
+            displacements=np.array([[0, 0], [1, 0], [-1, 0], [0, 1], [0, -1]]) * u.mas,
+            dtype=np.float32,
+        )
+
+
 def test_photometry_is_generic_and_preserves_incident_count_convention():
     conversion = CalibrationPhotometry(
         magnitude_band="test band", photons_per_frame_zeropoint=1e8 * u.photon
@@ -212,6 +225,8 @@ def test_photometry_is_generic_and_preserves_incident_count_convention():
         [1e8, 1e6, 1e4],
         rtol=1e-15,
     )
+    with pytest.raises(ValueError, match="magnitudes must be real"):
+        conversion.photons_per_frame([10 + 2j] * u.mag)
     q = conversion.photons_per_frame_zeropoint
     q._unit = u.electron
     assert conversion.photons_per_frame_zeropoint.unit == u.photon
@@ -233,15 +248,15 @@ def test_fitted_identity_covers_json_and_payload_and_changed_valid_product(tmp_p
         "coefficient": 1.0,
     }
     path.write_text(json.dumps(data))
-    identity = read_calibration_artifact_identity(path)
-    assert isinstance(identity, CalibrationArtifactIdentity)
+    identity = read_calibration_product_identity(path)
+    assert isinstance(identity, CalibrationProductIdentity)
     assert len(identity.payloads) == 1
     identity.verify()
     # Another valid generation at the same path is nevertheless not this binding.
     np.savez(payload, values=[2.0, 3.0])
     data["payload_sha256"] = hashlib.sha256(payload.read_bytes()).hexdigest()
     path.write_text(json.dumps(data))
-    replacement = read_calibration_artifact_identity(path)
+    replacement = read_calibration_product_identity(path)
     assert replacement != identity
     with pytest.raises(ValueError, match="content changed"):
         identity.verify()
@@ -254,12 +269,12 @@ def test_fitted_identity_covers_json_and_payload_and_changed_valid_product(tmp_p
 def test_json_only_identity_and_bad_payload_paths(tmp_path):
     path = tmp_path / "model.json"
     path.write_text('{"coefficient": 1}')
-    identity = read_calibration_artifact_identity(path)
+    identity = read_calibration_product_identity(path)
     assert identity.payloads == ()
     for value in ("../elsewhere.npz", "/tmp/elsewhere.npz", "not-an-array.json"):
         path.write_text(json.dumps({"payload": value, "payload_sha256": "0" * 64}))
         with pytest.raises(ValueError, match="relative NPZ"):
-            read_calibration_artifact_identity(path)
+            read_calibration_product_identity(path)
 
 
 def test_atomic_sample_write_preserves_previous_on_cancellation(tmp_path, monkeypatch):
@@ -317,3 +332,11 @@ def test_precision_configuration_defaults_ini_and_explicit_override(tmp_path):
     path = ini(tmp_path, "precision = float16\n")
     with pytest.raises(ValueError, match="float32 or float64"):
         load_e2e_calibration_configuration(path)
+
+
+
+def test_sensing_history_controls_load_from_ini(tmp_path):
+    path = ini(tmp_path, "[calibration.sensing]\nnoise_realizations = 3\nnoise_frames = 256\n")
+    settings = load_e2e_calibration_configuration(path).sensing
+    assert settings.noise_realizations == 3
+    assert settings.noise_frames == 256

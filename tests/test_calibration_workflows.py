@@ -1,5 +1,7 @@
 """Complete configured calibration handoff using native-independent telemetry."""
 
+import hashlib
+import json
 from contextlib import contextmanager
 from dataclasses import replace
 
@@ -17,11 +19,12 @@ from hybrid_ao_psf import (
     E2ECalibration,
     E2ECalibrationConfiguration,
     FixedGainIntegrator,
+    ReconstructorCalibrationResult,
     ReconstructorCalibrationSettings,
     ReconstructorNoiseMeasurements,
     ScienceHoPsfSamples,
     SensingCalibrationSettings,
-    SensingReplayRequest,
+    SensingNoiseRequest,
     SensingWfsMeasurements,
     build_science_ho_psf_interpolator,
     build_sensing_response,
@@ -150,8 +153,8 @@ def pipeline(tmp_path_factory, request):
             zero_draws=128,
             gain_draws=64,
             block_draws=8,
-            replay_realizations=3,
-            replay_frames=256,
+            noise_realizations=3,
+            noise_frames=256,
             discard_frames=96,
         ),
     )
@@ -214,7 +217,7 @@ def pipeline(tmp_path_factory, request):
         dtype=config.dtype,
     )
     requests = [
-        SensingReplayRequest(
+        SensingNoiseRequest(
             key=str(n),
             population="synthetic",
             zenith_angle=20 * u.deg,
@@ -226,8 +229,8 @@ def pipeline(tmp_path_factory, request):
         )
         for n in (1, 2, 3)
     ]
-    replays = list(calibration.replay_sensing(response, requests))
-    sensing = calibration.build_sensing(response, replays).model
+    noise_measurements = list(calibration.simulate_sensing_noise(response, requests))
+    sensing = calibration.build_sensing(response, noise_measurements).model
     return calibration, (prior, covariances, coma, sensing)
 
 
@@ -248,6 +251,62 @@ def test_configured_four_family_handoff_without_native_files(pipeline):
     assert loaded[3].blur.parameters() == models[3].blur.parameters()
     for family in ("reconstructor", "covariance", "coma", "sensing"):
         assert getattr(config, f"{family}_model").with_name("diagnostics.json").exists()
+    assert [
+        json.loads(path.read_text()).get("payload")
+        for path in (
+            config.reconstructor_model,
+            config.covariance_model,
+            config.coma_model,
+            config.sensing_model,
+        )
+    ] == [
+        "reconstructor-noise-interpolator.npz",
+        "covariance-interpolators.npz",
+        None,
+        "sensing-calibration-interpolators.npz",
+    ]
+
+
+@pytest.mark.parametrize("configured", [False, True])
+def test_named_payloads_preserve_prior_revision_and_reuse_current(
+    pipeline, tmp_path, configured
+):
+    from hybrid_ao_psf._calibration_workflows import publish_result
+
+    _, models = pipeline
+    model = models[0]
+    path = tmp_path / "model.json"
+
+    def publish(prior):
+        if configured:
+            publish_result(
+                ReconstructorCalibrationResult(model=prior, diagnostics={}),
+                path,
+                save_reconstructor_calibration,
+            )
+        else:
+            save_reconstructor_calibration(prior, path)
+
+    publish(model)
+    original = path.with_name("reconstructor-noise-interpolator.npz")
+    original_payload = original.read_bytes()
+    updated = replace(model, variance=model.variance * 1.01)
+    publish(updated)
+    publish(updated)
+
+    manifest = path.read_bytes()
+    assert json.loads(manifest)["payload"] == "reconstructor-noise-interpolator-2.npz"
+    assert {file.name for file in tmp_path.glob("*.npz")} == {
+        "reconstructor-noise-interpolator.npz",
+        "reconstructor-noise-interpolator-2.npz",
+    }
+    assert original.read_bytes() == original_payload
+    np.testing.assert_array_equal(
+        load_reconstructor_calibration(path).variance, updated.variance
+    )
+    if configured:
+        diagnostics = json.loads(path.with_name("diagnostics.json").read_text())
+        assert diagnostics["model_sha256"] == hashlib.sha256(manifest).hexdigest()
 
 
 @pytest.mark.parametrize(
@@ -341,8 +400,6 @@ def test_calibrated_reconstructor_validation_rejects_mismatched_telemetry(pipeli
 
 @pytest.mark.parametrize("family", range(4))
 def test_each_product_rejects_wrong_declared_units(pipeline, tmp_path, family):
-    import json
-
     _, models = pipeline
     save = (
         save_reconstructor_calibration,

@@ -32,7 +32,7 @@ Precision resolves from float32 default, then `[e2e] precision`, then an explici
 `dtype` argument. `model.prepare(dtype=...)` converts immutable runtime state
 without changing saved products or recovering information lost during earlier
 rounding. Once prepared, prediction performs no file I/O. The read-only
-`product_identities` mapping exposes the four content-bound artifact identities
+`product_identities` mapping exposes the four content-bound file identities
 and the NGS metric file identity for execution/reuse checks. Direct construction
 from loaded providers can omit file identities.
 

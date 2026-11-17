@@ -2,13 +2,11 @@
 
 from __future__ import annotations
 
-import hashlib
 import json
-import stat
 import tempfile
 from pathlib import Path
 
-from ._calibration_products import json_metadata, publish_manifest
+from ._calibration_products import json_metadata, payload_destination, publish_manifest
 
 
 def publish_result(result, path: Path, save_model) -> None:
@@ -29,26 +27,11 @@ def publish_result(result, path: Path, save_model) -> None:
         save_model(result.model, staged)
         header = json.loads(staged.read_text())
         if "payload" in header:
-            source, destination = (
-                temporary / header["payload"],
-                path.parent / header["payload"],
+            source = temporary / header["payload"]
+            destination, reused = payload_destination(
+                path, header["schema"], header["payload_sha256"]
             )
-            if destination.exists():
-                with destination.open("rb") as stream:
-                    unchanged = (
-                        hashlib.file_digest(stream, "sha256").hexdigest()
-                        == header["payload_sha256"]
-                    )
-                if not unchanged:
-                    source.chmod(stat.S_IMODE(destination.stat().st_mode))
-                    source.replace(destination)
-            else:
+            if not reused:
                 source.replace(destination)
-        publish_manifest(
-            path,
-            header,
-            diagnostics={
-                "model_sha256": hashlib.sha256(staged.read_bytes()).hexdigest(),
-                "diagnostics": diagnostics,
-            },
-        )
+            header["payload"] = destination.name
+        publish_manifest(path, header, diagnostics=diagnostics)

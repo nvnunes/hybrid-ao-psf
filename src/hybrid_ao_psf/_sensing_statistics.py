@@ -1,4 +1,4 @@
-"""Native-free WFS moments, pooled replay statistics and noise-shape fitting."""
+"""Native-free WFS moments, pooled displacement statistics and noise-shape fitting."""
 
 from __future__ import annotations
 
@@ -20,7 +20,7 @@ DIRECTIONS = np.column_stack(
 
 
 @dataclass(frozen=True)
-class ReplayStatistics:
+class NoiseDisplacementStatistics:
     """Shape diagnostics after pooled centring and whitening.
 
     Radial probabilities include the final infinite-tail bin and sum to one.
@@ -37,16 +37,16 @@ class ReplayStatistics:
 
 
 @dataclass(frozen=True)
-class ReplayCase:
-    """One retained asterism summarized using every captured replay sample."""
+class NoiseDisplacementCase:
+    """One retained asterism summarized using every captured displacement sample."""
 
     key: str
     ngs_count: int
     population: str
-    statistics: ReplayStatistics
+    statistics: NoiseDisplacementStatistics
 
 
-def pooled_replay_moments(
+def pooled_displacement_moments(
     displacements_mas: NDArray,
     *,
     dtype=None,
@@ -69,7 +69,7 @@ def pooled_replay_moments(
         or samples.shape[2] < 3
         or not np.isfinite(samples).all()
     ):
-        raise ValueError("Replay must be finite with shape (2,realizations,frames).")
+        raise ValueError("Displacement histories must be finite with shape (2,realizations,frames).")
     mean = samples.mean(axis=(1, 2), keepdims=True)
     centred = samples - mean
     flat = centred.reshape(2, -1)
@@ -77,13 +77,13 @@ def pooled_replay_moments(
     return centred, mean[:, 0, 0], covariance
 
 
-def replay_statistics(displacements_mas: NDArray, *, dtype=None) -> ReplayStatistics:
+def noise_displacement_statistics(displacements_mas: NDArray, *, dtype=None) -> NoiseDisplacementStatistics:
     """Summarize shape after centring a (2,realizations,frames) case as one pool.
 
     The same pooled covariance both describes the displacement distribution and
     whitens it for shape fitting. Absolute prediction width comes from Lyapunov.
     """
-    samples, _, covariance = pooled_replay_moments(displacements_mas, dtype=dtype)
+    samples, _, covariance = pooled_displacement_moments(displacements_mas, dtype=dtype)
     dtype = samples.dtype
     samples = samples.reshape(2, -1)
     white = np.linalg.solve(np.linalg.cholesky(covariance), samples).T
@@ -98,7 +98,7 @@ def replay_statistics(displacements_mas: NDArray, *, dtype=None) -> ReplayStatis
             values, np.r_[-np.inf, PROJECTION_EDGES.astype(dtype), np.inf]
         )[0]
         cdfs.append(np.cumsum(counts)[:-1].astype(dtype) / len(values))
-    return ReplayStatistics(
+    return NoiseDisplacementStatistics(
         probability, np.array(cdfs), float(np.mean(radius**2)), covariance, len(radius)
     )
 
@@ -148,7 +148,7 @@ def _bin_probability_gradient(model: NoiseBlurModel, count: int) -> NDArray:
 
 
 def fit_noise_blur(
-    cases: list[ReplayCase], *, dtype=np.float32
+    cases: list[NoiseDisplacementCase], *, dtype=np.float32
 ) -> tuple[NoiseBlurModel, dict]:
     """Fit the documented three-coefficient covariance-preserving mixture.
 
@@ -242,7 +242,7 @@ def fit_noise_blur(
     return NoiseBlurModel(*best.x, dtype=dtype), diagnostics
 
 
-def assess_noise_blur(model: NoiseBlurModel, case: ReplayCase) -> dict:
+def assess_noise_blur(model: NoiseBlurModel, case: NoiseDisplacementCase) -> dict:
     """Compare fitted and empirical CDFs and fourth moment on the same shape scale."""
     measured = case.statistics
     narrow, broad = model.scales(case.ngs_count)

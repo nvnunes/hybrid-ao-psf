@@ -8,7 +8,7 @@ from types import MappingProxyType
 
 import numpy as np
 from astropy import units as u
-from numpy.typing import DTypeLike
+from numpy.typing import ArrayLike, DTypeLike, NDArray
 from scipy.interpolate import RegularGridInterpolator
 
 from ._calibration_contracts import (
@@ -58,6 +58,9 @@ class SensingPrediction(_PhysicalRecord):
         object.__setattr__(self, "variance", variance)
 
 
+# Fitted response and physical queries
+
+
 @dataclass(frozen=True, init=False, eq=False)
 class SensingResponseModel:
     """Immutable gain/log-variance tables over measured position/magnitude/airmass.
@@ -83,14 +86,41 @@ class SensingResponseModel:
     @classmethod
     def _from_arrays(
         cls,
-        arrays,
-        controller,
-        photometry,
-        field_radius,
-        intervals,
-        producer_dtype=None,
-        support_precision=None,
-    ):
+        arrays: Mapping[str, NDArray],
+        controller: FixedGainIntegrator,
+        photometry: CalibrationPhotometry,
+        field_radius: u.Quantity,
+        intervals: ArrayLike | None,
+        producer_dtype: DTypeLike | None = None,
+        support_precision: DTypeLike | None = None,
+    ) -> SensingResponseModel:
+        """Validate and own fitted response tables for build, load, and preparation.
+
+        Args:
+            arrays: Airmass and matching zenith in degrees, x/y in arcseconds,
+                and magnitude nodes. The dimensionless gain, natural log of
+                variance in mas squared, and Boolean measured-support mask
+                have axis order ``(airmass, x, y, magnitude)``.
+            controller: Fixed integrator used during calibration.
+            photometry: Calibration magnitude and photon-count convention.
+            field_radius: Positive scalar angular radius of the calibration.
+            intervals: Supported magnitude intervals as ``(lower, upper)``
+                pairs in magnitudes, or None to infer intervals from the nodes.
+            producer_dtype: Original calibration precision, if recorded.
+            support_precision: Coarsest precision already retained for support
+                comparisons. The model uses the coarsest of this, producer
+                precision, and the current gain dtype.
+
+        Returns:
+            A response model with read-only copies of the tables and magnitude
+            intervals. The gain table determines the calculation precision.
+
+        Raises:
+            TypeError: If the controller, photometry, or angular radius has the
+                wrong type.
+            ValueError: If the grid, tables, support, radius, intervals, or
+                precision are inconsistent.
+        """
         dtype = validate_psf_dtype(arrays["gain"].dtype)
         support_precision = support_dtype(dtype, producer_dtype, support_precision)
         expected = {
@@ -207,23 +237,6 @@ class SensingResponseModel:
         """Coarsest coordinate precision retained through preparation and loading."""
         return self._support_precision
 
-    def prepare(self, *, dtype=np.float32) -> SensingResponseModel:
-        """Copy runtime state and preserve the original producer precision."""
-        dtype = validate_psf_dtype(dtype)
-        arrays = {
-            key: value.astype(dtype) if value.dtype.kind == "f" else value.copy()
-            for key, value in self._arrays.items()
-        }
-        return self._from_arrays(
-            arrays,
-            replace(self.controller, dtype=dtype),
-            replace(self.photometry, dtype=dtype),
-            self.field_radius,
-            self._intervals.astype(dtype),
-            self.producer_dtype,
-            self.support_precision,
-        )
-
     @property
     def controller(self) -> FixedGainIntegrator:
         """Return the fixed numerical controller on which the shape calibration rests."""
@@ -282,6 +295,33 @@ class SensingResponseModel:
         """Return immutable measured-vertex membership on the rectangular grid."""
         return self._arrays["support"].view()
 
+    def prepare(self, *, dtype: DTypeLike = np.float32) -> SensingResponseModel:
+        """Copy runtime state and preserve the original producer precision.
+
+        Args:
+            dtype: Numerical precision, either float32 or float64.
+
+        Returns:
+            A separate gain and noise-variance provider at the requested precision.
+
+        Raises:
+            ValueError: If the precision is unsupported or conversion invalidates support.
+        """
+        dtype = validate_psf_dtype(dtype)
+        arrays = {
+            key: value.astype(dtype) if value.dtype.kind == "f" else value.copy()
+            for key, value in self._arrays.items()
+        }
+        return self._from_arrays(
+            arrays,
+            replace(self.controller, dtype=dtype),
+            replace(self.photometry, dtype=dtype),
+            self.field_radius,
+            self._intervals.astype(dtype),
+            self.producer_dtype,
+            self.support_precision,
+        )
+
     def predict(
         self, *, positions: u.Quantity, magnitudes: u.Quantity, zenith_angle: u.Quantity
     ) -> SensingPrediction:
@@ -290,6 +330,19 @@ class SensingResponseModel:
         positions is (N,2); magnitudes is length N or a scalar shared by all NGS.
         Viewing angle is scalar. Enforce measured intervals, field radius,
         rectangular bounds and support for every nonzero-weight vertex.
+
+        Args:
+            positions: Cartesian angular x/y coordinates with shape ``(NGS, 2)``.
+            magnitudes: One magnitude per coordinate, or a scalar for all positions.
+            zenith_angle: Common angular viewing coordinate.
+
+        Returns:
+            Gain and per-axis angular noise variance in input order.
+
+        Raises:
+            TypeError: If a physical input lacks its required quantity.
+            ValueError: If a query is invalid, outside calibrated support or needs an
+                unmeasured interpolation vertex.
         """
         precision = self.support_precision
         positions = _quantity(positions, u.arcsec, "positions", 2, dtype=self.dtype)
@@ -359,10 +412,27 @@ class SensingResponseModel:
             * u.mas**2,
         )
 
+    def _measured_zenith_index(self, zenith_angle: u.Quantity) -> int:
+        """Locate one measured plane within the rounding of the stored support."""
+        angles = self.zenith_angles.to_value(u.deg)
+        bound = (
+            2 * np.finfo(self.support_precision).eps * np.maximum(1.0, np.abs(angles))
+        )
+        query = self.dtype.type(zenith_angle.to_value(u.deg))
+        matches = np.flatnonzero(np.abs(angles - query) <= bound)
+        if len(matches) != 1:
+            raise ValueError(
+                "noise-bank draw requires an actually measured zenith plane"
+            )
+        return int(matches[0])
+
+
+# Fitted response and noise banks for simulation
+
 
 @dataclass(frozen=True, init=False, eq=False)
 class SensingResponseCalibration:
-    """Prepared response model and paired dimensionless banks for offline replay.
+    """Prepared response model and paired dimensionless banks for offline simulation.
 
     Build from reusable WFS observations with build_sensing_response. The banks
     preserve the accepted conditional whitening at their configured precision;
@@ -378,8 +448,28 @@ class SensingResponseCalibration:
     def __init__(self):
         raise TypeError("Use build_sensing_response")
 
-    def prepare(self, *, dtype=np.float32) -> SensingResponseCalibration:
-        """Copy model and banks at one precision; reject collapsed bank nodes."""
+    @property
+    def model(self) -> SensingResponseModel:
+        """Return the immutable gain/variance provider for the captured observations."""
+        return self._model
+
+    @property
+    def bank_count(self) -> int:
+        """Return the number of captured direction/magnitude/zenith noise banks."""
+        return len(self._banks)
+
+    def prepare(self, *, dtype: DTypeLike = np.float32) -> SensingResponseCalibration:
+        """Copy model and banks at one precision; reject collapsed bank nodes.
+
+        Args:
+            dtype: Numerical precision, either float32 or float64.
+
+        Returns:
+            A separate response model and noise bank at the requested precision.
+
+        Raises:
+            ValueError: If the precision is unsupported or conversion invalidates support.
+        """
         dtype = validate_psf_dtype(dtype)
         banks = {}
         for key, value in self._banks.items():
@@ -400,16 +490,6 @@ class SensingResponseCalibration:
         )
         return result
 
-    @property
-    def model(self) -> SensingResponseModel:
-        """Return the immutable gain/variance provider for the captured observations."""
-        return self._model
-
-    @property
-    def bank_count(self) -> int:
-        """Return the number of captured direction/magnitude/zenith noise banks."""
-        return len(self._banks)
-
     def draw_noise(
         self,
         *,
@@ -424,6 +504,20 @@ class SensingResponseCalibration:
         The generator is caller-owned and advanced deterministically. Return
         newly owned (count,2) dimensionless samples. Viewing angle must be a
         captured plane; no between-plane noise-shape interpolation is invented.
+
+        Args:
+            position: One Cartesian angular x/y coordinate.
+            magnitude: Magnitude in the calibrated convention.
+            zenith_angle: A measured zenith plane.
+            rng: NumPy random generator, advanced in place.
+            count: Positive number of paired draws.
+
+        Returns:
+            Dimensionless x/y white-noise pairs with shape ``(count, 2)``.
+
+        Raises:
+            TypeError: If inputs lack required quantities or the RNG is the wrong type.
+            ValueError: If sampling is invalid or requests unavailable support.
         """
         position = _quantity(position, u.arcsec, "position", 1, dtype=self.model.dtype)
         if position.shape != (2,):
@@ -437,14 +531,7 @@ class SensingResponseCalibration:
             positions=position[None, :], magnitudes=mag, zenith_angle=angle
         )
         precision = self.model.support_precision
-        measured_angles = self.model.zenith_angles.value
-        bound = 2 * np.finfo(precision).eps * np.maximum(1.0, np.abs(measured_angles))
-        matches = np.flatnonzero(np.abs(measured_angles - angle.value) <= bound)
-        if len(matches) != 1:
-            raise ValueError(
-                "noise-bank draw requires an actually measured zenith plane"
-            )
-        angle = measured_angles[matches[0]] * u.deg
+        angle = self.model.zenith_angles[self.model._measured_zenith_index(angle)]
         position = (
             np.array(
                 [
@@ -496,19 +583,35 @@ class SensingResponseCalibration:
         return result
 
 
+# Build the response tables and noise banks
+
+
 def build_sensing_response(
     measurements: Iterable[SensingCalibrationMeasurements],
     *,
     field_radius: u.Quantity,
     magnitude_intervals: u.Quantity | None = None,
-    dtype=np.float32,
+    dtype: DTypeLike = np.float32,
 ) -> SensingResponseCalibration:
-    """Build scalar gain/log-variance tables and replay banks without native access.
+    """Build scalar gain/log-variance tables and noise banks without native access.
 
     Stream captured points, requiring unique coordinates and compatible numerical
     sampling, photometry and controller settings. Preserve gaps unless explicit
     intervals declare calibrated nonuniform magnitude spacing. The runtime
     sensing product is not publishable until its noise-shape fit is complete.
+
+    Args:
+        measurements: Compatible raw WFS observations over field and magnitude.
+        field_radius: Positive angular radius enclosing the sampled directions.
+        magnitude_intervals: Optional measured magnitude intervals used to
+            bound interpolation. Defaults to the measured magnitude range.
+        dtype: Calculation precision, either float32 or float64.
+
+    Returns:
+        A gain and variance provider with retained noise banks for simulation.
+
+    Raises:
+        ValueError: If measurements conflict or leave required support undefined.
     """
     dtype = validate_psf_dtype(dtype)
     rows = []

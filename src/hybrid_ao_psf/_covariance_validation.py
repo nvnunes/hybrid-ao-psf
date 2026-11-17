@@ -29,7 +29,7 @@ def _cov(left, right):
 
 
 def assembly_check(source: HistoryArrays, settings: FilterSettings) -> dict:
-    """Compare Q, K, D and residual covariance with independent matrix replay.
+    """Compare Q, K, D and residual covariance with independent matrix-loop simulation.
 
     One-, two- and three-direction fixtures include noncommuting reconstruction
     blocks and unequal eigenvalues. These are numerical fixtures, not fitted
@@ -69,7 +69,7 @@ def assembly_check(source: HistoryArrays, settings: FilterSettings) -> dict:
             np.zeros_like(source.coma[0]),
         )
 
-        def replay(history, feedback):
+        def simulate_loop(history, feedback):
             result = np.broadcast_to(
                 np.linalg.solve(feedback, history[:, :1]), history.shape
             ).copy()
@@ -81,7 +81,7 @@ def assembly_check(source: HistoryArrays, settings: FilterSettings) -> dict:
                 )
             return result[:, settings.discard :]
 
-        ua, uc = replay(atmospheric, feedback), replay(coma, feedback)
+        ua, uc = simulate_loop(atmospheric, feedback), simulate_loop(coma, feedback)
         science = source.tilt[0, :, settings.discard :]
         predicted_a, predicted_c, predicted_ac = [
             np.zeros((2, 2), dtype=dtype) for _ in range(3)
@@ -458,7 +458,7 @@ def pilot_diagnostics(
     tolerance: float = 1e-8,
     maximum: int = 500,
 ) -> dict:
-    """Check recurrence, initialization and restarted replay on actual PH inputs.
+    """Check recurrence, initialization and restarted filtering on actual PH inputs.
 
     A direct frame recurrence supplies the independent scalar reference.
     Covariance-change errors are scaled by variable RMS products so that weak
@@ -473,7 +473,7 @@ def pilot_diagnostics(
     )
     if settings.discard < cut:
         raise ValueError(
-            f"Replay cut {settings.discard} is below the state-propagation bound {cut}"
+            f"Settling cut {settings.discard} is below the state-propagation bound {cut}"
         )
     errors, settling, assemblies, absolute_settling = [], [], [], []
     for source in sources[:2]:
@@ -509,16 +509,16 @@ def pilot_diagnostics(
                 baseline = output[..., restart + settings.discard :].copy()
                 baseline -= baseline.mean(-1, keepdims=True)
                 for equilibrium in [True, False]:
-                    replay = scalar_filter(
+                    restarted = scalar_filter(
                         values[..., restart:],
                         b,
                         settings.gain,
                         settings.delay,
                         equilibrium=equilibrium,
                     )[..., settings.discard :]
-                    replay -= replay.mean(-1, keepdims=True)
-                    n = replay.shape[-1]
-                    left, right = baseline.reshape(-1, n), replay.reshape(-1, n)
+                    restarted -= restarted.mean(-1, keepdims=True)
+                    n = restarted.shape[-1]
+                    left, right = baseline.reshape(-1, n), restarted.reshape(-1, n)
                     difference = right @ right.T / n - left @ left.T / n
                     rms = np.sqrt(np.mean(left**2, axis=1))
                     denominator = np.outer(rms, rms)
@@ -531,7 +531,7 @@ def pilot_diagnostics(
                     value = float(normalized.max())
                     if value > 1e-4:
                         raise ValueError(
-                            f"Replay settling failed: {input_name}, b={b}, error={value}"
+                            f"Filter settling failed: {input_name}, b={b}, error={value}"
                         )
                     settling.append(value)
                     absolute_settling.append(float(abs(difference).max()))

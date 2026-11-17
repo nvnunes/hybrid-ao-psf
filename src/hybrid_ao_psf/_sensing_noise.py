@@ -1,4 +1,4 @@
-"""Offline delayed-loop replay of paired WFS noise with calibrated LO weights."""
+"""Simulate noise-driven LO commands using retained paired WFS draws."""
 
 from __future__ import annotations
 
@@ -26,10 +26,10 @@ from ._covariance_calibration import CovarianceFunctions
 from ._io import atomic_output_path
 from ._reconstructor_calibration import ReconstructorNoiseModel, build_lo_reconstructor
 from ._sensing_response import SensingResponseCalibration
-from ._sensing_statistics import pooled_replay_moments
+from ._sensing_statistics import pooled_displacement_moments
 from ._validation import validate_psf_dtype
 
-_KIND = "hybrid-ao-psf-sensing-replay"
+_KIND = "hybrid-ao-psf-sensing-noise"
 _ARRAY_UNITS = {
     "positions": "arcsec",
     "magnitudes": "mag",
@@ -49,8 +49,8 @@ _ARRAY_UNITS = {
 
 
 @dataclass(frozen=True, kw_only=True, eq=False)
-class SensingReplayRequest(_PhysicalRecord):
-    """One synthetic asterism and its explicit replay inputs, without native state.
+class SensingNoiseRequest(_PhysicalRecord):
+    """One synthetic asterism and its noise-simulation inputs, without native state.
 
     Attributes:
         dtype: Real calculation/state precision, float32 by default or float64.
@@ -85,7 +85,7 @@ class SensingReplayRequest(_PhysicalRecord):
             not isinstance(value, str) or not value.strip()
             for value in (self.key, self.population)
         ):
-            raise ValueError("nonempty replay key and population required")
+            raise ValueError("nonempty measurement key and population required")
         _count(self.seed, "seed", 0)
         values = {
             "zenith_angle": _angle(self.zenith_angle, dtype=self.dtype),
@@ -114,7 +114,7 @@ class SensingReplayRequest(_PhysicalRecord):
 
 
 @dataclass(frozen=True, kw_only=True, eq=False)
-class SensingReplayMeasurements(_PhysicalRecord):
+class SensingNoiseMeasurements(_PhysicalRecord):
     """One retained command-displacement history with reproducible numeric inputs.
 
     Attributes:
@@ -130,7 +130,7 @@ class SensingReplayMeasurements(_PhysicalRecord):
         variances: Per-NGS measured angular-squared noise variances.
         noise_prior: Separate pre-filter prior for reconstruction, shape (2*N,2*N).
         analytical_covariance: Lyapunov command covariance, shape (2,2), angular squared.
-        measured_covariance: Replay population covariance before history serialization.
+        measured_covariance: Population covariance measured before history serialization.
         pooled_mean: Two-component mean removed across retained frames/realizations.
         realization_means: Per-realization angular means before pooled centring.
 
@@ -140,7 +140,7 @@ class SensingReplayMeasurements(_PhysicalRecord):
     captured-history quantization and configured reduction bounds.
     """
 
-    request: SensingReplayRequest
+    request: SensingNoiseRequest
     controller: FixedGainIntegrator
     settings: SensingCalibrationSettings
     displacements: u.Quantity
@@ -159,14 +159,14 @@ class SensingReplayMeasurements(_PhysicalRecord):
     def __post_init__(self):
         object.__setattr__(self, "dtype", validate_psf_dtype(self.dtype))
         if (
-            not isinstance(self.request, SensingReplayRequest)
+            not isinstance(self.request, SensingNoiseRequest)
             or not isinstance(self.controller, FixedGainIntegrator)
             or not isinstance(self.settings, SensingCalibrationSettings)
         ):
-            raise TypeError("typed replay request/controller/settings required")
+            raise TypeError("typed measurement request/controller/settings required")
         n = len(self.request.positions)
-        r = self.settings.replay_realizations
-        f = self.settings.replay_frames
+        r = self.settings.noise_realizations
+        f = self.settings.noise_frames
         specs = {
             "displacements": (u.mas, (r, f, 2)),
             "reconstructor": (u.one, (2, 2 * n)),
@@ -190,10 +190,10 @@ class SensingReplayMeasurements(_PhysicalRecord):
                 ),
             )
             if value.shape != shape:
-                raise ValueError(f"incorrect replay {name} shape")
+                raise ValueError(f"incorrect measurement {name} shape")
             object.__setattr__(self, name, value)
         if np.any(self.gains.value <= 0) or np.any(self.variances.value <= 0):
-            raise ValueError("positive replay gains/variances required")
+            raise ValueError("positive measurement gains/variances required")
         for name in ("noise_prior", "analytical_covariance", "measured_covariance"):
             covariance = getattr(self, name).value
             if not np.allclose(
@@ -202,25 +202,25 @@ class SensingReplayMeasurements(_PhysicalRecord):
                 (covariance + covariance.T) / 2
             ).min() < -1e-12 * max(1.0, np.linalg.norm(covariance)):
                 raise ValueError(
-                    f"replay {name} must be symmetric positive semidefinite"
+                    f"measurement {name} must be symmetric positive semidefinite"
                 )
         blocks = self.reconstructor.value.reshape(2, n, 2).transpose(1, 0, 2)
         feedback = np.einsum("g,gab->ab", self.gains.value, blocks)
         if not np.allclose(feedback, self.feedback.value, rtol=1e-12, atol=1e-12):
-            raise ValueError("replay feedback differs from declared weights/gains")
+            raise ValueError("measurement feedback differs from declared weights/gains")
         innovation = np.einsum("g,gab,gcb->ac", self.variances.value, blocks, blocks)
         covariance = self.controller.noise_covariance(feedback, innovation * u.mas**2)
         if not np.allclose(
             covariance.value, self.analytical_covariance.value, rtol=1e-10, atol=1e-10
         ):
             raise ValueError(
-                "replay analytical covariance differs from declared controller/noise"
+                "measurement analytical covariance differs from declared controller/noise"
             )
 
         _validate_history_moments(self)
 
 
-def _validate_history_moments(record: SensingReplayMeasurements) -> None:
+def _validate_history_moments(record: SensingNoiseMeasurements) -> None:
     """Check pre-storage moments against pooled-centred captured histories.
 
     Quantization bounds use half an ulp at the actual history dtype for each retained
@@ -245,7 +245,7 @@ def _validate_history_moments(record: SensingReplayMeasurements) -> None:
         + reduction_error * np.outer(rms, rms)
     )
     if np.any(np.abs(second - record.measured_covariance.value) > covariance_bound):
-        raise ValueError("replay history moments differ from measured covariance")
+        raise ValueError("measurement history moments differ from measured covariance")
     original_means = record.realization_means.value
     pooled = record.pooled_mean.value
     mean_scale = np.maximum(np.max(np.abs(original_means), axis=0), np.abs(pooled))
@@ -254,7 +254,7 @@ def _validate_history_moments(record: SensingReplayMeasurements) -> None:
     )
     if np.any(np.abs(original_means.mean(0) - pooled) > numerical_bound):
         raise ValueError(
-            "replay history moments have inconsistent pooled/realization means"
+            "measurement history moments have inconsistent pooled/realization means"
         )
     quantization_bound = relative_error * np.abs(samples).mean(axis=1) + absolute_error
     if np.any(
@@ -262,25 +262,41 @@ def _validate_history_moments(record: SensingReplayMeasurements) -> None:
         > quantization_bound + numerical_bound
     ):
         raise ValueError(
-            "replay history moments differ from recorded realization means"
+            "measurement history moments differ from recorded realization means"
         )
 
 
-def replay_sensing_calibration(
+def simulate_sensing_noise(
     response: SensingResponseCalibration,
-    requests: Iterable[SensingReplayRequest],
+    requests: Iterable[SensingNoiseRequest],
     covariances: CovarianceFunctions,
     noise_prior: ReconstructorNoiseModel,
     *,
     settings: SensingCalibrationSettings | None = None,
-    dtype=np.float32,
-) -> Iterator[SensingReplayMeasurements]:
-    """Replay cases independently with captured paired banks and calibrated weights.
+    dtype: DTypeLike = np.float32,
+) -> Iterator[SensingNoiseMeasurements]:
+    """Simulate noise-driven commands for each asterism using retained WFS draws.
 
     Use zero command prehistory, discard the declared settling interval, then
     remove one pooled mean across retained frames and realizations. Preserve
     the original star/draw order, rectangular bank mixing and selected-precision retained
     histories. No E2E modules/files or calibration object are needed.
+
+    Args:
+        response: Numerical sensing calibration with captured noise banks.
+        requests: Asterisms and seeds defining the independent measurement cases.
+        covariances: Bank used for atmospheric reconstruction geometry.
+        noise_prior: Separate pre-filter noise prior used in reconstruction.
+        settings: Optional observation-compatible noise-history and settling controls.
+        dtype: Noise simulation arithmetic precision, either float32 or float64.
+
+    Yields:
+        Command-displacement histories in request order with their pooled
+        mean removed, alongside analytical and measured covariance.
+
+    Raises:
+        TypeError: If any provider or request is the wrong type.
+        ValueError: If the inputs conflict, a loop is unstable or support is exceeded.
     """
     if (
         not isinstance(response, SensingResponseCalibration)
@@ -303,7 +319,7 @@ def replay_sensing_calibration(
         or settings.displacement != response._displacement
     ):
         raise ValueError(
-            "replay sampling/displacement settings differ from captured observations"
+            "measurement sampling/displacement settings differ from captured observations"
         )
     controller = response.model.controller
     if (
@@ -314,12 +330,12 @@ def replay_sensing_calibration(
         raise ValueError("sensing and covariance controllers differ")
     seen = set()
     for request in requests:
-        if not isinstance(request, SensingReplayRequest):
-            raise TypeError("typed replay requests required")
+        if not isinstance(request, SensingNoiseRequest):
+            raise TypeError("typed measurement requests required")
         request = replace(request, dtype=dtype)
         identity = (float(request.zenith_angle.value), request.key)
         if identity in seen:
-            raise ValueError("duplicate replay case")
+            raise ValueError("duplicate measurement case")
         seen.add(identity)
         values = response.model.predict(
             positions=request.positions,
@@ -346,8 +362,8 @@ def replay_sensing_calibration(
         feedback = np.einsum("g,gab->ab", gains, blocks)
         reconstructed_noise = np.einsum("g,gab,gcb->ac", variance, blocks, blocks)
         expected = controller.noise_covariance(feedback, reconstructed_noise * u.mas**2)
-        frames = settings.replay_frames + settings.discard_frames
-        realizations = settings.replay_realizations
+        frames = settings.noise_frames + settings.discard_frames
+        realizations = settings.noise_realizations
         x = np.zeros((2, realizations, frames), dtype=dtype)
         rng = np.random.default_rng(request.seed)
         for g in range(n):
@@ -365,8 +381,8 @@ def replay_sensing_calibration(
             ..., settings.discard_frames :
         ]
         realization_means = displacements.mean(-1)
-        displacements, mean, covariance = pooled_replay_moments(displacements)
-        yield SensingReplayMeasurements(
+        displacements, mean, covariance = pooled_displacement_moments(displacements)
+        yield SensingNoiseMeasurements(
             dtype=dtype,
             request=request,
             controller=controller,
@@ -395,28 +411,37 @@ def _settings_header(settings):
     }
 
 
-def save_sensing_replay(replay: SensingReplayMeasurements, path: str | Path) -> None:
-    """Atomically retain one full replay result and its physical reconstruction inputs."""
-    if not isinstance(replay, SensingReplayMeasurements):
-        raise TypeError("unsupported sensing replay type")
-    request = replay.request
+def save_sensing_noise(measurement: SensingNoiseMeasurements, path: str | Path) -> None:
+    """Save noise histories and their physical reconstruction inputs atomically.
+
+    Args:
+        measurement: A retained case history and its numerical simulation inputs.
+        path: Destination NPZ file. Create its parent directories if
+            needed. Atomically replace any existing destination.
+
+    Raises:
+        TypeError: If the input is not the expected calibration record.
+    """
+    if not isinstance(measurement, SensingNoiseMeasurements):
+        raise TypeError("unsupported sensing measurement type")
+    request = measurement.request
     header = {
         "schema": _KIND,
         "version": 2,
-        "precision": replay.dtype.name,
+        "precision": measurement.dtype.name,
         "units": _ARRAY_UNITS,
         "centring": "pooled",
         "key": request.key,
         "population": request.population,
         "zenith_angle_deg": float(request.zenith_angle.value),
         "seed": request.seed,
-        "controller": controller_header(replay.controller),
-        "settings": _settings_header(replay.settings),
+        "controller": controller_header(measurement.controller),
+        "settings": _settings_header(measurement.settings),
     }
     arrays = {
         name: getattr(request, name).value
         if name in ("positions", "magnitudes", "ee", "fwhm")
-        else getattr(replay, name).value
+        else getattr(measurement, name).value
         for name in _ARRAY_UNITS
     }
     with atomic_output_path(Path(path)) as temporary, temporary.open("wb") as stream:
@@ -425,13 +450,24 @@ def save_sensing_replay(replay: SensingReplayMeasurements, path: str | Path) -> 
         )
 
 
-def load_sensing_replay(path: str | Path) -> SensingReplayMeasurements:
-    """Load exactly the shared pooled-replay schema, never native provenance files."""
+def load_sensing_noise(path: str | Path) -> SensingNoiseMeasurements:
+    """Load a noise-history file and its physical inputs.
+
+    Args:
+        path: Path to the saved NPZ file.
+
+    Returns:
+        A retained case history and its numerical inputs at stored precision.
+
+    Raises:
+        FileNotFoundError: If a required file is missing.
+        ValueError: If its schema or numerical contents are invalid.
+    """
     with np.load(Path(path), allow_pickle=False) as saved:
         header = json.loads(str(saved["__header__"]))
         validate_observation_precision(header, saved, history_fields=("displacements",))
         if (
-            (set(header) - ({"precision"} if header.get("version") == 2 else set()))
+            (set(header) - {"precision"})
             != {
                 "schema",
                 "version",
@@ -446,16 +482,16 @@ def load_sensing_replay(path: str | Path) -> SensingReplayMeasurements:
             }
             or header["schema"] != _KIND
             or type(header["version"]) is not int
-            or header["version"] not in (1, 2)
+            or header["version"] != 2
             or header["units"] != _ARRAY_UNITS
             or header["centring"] != "pooled"
             or set(saved.files) != {"__header__", *_ARRAY_UNITS}
         ):
-            raise ValueError("invalid sensing replay schema, units, centring or fields")
-        dtype = header.get("precision", np.float64)
+            raise ValueError("invalid sensing measurement schema, units, centring or fields")
+        dtype = header["precision"]
         settings = dict(header["settings"])
         settings["displacement"] = settings.pop("displacement_mas") * u.mas
-        request = SensingReplayRequest(
+        request = SensingNoiseRequest(
             dtype=dtype,
             key=header["key"],
             population=header["population"],
@@ -466,7 +502,7 @@ def load_sensing_replay(path: str | Path) -> SensingReplayMeasurements:
                 for name in ("positions", "magnitudes", "ee", "fwhm")
             },
         )
-        return SensingReplayMeasurements(
+        return SensingNoiseMeasurements(
             dtype=dtype,
             request=request,
             controller=read_controller_header(header["controller"], dtype=dtype),

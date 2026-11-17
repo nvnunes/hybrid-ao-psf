@@ -184,7 +184,7 @@ def settling_cut(
         )
         if envelope <= tolerance:
             return cut, float(envelope)
-    raise ValueError(f"No settled replay window within {maximum} saved frames")
+    raise ValueError(f"No settled simulation window within {maximum} saved frames")
 
 
 def scalar_filter(
@@ -223,7 +223,7 @@ def filter_input(
 
     A complex Schur basis is a numerically stable exact 2D decomposition.
     Coupled off-diagonal response is retained; no symmetric-B approximation or
-    potentially ill-conditioned eigenvector inversion enters this replay.
+    potentially ill-conditioned eigenvector inversion enters this simulation.
     """
     from scipy.linalg import schur
 
@@ -251,5 +251,5 @@ def filter_input(
     result = np.einsum("ab,brt->art", basis, np.stack((first, second)))
     bound = 32 * np.finfo(dtype).eps * max(1.0, float(np.max(np.abs(result.real))))
     if np.max(np.abs(result.imag)) > bound:
-        raise ValueError("Noise replay has a nonreal numerical remainder.")
+        raise ValueError("Noise simulation has a nonreal numerical remainder.")
     return result.real

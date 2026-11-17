@@ -63,11 +63,25 @@ class NoiseBlurModel:
             object.__setattr__(self, name, dtype.type(value))
 
     def prepare(self, *, dtype: DTypeLike = np.float32) -> NoiseBlurModel:
-        """Copy coefficient state for the requested numerical precision."""
+        """Copy coefficient state for the requested numerical precision.
+
+        Args:
+            dtype: Numerical precision, either float32 or float64.
+
+        Returns:
+            A separate set of fitted shape coefficients at the requested precision.
+
+        Raises:
+            ValueError: If the precision is unsupported or conversion invalidates support.
+        """
         return replace(self, dtype=validate_psf_dtype(dtype))
 
     def parameters(self) -> dict[str, float]:
-        """Return the three named coefficients as ordinary floats."""
+        """Return the three named coefficients as ordinary floats.
+
+        Returns:
+            The mixture weight and the single- and multiple-NGS narrow scales.
+        """
         return {
             name: float(getattr(self, name))
             for name in (
@@ -82,6 +96,12 @@ class NoiseBlurModel:
 
         One NGS uses the single scale; every larger count uses the multi scale.
         Invalid counts raise ValueError.
+
+        Args:
+            ngs_count: Number of active guide stars in the asterism.
+
+        Returns:
+            Narrow and broad covariance multipliers, in that order.
         """
         if (
             isinstance(ngs_count, (bool, np.bool_))
@@ -101,6 +121,13 @@ class NoiseBlurModel:
         Radius is dimensionless after whitening by the supplied total covariance.
         Scalar/array nonnegative radii, including infinity, are accepted. NaN,
         negative radii and invalid NGS counts raise ValueError.
+
+        Args:
+            squared_radius: Dimensionless squared Mahalanobis radius or array.
+            ngs_count: Positive active NGS count selecting the fitted shape family.
+
+        Returns:
+            Cumulative probability at each radius, including unit probability at infinity.
         """
         radius = np.asarray(squared_radius, dtype=self.dtype)
         if np.isnan(radius).any() or np.any(radius < 0):
@@ -121,6 +148,19 @@ class NoiseBlurModel:
         width/height and ``pixel_scale`` is its positive angular pixel scale.
         Rows/columns follow y/x. The real (side,side) result has DC value one.
         Inputs are not mutated; invalid inputs raise ValueError.
+
+        Args:
+            covariance: Applied x/y angular noise covariance of shape ``(2, 2)``.
+            ngs_count: Positive active NGS count selecting the fitted shape family.
+            side: Number of rows and columns of the square frequency grid.
+            pixel_scale: Positive angular scale of one pixel.
+
+        Returns:
+            Real array of shape ``(side, side)`` with unity at DC.
+
+        Raises:
+            TypeError: If covariance or pixel scale lacks an Astropy quantity.
+            ValueError: If covariance, count, grid or scale is invalid.
         """
         self.scales(ngs_count)
         if not isinstance(covariance, u.Quantity) or not isinstance(

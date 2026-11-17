@@ -12,6 +12,7 @@ from numpy.typing import DTypeLike
 from scipy.interpolate import RegularGridInterpolator
 
 from ._calibration_contracts import (
+    CovarianceTelemetry,
     ReconstructorNoiseInputs,
     ReconstructorNoiseMeasurements,
     _count,
@@ -33,6 +34,9 @@ def _axis(value, unit, name, *, dtype=np.float64):
     if len(value) < 2 or np.any(value.value <= 0) or np.any(np.diff(value.value) <= 0):
         raise ValueError(f"{name} requires >=2 increasing positive nodes")
     return value
+
+
+# Measurement records and sampling grid
 
 
 @dataclass(frozen=True, kw_only=True, eq=False)
@@ -79,6 +83,8 @@ class ReconstructorCalibrationMeasurements(_PhysicalRecord):
         _count(self.seed, "seed", 0)
         if not isinstance(self.inputs, ReconstructorNoiseInputs):
             raise TypeError("inputs must be ReconstructorNoiseInputs")
+        if self.inputs.dtype != self.dtype:
+            raise ValueError("inputs precision must match measurement dtype")
         covariance = ReconstructorNoiseMeasurements(
             covariance=self.covariance, dtype=self.dtype
         ).covariance
@@ -106,14 +112,35 @@ class ReconstructorCalibrationMeasurements(_PhysicalRecord):
 
 
 def reconstructor_calibration_inputs(
-    photons_per_frame, fwhm, *, ee=None, holdouts=1200, seed=20261014, dtype=np.float32
-):
+    photons_per_frame: u.Quantity,
+    fwhm: u.Quantity,
+    *,
+    ee: u.Quantity | None = None,
+    holdouts: int = 1200,
+    seed: int = 20261014,
+    dtype: DTypeLike = np.float32,
+) -> ReconstructorNoiseInputs:
     """Construct the deterministic ordered batch for pre-filter noise calibration.
 
     Count/width inputs are increasing physical axes. ee=None uses a P*EE axis;
     a supplied increasing fraction axis keeps P and EE separate. The batch
     contains flattened ij-grid nodes, seeded holdouts and 24 equal-signal triples.
     This function requires no calibration object or native software.
+
+    Args:
+        photons_per_frame: Increasing axis of photon counts or, with ``ee=None``,
+            the product of photon count and encircled energy.
+        fwhm: Increasing angular FWHM axis.
+        ee: Optional increasing encircled-energy fractions.
+        holdouts: Positive number of seeded interpolation validation points.
+        seed: Seed controlling the ordered holdout batch.
+        dtype: Numerical precision for the generated coordinates.
+
+    Returns:
+        Ordered grid, holdout and equal-signal cases for native measurement.
+
+    Raises:
+        ValueError: If axes, holdout controls or precision are invalid.
     """
     dtype = validate_psf_dtype(dtype)
     photons = _axis(photons_per_frame, u.photon, "photons_per_frame", dtype=dtype).value
@@ -152,6 +179,9 @@ def reconstructor_calibration_inputs(
         ee=np.r_[fractions, product_ee] * u.one,
         fwhm=np.r_[values["fwhm"], product_width] * u.mas,
     )
+
+
+# Fitted noise prior and physical queries
 
 
 @dataclass(frozen=True, kw_only=True, eq=False)
@@ -234,8 +264,18 @@ class ReconstructorNoiseModel(_PhysicalRecord):
         ):
             object.__setattr__(self, name, value)
 
-    def prepare(self, *, dtype=np.float32) -> ReconstructorNoiseModel:
-        """Copy runtime table state without changing saved producer precision."""
+    def prepare(self, *, dtype: DTypeLike = np.float32) -> ReconstructorNoiseModel:
+        """Copy runtime table state without changing saved producer precision.
+
+        Args:
+            dtype: Numerical precision, either float32 or float64.
+
+        Returns:
+            A separate pre-filter noise provider at the requested precision.
+
+        Raises:
+            ValueError: If the precision is unsupported or conversion invalidates support.
+        """
         return replace(self, dtype=validate_psf_dtype(dtype))
 
     def predict(
@@ -246,6 +286,17 @@ class ReconstructorNoiseModel(_PhysicalRecord):
         Positive counts and widths and EE in (0,1] must lie inside table support.
         Product tables bound P*EE, rather than P and EE separately. No additional
         scientific approximation or extrapolation is applied during evaluation.
+
+        Args:
+            photons_per_frame: Incident photon counts for the NGS query.
+            ee: Encircled-energy fractions in (0, 1].
+            fwhm: Angular spot widths.
+
+        Returns:
+            Independent x/y covariance for each broadcast query, in square milliarcseconds.
+
+        Raises:
+            ValueError: If queries cannot broadcast or exceed measured support.
         """
         if not all(isinstance(v, u.Quantity) for v in (photons_per_frame, ee, fwhm)):
             raise TypeError("noise queries require physical quantities")
@@ -305,11 +356,27 @@ class ReconstructorNoiseModel(_PhysicalRecord):
     def measurement_noise(
         self, *, photons_per_frame: u.Quantity, ee: u.Quantity, fwhm: u.Quantity
     ) -> u.Quantity:
-        """Return block-diagonal C_eta for a nonempty one-dimensional NGS list."""
+        """Return block-diagonal C_eta for a nonempty one-dimensional NGS list.
+
+        Args:
+            photons_per_frame: Incident photon counts for the NGS query.
+            ee: Encircled-energy fractions in (0, 1].
+            fwhm: Angular spot widths.
+
+        Returns:
+            Block-diagonal ``(2*NGS, 2*NGS)`` covariance in square milliarcseconds,
+            with interleaved x/y coordinates.
+
+        Raises:
+            ValueError: If inputs are invalid or outside the model support.
+        """
         blocks = self.predict(photons_per_frame=photons_per_frame, ee=ee, fwhm=fwhm)
         if blocks.ndim != 3 or not len(blocks):
             raise ValueError("C_eta requires a nonempty one-dimensional NGS list")
         return np.diag(np.repeat(blocks.value[:, 0, 0], 2)) * u.mas**2
+
+
+# Build the noise prior
 
 
 @dataclass(frozen=True, kw_only=True)
@@ -333,14 +400,26 @@ class ReconstructorCalibrationResult:
 def build_reconstructor_calibration(
     measurements: ReconstructorCalibrationMeasurements,
     *,
-    interpolation="log-linear",
-    dtype=np.float32,
+    interpolation: str = "log-linear",
+    dtype: DTypeLike = np.float32,
 ) -> ReconstructorCalibrationResult:
     """Validate observations and build the calibrated prior without native access.
 
     Reject anisotropic/cross-axis priors and unjustified P*EE reduction. Preserve
     population/isotropy thresholds, seeded holdout queries and interpolation
     arithmetic. No files are opened or published by this operation.
+
+    Args:
+        measurements: Grid and holdout pre-filter covariance observations.
+        interpolation: Strategy for interpolating the scalar variance prior.
+        dtype: Numerical precision for validation and fitted state.
+
+    Returns:
+        The prior and interpolation, isotropy and equal-signal diagnostics.
+
+    Raises:
+        TypeError: If measurements is not an ordered reconstructor record.
+        ValueError: If the observations do not support a valid scalar prior.
     """
     if not isinstance(measurements, ReconstructorCalibrationMeasurements):
         raise TypeError("measurements must be ReconstructorCalibrationMeasurements")
@@ -415,10 +494,23 @@ def build_reconstructor_calibration(
     )
 
 
+# Save and load fitted noise priors
+
+
 def save_reconstructor_calibration(
     model: ReconstructorNoiseModel, path: str | Path
 ) -> None:
-    """Publish the runtime prior at model.json, preserving accepted data on failure."""
+    """Publish the runtime prior at model.json, preserving accepted data on failure.
+
+    Args:
+        model: The fitted pre-filter reconstructor noise prior.
+        path: Destination model.json manifest. Create its parent directories if
+            needed. Store the numerical payload beside the manifest. Replace
+            the manifest only after publishing the payload.
+
+    Raises:
+        TypeError: If the input is not the expected calibration record.
+    """
     if not isinstance(model, ReconstructorNoiseModel):
         raise TypeError("model must be ReconstructorNoiseModel")
     arrays = {
@@ -451,7 +543,18 @@ def save_reconstructor_calibration(
 
 
 def load_reconstructor_calibration(path: str | Path) -> ReconstructorNoiseModel:
-    """Load a strict shared prior without detector metadata or native software."""
+    """Load a strict shared prior without detector metadata or native software.
+
+    Args:
+        path: Path to the saved model.json manifest.
+
+    Returns:
+        The fitted pre-filter reconstructor noise prior reconstructed at its stored precision.
+
+    Raises:
+        FileNotFoundError: If a required file is missing.
+        ValueError: If its schema or numerical contents are invalid.
+    """
     header, arrays = load_product(path, _KIND)
     if (set(header) - {"precision", "producer_precision", "support_precision"}) != {
         "schema",
@@ -493,10 +596,22 @@ def load_reconstructor_calibration(path: str | Path) -> ReconstructorNoiseModel:
     )
 
 
+# Save and load noise measurements
+
+
 def save_reconstructor_measurements(
     measurements: ReconstructorCalibrationMeasurements, path: str | Path
 ) -> None:
-    """Atomically retain the complete ordered physical batch for offline building."""
+    """Atomically retain the complete ordered physical batch for offline building.
+
+    Args:
+        measurements: The ordered grid and validation observations.
+        path: Destination NPZ file. Create its parent directories if
+            needed. Atomically replace any existing destination.
+
+    Raises:
+        TypeError: If the input is not the expected calibration record.
+    """
     if not isinstance(measurements, ReconstructorCalibrationMeasurements):
         raise TypeError("unsupported measurement type")
     header = {
@@ -527,7 +642,18 @@ def save_reconstructor_measurements(
 def load_reconstructor_measurements(
     path: str | Path,
 ) -> ReconstructorCalibrationMeasurements:
-    """Load strict physical measurement arrays; never inspect native acquisition files."""
+    """Load strict physical measurement arrays; never inspect native acquisition files.
+
+    Args:
+        path: Path to the saved NPZ file.
+
+    Returns:
+        The ordered grid and validation observations reconstructed at its stored precision.
+
+    Raises:
+        FileNotFoundError: If a required file is missing.
+        ValueError: If its schema or numerical contents are invalid.
+    """
     import json
 
     with np.load(Path(path), allow_pickle=False) as saved:
@@ -574,12 +700,15 @@ def load_reconstructor_measurements(
         )
 
 
+# Solve the field-centre reconstructor
+
+
 def solve_lo_reconstructor(
     ngs_covariance: u.Quantity,
     centre_ngs_covariance: u.Quantity,
     measurement_noise: u.Quantity,
     *,
-    dtype=np.float32,
+    dtype: DTypeLike = np.float32,
 ) -> u.Quantity:
     """Solve absolute field-centre LO weights from explicit angular covariances.
 
@@ -588,6 +717,20 @@ def solve_lo_reconstructor(
     solve R=Cas(Css+C_eta)^-1 without conditioning or block normalization. One
     NGS returns I. Return an immutable dimensionless (2,2*N) quantity. No
     calibrated model or native software is required; singular matrices raise.
+
+    Args:
+        ngs_covariance: Atmospheric covariance between all NGS tilt axes.
+        centre_ngs_covariance: Field-centre tilt cross-covariance with NGS axes.
+        measurement_noise: Pre-filter NGS measurement-noise covariance.
+        dtype: Numerical precision of the solve.
+
+    Returns:
+        Dimensionless field-centre weights in interleaved NGS x/y order.
+
+    Raises:
+        TypeError: If a covariance lacks an Astropy quantity.
+        ValueError: If covariance inputs are invalid.
+        numpy.linalg.LinAlgError: If the required multistar matrix is singular.
     """
     from ._calibration_numerics import lo_reconstructor
 
@@ -625,17 +768,16 @@ def _reconstructor_atmospheric_covariances(
     )
 
 
-
 def build_lo_reconstructor(
-    covariances,
-    noise,
+    covariances: CovarianceFunctions,
+    noise: ReconstructorNoiseModel,
     *,
     ngs_positions: u.Quantity,
     zenith_angle: u.Quantity,
     photons_per_frame: u.Quantity,
     ee: u.Quantity,
     fwhm: u.Quantity,
-    dtype=np.float32,
+    dtype: DTypeLike = np.float32,
 ) -> np.ndarray:
     """Return absolute dimensionless field-centre LO weights, shape (2,2*N).
 
@@ -645,6 +787,22 @@ def build_lo_reconstructor(
     returns identity without querying either provider. No sensing gain, measured
     noise variance, weight normalization or covariance conditioning is introduced.
     Unsupported queries and unsolvable covariance matrices propagate errors.
+
+    Args:
+        covariances: Calibrated bank supplying atmospheric field covariances.
+        noise: Calibrated reconstructor noise prior.
+        ngs_positions: Cartesian angular NGS positions with shape ``(NGS, 2)``.
+        zenith_angle: Common angular viewing coordinate.
+        photons_per_frame: Incident photon count per NGS.
+        ee: Encircled-energy fraction per NGS.
+        fwhm: Angular spot width per NGS.
+        dtype: Numerical precision of the reconstruction.
+
+    Returns:
+        Dimensionless reconstructing weights with two interleaved columns per NGS.
+
+    Raises:
+        ValueError: If the supplied inputs or their calibrated support are invalid.
     """
     from ._calibration_contracts import _angle
     from ._calibration_numerics import lo_reconstructor
@@ -674,27 +832,26 @@ def build_lo_reconstructor(
         raise ValueError(
             "multiple NGS require calibrated atmospheric and noise providers"
         )
-    x, y = positions.T
-    blocks = covariances.C_t_t(
-        x[:, None], y[:, None], x[None, :], y[None, :], zenith_angle=angle
-    ).to_value(u.mas**2)
-    centre = covariances.C_t_t(
-        0 * u.arcsec, 0 * u.arcsec, x, y, zenith_angle=angle
-    ).to_value(u.mas**2)
-    css = blocks.transpose(0, 2, 1, 3).reshape(2 * n, 2 * n)
-    cas = centre.transpose(1, 0, 2).reshape(2, 2 * n)
+    ngs_covariance, centre_ngs_covariance = _reconstructor_atmospheric_covariances(
+        covariances, positions, angle
+    )
     prior = noise.measurement_noise(
         photons_per_frame=counts * u.photon, ee=fractions * u.one, fwhm=widths * u.mas
     ).to_value(u.mas**2)
-    return lo_reconstructor(css, cas, prior, dtype=dtype)
+    return lo_reconstructor(
+        ngs_covariance.value, centre_ngs_covariance.value, prior, dtype=dtype
+    )
+
+
+# Validate the reconstructor against telemetry
 
 
 def validate_covariance_reconstructor(
-    covariances,
+    covariances: CovarianceFunctions,
     noise: ReconstructorNoiseModel,
-    telemetry,
+    telemetry: CovarianceTelemetry,
 ) -> Mapping:
-    """Check calibrated-weight atmospheric assembly against direct matrix replay.
+    """Check calibrated-weight atmospheric assembly against direct matrix simulation.
 
     Use matching uncentred telemetry for one measured ZA plane and the bank's
     settled window. Choose one/two/three measured directions, build absolute
@@ -705,10 +862,19 @@ def validate_covariance_reconstructor(
     Raise on incompatible timing/directions or discrepancies above rtol=1e-12,
     atol=1e-10 mas squared. Return immutable per-asterism numerical evidence.
     No native files, WFS model or MASTSEL calculation is used.
-    """
-    from ._calibration_contracts import CovarianceTelemetry
-    from ._covariance_calibration import CovarianceFunctions
 
+    Args:
+        covariances: Measured covariance bank.
+        noise: Accepted reconstructor noise prior.
+        telemetry: Matched histories at one measured zenith plane.
+
+    Returns:
+        Immutable per-asterism evidence comparing bank and direct simulation.
+
+    Raises:
+        TypeError: If inputs are not the required typed records.
+        ValueError: If compatibility or agreement checks fail.
+    """
     if (
         not isinstance(covariances, CovarianceFunctions)
         or not isinstance(noise, ReconstructorNoiseModel)

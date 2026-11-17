@@ -20,9 +20,9 @@ from numpy.typing import DTypeLike, NDArray
 from ._calibration_config import load_e2e_calibration_configuration
 from ._calibration_contracts import _angle, _quantity
 from ._calibration_io import (
-    CalibrationArtifactIdentity,
     CalibrationFileIdentity,
-    read_calibration_artifact_identity,
+    CalibrationProductIdentity,
+    read_calibration_product_identity,
 )
 from ._coma_calibration import ComaResponseModel, load_coma_calibration
 from ._covariance_calibration import CovarianceFunctions, load_covariance_calibration
@@ -72,7 +72,7 @@ class E2ECalibratedModel(_LowOrderModel):
     ngs_metrics: NgsHoMetricInterpolator
     dtype: DTypeLike = np.float32
     product_identities: Mapping[
-        str, CalibrationArtifactIdentity | CalibrationFileIdentity
+        str, CalibrationProductIdentity | CalibrationFileIdentity
     ] = field(default_factory=dict)
 
     def __post_init__(self):
@@ -122,7 +122,7 @@ class E2ECalibratedModel(_LowOrderModel):
             expected = (
                 CalibrationFileIdentity
                 if name == "ngs_metrics"
-                else CalibrationArtifactIdentity
+                else CalibrationProductIdentity
             )
             if not isinstance(value, expected):
                 raise TypeError(f"invalid {name} product identity")
@@ -401,7 +401,7 @@ def load_e2e_calibrated_model(
         for name in ("covariance", "coma", "sensing", "reconstructor")
     }
     identities = {
-        name: read_calibration_artifact_identity(value) for name, value in paths.items()
+        name: read_calibration_product_identity(value) for name, value in paths.items()
     }
     identities["ngs_metrics"] = CalibrationFileIdentity(
         config.ngs_metrics, hashlib.sha256(config.ngs_metrics.read_bytes()).hexdigest()

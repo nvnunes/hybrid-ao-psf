@@ -1,5 +1,7 @@
 """Independent known-displacement gain and conditional-noise checks."""
 
+from dataclasses import replace
+
 import numpy as np
 import pytest
 from astropy import units as u
@@ -86,6 +88,8 @@ def test_reusable_sensing_observations_preserve_raw_means_pairing_and_statistics
         ),
         dtype=np.float64,
     )
+    with pytest.raises(ValueError, match="samples precision must match"):
+        replace(point, dtype=np.float32)
     path = tmp_path / "measured.npz"
     save_sensing_measurements(point, path)
     restored = load_sensing_measurements(path)
@@ -99,22 +103,22 @@ def test_reusable_sensing_observations_preserve_raw_means_pairing_and_statistics
         restored.samples.zero.value.flags.writeable = True
 
 
-def test_complete_sensing_offline_replay_shape_fit_and_roundtrip(tmp_path):
+def test_complete_sensing_noise_simulation_shape_fit_and_roundtrip(tmp_path):
     from hybrid_ao_psf import (
         CovarianceCalibrationSettings,
         CovarianceTelemetry,
         ReconstructorNoiseModel,
         SensingCalibrationSettings,
-        SensingReplayRequest,
+        SensingNoiseRequest,
         build_covariance_calibration,
         build_sensing_calibration,
         build_sensing_response,
         load_sensing_calibration,
-        load_sensing_replay,
+        load_sensing_noise,
         measure_covariance_calibration,
-        replay_sensing_calibration,
         save_sensing_calibration,
-        save_sensing_replay,
+        save_sensing_noise,
+        simulate_sensing_noise,
     )
 
     controller = FixedGainIntegrator(
@@ -186,7 +190,7 @@ def test_complete_sensing_offline_replay_shape_fit_and_roundtrip(tmp_path):
         dtype=np.float64,
     )
     requests = [
-        SensingReplayRequest(
+        SensingNoiseRequest(
             key=f"case{n}",
             population="fixture",
             zenith_angle=20 * u.deg,
@@ -203,21 +207,21 @@ def test_complete_sensing_offline_replay_shape_fit_and_roundtrip(tmp_path):
         zero_draws=128,
         gain_draws=64,
         block_draws=8,
-        replay_realizations=3,
-        replay_frames=256,
+        noise_realizations=3,
+        noise_frames=256,
         discard_frames=96,
     )
-    replays = list(
-        replay_sensing_calibration(
+    noise_measurements = list(
+        simulate_sensing_noise(
             response, requests, covariances, prior, settings=settings, dtype=np.float64
         )
     )
-    for replay in replays:
-        request = replay.request
+    for measurement in noise_measurements:
+        request = measurement.request
         rng = np.random.default_rng(request.seed)
-        total = settings.replay_frames + settings.discard_frames
+        total = settings.noise_frames + settings.discard_frames
         x = np.zeros((3, total, 2))
-        blocks = replay.reconstructor.value.reshape(
+        blocks = measurement.reconstructor.value.reshape(
             2, len(request.positions), 2
         ).transpose(1, 0, 2)
         for g in range(len(request.positions)):
@@ -228,10 +232,10 @@ def test_complete_sensing_offline_replay_shape_fit_and_roundtrip(tmp_path):
                 rng=rng,
                 count=3 * total,
             )
-            scaled = (white * np.sqrt(replay.variances.value[g])).reshape(3, total, 2)
+            scaled = (white * np.sqrt(measurement.variances.value[g])).reshape(3, total, 2)
             x += scaled @ blocks[g].T
         output = np.zeros_like(x)
-        B = replay.feedback.value
+        B = measurement.feedback.value
         for k in range(2, total):
             output[:, k] = (
                 output[:, k - 1] - 0.3 * (output[:, k - 2] @ B.T) + 0.3 * x[:, k - 2]
@@ -240,66 +244,73 @@ def test_complete_sensing_offline_replay_shape_fit_and_roundtrip(tmp_path):
         pooled = displacement.mean(axis=(0, 1))
         centred = displacement - pooled
         np.testing.assert_allclose(
-            replay.displacements.value,
-            centred.astype(replay.dtype),
+            measurement.displacements.value,
+            centred.astype(measurement.dtype),
             rtol=1e-10,
             atol=1e-10,
         )
         np.testing.assert_allclose(
-            replay.pooled_mean.value, pooled, rtol=1e-12, atol=1e-12
+            measurement.pooled_mean.value, pooled, rtol=1e-12, atol=1e-12
         )
         flat = centred.reshape(-1, 2)
         np.testing.assert_allclose(
-            replay.measured_covariance.value,
+            measurement.measured_covariance.value,
             flat.T @ flat / len(flat),
             rtol=1e-12,
             atol=1e-12,
         )
         assert np.linalg.norm(centred.mean(axis=1)) > 0
         path = tmp_path / f"{request.key}.npz"
-        save_sensing_replay(replay, path)
+        save_sensing_noise(measurement, path)
         np.testing.assert_array_equal(
-            load_sensing_replay(path).displacements, replay.displacements
+            load_sensing_noise(path).displacements, measurement.displacements
         )
-    from dataclasses import replace
-
     with pytest.raises(ValueError, match="response calibration"):
         build_sensing_calibration(
             response,
             [
                 replace(
-                    replays[0],
-                    variances=replays[0].variances * 1.1,
-                    analytical_covariance=replays[0].analytical_covariance * 1.1,
+                    noise_measurements[0],
+                    variances=noise_measurements[0].variances * 1.1,
+                    analytical_covariance=noise_measurements[0].analytical_covariance * 1.1,
                 ),
-                *replays[1:],
+                *noise_measurements[1:],
             ],
             dtype=np.float64,
         )
     with pytest.raises(ValueError, match="positive semidefinite"):
-        replace(replays[0], measured_covariance=np.diag([-1.0, 1.0]) * u.mas**2)
+        replace(noise_measurements[0], measured_covariance=np.diag([-1.0, 1.0]) * u.mas**2)
     # Stored float32 histories need not have an exactly zero pooled mean, and
     # the distinct realization means are part of the calibrated distribution.
-    assert np.linalg.norm(replays[0].displacements.value.mean(axis=(0, 1))) > 0
-    changed = replays[0].displacements.copy()
+    assert np.linalg.norm(noise_measurements[0].displacements.value.mean(axis=(0, 1))) > 0
+    changed = noise_measurements[0].displacements.copy()
     changed[0, 0] *= 100
     for updates in (
         {"displacements": changed},
-        {"measured_covariance": replays[0].measured_covariance * 1.1},
-        {"pooled_mean": replays[0].pooled_mean + [1, 0] * u.mas},
-        {"realization_means": replays[0].realization_means + [1, 0] * u.mas},
+        {"measured_covariance": noise_measurements[0].measured_covariance * 1.1},
+        {"pooled_mean": noise_measurements[0].pooled_mean + [1, 0] * u.mas},
+        {"realization_means": noise_measurements[0].realization_means + [1, 0] * u.mas},
     ):
         with pytest.raises(ValueError, match="history moments"):
-            replace(replays[0], **updates)
+            replace(noise_measurements[0], **updates)
     # The same validation must apply to external retained records on load.
-    path = tmp_path / f"{replays[0].request.key}.npz"
+    path = tmp_path / f"{noise_measurements[0].request.key}.npz"
     with np.load(path, allow_pickle=False) as stored:
         arrays = dict(stored)
+    import json
+
+    header = json.loads(str(arrays["__header__"]))
+    np.savez_compressed(path, **(arrays | {"__header__": json.dumps(dict(header, version=1))}))
+    with pytest.raises(ValueError, match="schema"):
+        load_sensing_noise(path)
     arrays["measured_covariance"] = arrays["measured_covariance"] * 1.2
     np.savez_compressed(path, **arrays)
     with pytest.raises(ValueError, match="history moments"):
-        load_sensing_replay(path)
-    result = build_sensing_calibration(response, replays, dtype=np.float64)
+        load_sensing_noise(path)
+    result = build_sensing_calibration(response, noise_measurements, dtype=np.float64)
+    lower_precision = build_sensing_calibration(response, noise_measurements, dtype=np.float32)
+    assert lower_precision.model.dtype == np.dtype(np.float32)
+    assert lower_precision.diagnostics["asterisms"] == result.diagnostics["asterisms"]
     assert result.diagnostics["asterisms"] == 3
     assert result.diagnostics["final_fit"]["family_weights"] == {
         "single": 0.5,
@@ -308,24 +319,32 @@ def test_complete_sensing_offline_replay_shape_fit_and_roundtrip(tmp_path):
     path = tmp_path / "model.json"
     save_sensing_calibration(result.model, path)
     model = load_sensing_calibration(path)
+    header = json.loads(path.read_text())
+    assert header["version"] == 3
+    assert header["centring"] == "pooled"
+    for version in (2, 4):
+        path.write_text(json.dumps(dict(header, version=version)))
+        with pytest.raises(ValueError, match="product schema"):
+            load_sensing_calibration(path)
+    path.write_text(json.dumps(header))
     case = requests[2]
     width = model.noise_covariance(
         positions=case.positions,
         magnitudes=case.magnitudes,
         zenith_angle=case.zenith_angle,
-        reconstructor=replays[2].reconstructor.value,
+        reconstructor=noise_measurements[2].reconstructor.value,
     )
-    np.testing.assert_array_equal(width, replays[2].analytical_covariance)
+    np.testing.assert_array_equal(width, noise_measurements[2].analytical_covariance)
     assert model.blur.parameters() == result.model.blur.parameters()
     with pytest.raises(ValueError):
         model.response.gain_table.value.flags.writeable = True
 
 
-def test_empty_replay_asterism_is_rejected_before_loop_work():
-    from hybrid_ao_psf import SensingReplayRequest
+def test_empty_noise_asterism_is_rejected_before_loop_work():
+    from hybrid_ao_psf import SensingNoiseRequest
 
     with pytest.raises(ValueError, match="must not be empty"):
-        SensingReplayRequest(
+        SensingNoiseRequest(
             key="empty",
             population="test",
             zenith_angle=20 * u.deg,
