@@ -10,7 +10,7 @@ import numpy as np
 from ao_stats import PsfMetadata
 from astropy import units as u
 
-from ._e2e_model import E2ELowOrderPrediction
+from ._e2e_prediction import E2ELowOrderPrediction
 from ._io import atomic_output_path
 from .contracts import (
     HybridDiagnostics,

@@ -1,4 +1,4 @@
-"""Independent matrix replay and configured calibrated-model contracts."""
+"""Independent matrix simulation and configured calibrated-model contracts."""
 
 import builtins
 import json
@@ -14,6 +14,7 @@ from hybrid_ao_psf import (
     CalibrationPhotometry,
     ComaResponseModel,
     CovarianceCalibrationSettings,
+    CovarianceFunctions,
     CovarianceTelemetry,
     E2ECalibratedModel,
     FixedGainIntegrator,
@@ -37,7 +38,7 @@ from hybrid_ao_psf import (
     save_reconstructor_calibration,
     save_sensing_calibration,
 )
-from hybrid_ao_psf._e2e_model import _scalar_decomposition
+from hybrid_ao_psf._lo_model import _ReconstructorCovariances, _scalar_decomposition
 
 
 def pooled(left, right):
@@ -45,7 +46,7 @@ def pooled(left, right):
     return (left - left.mean(0)).T @ (right - right.mean(0)) / len(left)
 
 
-def matrix_replay(inputs, feedback, gain, delay):
+def simulate_matrix_loop(inputs, feedback, gain, delay):
     # Independent recurrence; no shared controller/filter/impulse helper.
     output = np.broadcast_to(
         np.linalg.solve(feedback, inputs[:, 0].T).T[:, None], inputs.shape
@@ -173,7 +174,7 @@ def synthetic():
             zenith_angle=record.zenith_angle,
         ).gain.value
         feedback = sum(g * weights[:, 2 * i : 2 * i + 2] for i, g in enumerate(gains))
-        strengths.extend(_scalar_decomposition(feedback)["strengths"])
+        strengths.extend(_scalar_decomposition(feedback).strengths)
     measured = measure_covariance_calibration(
         record,
         controller,
@@ -194,8 +195,60 @@ def synthetic():
     ), record
 
 
+@pytest.mark.parametrize("indices,expected_tilt_queries", [([0], 1), ([0, 8], 3)])
+def test_reconstructor_uses_one_evaluated_prior(
+    synthetic, monkeypatch, indices, expected_tilt_queries
+):
+    model, record = synthetic
+    priors = []
+    original_prior = ReconstructorNoiseModel.measurement_noise
+    original_tilt = CovarianceFunctions.C_t_t
+    tilt_queries = []
+
+    def measurement_noise(self, **kwargs):
+        prior = original_prior(self, **kwargs)
+        priors.append(prior)
+        return prior
+
+    def tilt_covariance(self, *args, **kwargs):
+        tilt_queries.append(args)
+        return original_tilt(self, *args, **kwargs)
+
+    monkeypatch.setattr(ReconstructorNoiseModel, "measurement_noise", measurement_noise)
+    monkeypatch.setattr(CovarianceFunctions, "C_t_t", tilt_covariance)
+    prediction = model.predict(
+        ngs_positions=record.positions[indices],
+        magnitudes=np.full(len(indices), 9) * u.mag,
+        science_positions=record.positions,
+        zenith_angle=record.zenith_angle,
+    )
+
+    assert len(priors) == 1
+    np.testing.assert_array_equal(prediction.noise_prior, priors[0])
+    assert len(tilt_queries) == expected_tilt_queries
+    if len(indices) == 1:
+        np.testing.assert_array_equal(prediction.reconstructor, np.eye(2))
+
+
+def test_low_order_base_rejects_reconstruction_for_wrong_ngs_count(synthetic):
+    model, _ = synthetic
+    one_ngs_covariance = np.eye(2) * u.mas**2
+    with pytest.raises(ValueError, match="two axes per NGS"):
+        model._predict_low_order(
+            reconstruction_covariances=_ReconstructorCovariances(
+                ngs_covariance=one_ngs_covariance,
+                centre_ngs_covariance=one_ngs_covariance,
+                noise_prior=one_ngs_covariance,
+            ),
+            sensing_gains=np.array([0.4, 0.6]),
+            wfs_noise_variances=np.array([1.0, 2.0]),
+            controller=model.covariance.controller,
+            evaluate_covariances=lambda _: pytest.fail("must reject before evaluation"),
+        )
+
+
 @pytest.mark.parametrize("indices", [[0], [0, 8], [0, 8, 2]])
-def test_complete_covariances_match_independent_matrix_replay(synthetic, indices):
+def test_complete_covariances_match_independent_loop_simulation(synthetic, indices):
     model, record = synthetic
     prediction = model.predict(
         ngs_positions=record.positions[indices],
@@ -217,10 +270,10 @@ def test_complete_covariances_match_independent_matrix_replay(synthetic, indices
         for g, idx in enumerate(indices)
     )
     controller = model.covariance.controller
-    atm = matrix_replay(
+    atm = simulate_matrix_loop(
         atm_input, prediction.feedback, controller.gain, controller.delay
     )[:, model.covariance.discard :]
-    ho = matrix_replay(
+    ho = simulate_matrix_loop(
         ho_input, prediction.feedback, controller.gain, controller.delay
     )[:, model.covariance.discard :]
     science = record.tilt.value[:, model.covariance.discard :]
@@ -337,14 +390,14 @@ def test_precision_immutability_and_input_rejection(synthetic, dtype, indices):
 def test_feedback_limits_and_scalar_closed_form():
     for b in (0.5, 1.0, 1.7):
         values = _scalar_decomposition(np.eye(2) * b)
-        np.testing.assert_allclose(values["strengths"], b)
-        np.testing.assert_allclose(values["projectors"].sum(0), np.eye(2))
-        assert not values["symmetric_feedback_fallback"]
+        np.testing.assert_allclose(values.strengths, b)
+        np.testing.assert_allclose(values.projectors.sum(0), np.eye(2))
+        assert not values.symmetric_fallback
     feedback = np.array([[0.8, 0.2], [-0.2, 0.8]])
     values = _scalar_decomposition(feedback)
-    assert values["symmetric_feedback_fallback"]
-    np.testing.assert_allclose(values["effective_feedback"], np.eye(2) * 0.8)
-    assert values["feedback_approximation_relative_error"] > 0.1
+    assert values.symmetric_fallback
+    np.testing.assert_allclose(values.effective_feedback, np.eye(2) * 0.8)
+    assert values.approximation_relative_error > 0.1
     with pytest.raises(ValueError, match="defective"):
         _scalar_decomposition(np.array([[0.8, 1.0], [0, 0.8]]))
 
@@ -375,17 +428,17 @@ def test_nonorthogonal_projectors_allow_matrix_product_roundoff(dtype, feedback)
     )
     assert np.max(np.abs(np.linalg.eigvals(controller.transition(feedback)))) < 1
     decomposition = _scalar_decomposition(feedback)
-    projectors = decomposition["projectors"]
+    projectors = decomposition.projectors
     tolerance = max(1e-10, 32 * np.finfo(dtype).eps)
-    assert not decomposition["symmetric_feedback_fallback"]
-    assert decomposition["eigenbasis_condition"] < min(
+    assert not decomposition.symmetric_fallback
+    assert decomposition.eigenbasis_condition < min(
         1e10, 1 / (100 * np.finfo(dtype).eps)
     )
     np.testing.assert_allclose(
         projectors.sum(0), np.eye(2), rtol=tolerance, atol=tolerance
     )
     np.testing.assert_allclose(
-        np.einsum("p,pab->ab", decomposition["strengths"], projectors),
+        np.einsum("p,pab->ab", decomposition.strengths, projectors),
         feedback,
         rtol=tolerance,
         atol=tolerance,
@@ -538,7 +591,7 @@ def test_unsupported_spatial_and_zenith_queries_are_rejected(synthetic):
 def test_complex_feedback_bank_uses_symmetric_part_but_noise_uses_actual(
     synthetic, monkeypatch
 ):
-    import hybrid_ao_psf._e2e_model as implementation
+    import hybrid_ao_psf._lo_model as implementation
 
     model, record = synthetic
     indices = [0, 8]
@@ -553,7 +606,9 @@ def test_complex_feedback_bank_uses_symmetric_part_but_noise_uses_actual(
     second = (actual - gains[0] * first) / gains[1]
     weights = np.hstack((first, second))
     monkeypatch.setattr(
-        implementation, "build_lo_reconstructor", lambda *args, **kwargs: weights
+        implementation,
+        "lo_reconstructor",
+        lambda *args, **kwargs: weights,
     )
     result = model.predict(
         ngs_positions=record.positions[indices],
@@ -573,7 +628,7 @@ def test_complex_feedback_bank_uses_symmetric_part_but_noise_uses_actual(
         * result.coma_response.value[g]
         for g, idx in enumerate(indices)
     )
-    effective = matrix_replay(atm + ho, result.effective_feedback, 0.3, 2)[
+    effective = simulate_matrix_loop(atm + ho, result.effective_feedback, 0.3, 2)[
         :, model.covariance.discard :
     ]
     for j in range(len(record.positions)):
@@ -608,23 +663,29 @@ def test_complex_feedback_bank_uses_symmetric_part_but_noise_uses_actual(
     [
         (np.eye(2) * 2.5, "support"),
         (np.eye(2) * 4, "Unstable"),
+        (np.array([[0.7, -0.6], [0.6, -0.1]]), "Unstable"),  # Symmetric part only.
         (np.array([[0.8, 1.0], [0, 0.8]]), "defective"),
     ],
 )
 def test_model_rejects_unsupported_feedback(synthetic, monkeypatch, feedback, error):
-    import hybrid_ao_psf._e2e_model as implementation
+    import hybrid_ao_psf._lo_model as implementation
 
     model, record = synthetic
-    g = model.sensing.predict(
-        positions=record.positions[[0]], magnitudes=[9] * u.mag, zenith_angle=20 * u.deg
+    positions = record.positions[[0, 8]]
+    magnitudes = [9, 9] * u.mag
+    gain = model.sensing.predict(
+        positions=positions, magnitudes=magnitudes, zenith_angle=20 * u.deg
     ).gain.value[0]
+    weights = np.hstack((feedback / gain, np.zeros_like(feedback)))
     monkeypatch.setattr(
-        implementation, "build_lo_reconstructor", lambda *args, **kwargs: feedback / g
+        implementation,
+        "lo_reconstructor",
+        lambda *args, **kwargs: weights,
     )
     with pytest.raises(ValueError, match=error):
         model.predict(
-            ngs_positions=record.positions[[0]],
-            magnitudes=[9] * u.mag,
+            ngs_positions=positions,
+            magnitudes=magnitudes,
             science_positions=record.positions[[4]],
             zenith_angle=20 * u.deg,
         )

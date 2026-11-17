@@ -20,6 +20,7 @@ from ._calibration_contracts import (
 )
 from ._calibration_io import validate_observation_precision
 from ._calibration_products import immutable_metadata, load_product, save_product
+from ._covariance_calibration import CovarianceFunctions
 from ._io import atomic_output_path
 from ._validation import clip_support, support_dtype, validate_psf_dtype
 
@@ -602,6 +603,27 @@ def solve_lo_reconstructor(
     return _quantity(
         lo_reconstructor(*values, dtype=dtype) * u.one, u.one, "weights", 2, dtype=dtype
     )
+
+
+def _reconstructor_atmospheric_covariances(
+    covariances: CovarianceFunctions,
+    ngs_positions: u.Quantity,
+    zenith_angle: u.Quantity,
+) -> tuple[u.Quantity, u.Quantity]:
+    """Pack unfiltered NGS/NGS and centre/NGS covariance in interleaved x/y order."""
+    x, y = ngs_positions.T
+    blocks = covariances.C_t_t(
+        x[:, None], y[:, None], x[None, :], y[None, :], zenith_angle=zenith_angle
+    ).to(u.mas**2)
+    centre = covariances.C_t_t(
+        0 * u.arcsec, 0 * u.arcsec, x, y, zenith_angle=zenith_angle
+    ).to(u.mas**2)
+    components = 2 * len(ngs_positions)
+    return (
+        blocks.transpose(0, 2, 1, 3).reshape(components, components),
+        centre.transpose(1, 0, 2).reshape(2, components),
+    )
+
 
 
 def build_lo_reconstructor(

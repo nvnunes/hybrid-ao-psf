@@ -19,7 +19,7 @@ from ._validation import validate_psf_dtype
 if TYPE_CHECKING:
     from mastsel import MavisLO
 
-    from ._e2e_model import E2ELowOrderPrediction
+    from ._e2e_prediction import E2ELowOrderPrediction
 
 # Calibrated against released MASTSEL output. Negative eigenvalues at or below
 # this magnitude represent a material covariance failure in nm^2.
@@ -778,7 +778,7 @@ class HybridResult(_PhysicalRecord):
             if self.e2e_prediction is not None:
                 raise ValueError("MASTSEL results cannot contain E2E prediction state")
         else:
-            from ._e2e_model import E2ELowOrderPrediction
+            from ._e2e_prediction import E2ELowOrderPrediction
 
             if dtype is None:
                 raise ValueError("E2E results require a uniform declared precision")

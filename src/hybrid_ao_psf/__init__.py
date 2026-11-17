@@ -55,9 +55,9 @@ from ._covariance_calibration import (
 )
 from ._e2e_model import (
     E2ECalibratedModel,
-    E2ELowOrderPrediction,
     load_e2e_calibrated_model,
 )
+from ._e2e_prediction import E2ELowOrderPrediction
 from ._noise_blur import NoiseBlurModel
 from ._reconstructor_calibration import (
     ReconstructorCalibrationMeasurements,
