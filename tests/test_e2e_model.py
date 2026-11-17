@@ -18,8 +18,8 @@ from hybrid_ao_psf import (
     CovarianceTelemetry,
     E2ECalibratedModel,
     FixedGainIntegrator,
-    NgsHoMetricSamples,
     NoiseBlurModel,
+    PsfMetricSamples,
     ReconstructorNoiseModel,
     SensingCalibration,
     SensingCalibrationMeasurements,
@@ -27,14 +27,14 @@ from hybrid_ao_psf import (
     SensingWfsSampling,
     build_covariance_calibration,
     build_lo_reconstructor,
-    build_ngs_ho_metric_interpolator,
+    build_psf_metric_interpolator,
     build_sensing_response,
     load_e2e_calibrated_model,
     load_sensing_calibration,
     measure_covariance_calibration,
     save_coma_calibration,
     save_covariance_calibration,
-    save_ngs_ho_metric_interpolator,
+    save_psf_metric_interpolator,
     save_reconstructor_calibration,
     save_sensing_calibration,
 )
@@ -131,8 +131,8 @@ def synthetic():
         photometry=photometry,
         dtype=np.float64,
     )
-    metrics = build_ngs_ho_metric_interpolator(
-        NgsHoMetricSamples(
+    metrics = build_psf_metric_interpolator(
+        PsfMetricSamples(
             x=xy[:, 0] * u.arcsec,
             y=xy[:, 1] * u.arcsec,
             zenith_angle=20 * u.deg,
@@ -463,7 +463,7 @@ def test_configured_native_free_loading_and_conflicts(synthetic, tmp_path, monke
         strict=True,
     ):
         save(getattr(model, family), tmp_path / family / "model.json")
-    save_ngs_ho_metric_interpolator(model.ngs_metrics, tmp_path / "metrics.pkl")
+    save_psf_metric_interpolator(model.ngs_metrics, tmp_path / "metrics.pkl")
     ini = tmp_path / "model.ini"
     ini.write_text(
         "[e2e]\nprecision = float64\n"
@@ -584,7 +584,7 @@ def test_unsupported_spatial_and_zenith_queries_are_rejected(synthetic):
     }
     with pytest.raises(ValueError, match="support|outside"):
         model.predict(**(args | {"science_positions": [[10, 10]] * u.arcsec}))
-    with pytest.raises(ValueError, match="support|fixed"):
+    with pytest.raises(ValueError, match="range|fixed"):
         model.predict(**(args | {"zenith_angle": 60 * u.deg}))
 
 

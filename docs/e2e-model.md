@@ -76,9 +76,9 @@ for the result fields and constructor contracts.
 Pass the loaded model to the same engine used for MASTSEL:
 
 ```python
-from hybrid_ao_psf import HybridRequest, load_science_ho_psf_interpolator, simulate
+from hybrid_ao_psf import HybridRequest, load_psf_interpolator, simulate
 
-science = load_science_ho_psf_interpolator("science.pkl")
+science = load_psf_interpolator("science.pkl")
 request = HybridRequest(
     lo_model="e2e-calibrated",
     science_x=[0, 12] * u.arcsec, science_y=[0, 12] * u.arcsec,

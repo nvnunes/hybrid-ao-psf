@@ -1,8 +1,9 @@
 from __future__ import annotations
 
 import json
-import shutil
+from configparser import ConfigParser
 from dataclasses import replace
+from io import StringIO
 from pathlib import Path
 
 import numpy as np
@@ -13,26 +14,24 @@ from ngs_photometry import WFSPhotometryConfig, photons_per_frame_to_magnitudes
 from hybrid_ao_psf import (
     HybridCtotCorrection,
     HybridRequest,
-    NgsHoMetricPrediction,
-    NgsHoMetricSamples,
-    RbfInterpolationConfig,
-    ScienceHoPsfSamples,
+    PsfMetricPrediction,
+    PsfMetricSamples,
+    PsfSamples,
     _mastsel,
-    build_ngs_ho_metric_interpolator,
-    build_science_ho_psf_interpolator,
+    build_psf_interpolator,
+    build_psf_metric_interpolator,
     cli,
     load_configuration,
-    load_ngs_ho_metric_interpolator,
+    load_psf_interpolator,
+    load_psf_metric_interpolator,
     load_result,
-    load_science_ho_psf_interpolator,
     run_configuration,
-    save_ngs_ho_metric_interpolator,
-    save_science_ho_psf_interpolator,
+    save_psf_interpolator,
+    save_psf_metric_interpolator,
     simulate,
 )
 
 DATA = Path(__file__).parent / "data"
-EXAMPLE = Path(__file__).parents[1] / "examples" / "hybrid.ini"
 SCIENCE_X_ARCSEC = np.array([0.0, 36.0, 60.0])
 SCIENCE_Y_ARCSEC = np.zeros(3)
 NGS_RADIUS_ARCSEC = 30.0
@@ -49,10 +48,10 @@ def test_real_mastsel_engine_matches_retained_hybrid_golden(tmp_path: Path) -> N
     products = tmp_path / "products"
     products.mkdir()
     science_path = products / "science.pkl"
-    ngs_path = products / "ngs.pkl"
-    save_science_ho_psf_interpolator(
-        build_science_ho_psf_interpolator(
-            ScienceHoPsfSamples(
+    ngs_path = products / "ngs-metrics.pkl"
+    save_psf_interpolator(
+        build_psf_interpolator(
+            PsfSamples(
                 zenith_angle=20.0 * u.deg,
                 wavelength=WAVELENGTH_UM * u.um,
                 x=SCIENCE_X_ARCSEC * u.arcsec,
@@ -66,9 +65,9 @@ def test_real_mastsel_engine_matches_retained_hybrid_golden(tmp_path: Path) -> N
         science_path,
     )
     ngs_x, ngs_y = _ngs_cartesian()
-    save_ngs_ho_metric_interpolator(
-        build_ngs_ho_metric_interpolator(
-            NgsHoMetricSamples(
+    save_psf_metric_interpolator(
+        build_psf_metric_interpolator(
+            PsfMetricSamples(
                 zenith_angle=20.0 * u.deg,
                 x=ngs_x * u.arcsec,
                 y=ngs_y * u.arcsec,
@@ -76,13 +75,12 @@ def test_real_mastsel_engine_matches_retained_hybrid_golden(tmp_path: Path) -> N
                 fwhm=np.array([76.0, 80.0, 84.0]) * u.mas,
                 sr=np.array([0.24, 0.22, 0.20]) * u.one,
             ),
-            interpolation_config=RbfInterpolationConfig(smoothing=0.0),
             dtype=np.float64,
         ),
         ngs_path,
     )
     configuration_path = tmp_path / "hybrid.ini"
-    shutil.copyfile(EXAMPLE, configuration_path)
+    configuration_path.write_text(_reference_ini(), encoding="utf-8")
     result = run_configuration(configuration_path, dtype=np.float64)
     persisted = load_result(tmp_path / "results" / "hybrid.h5")
     cli_output = tmp_path / "results" / "cli.h5"
@@ -153,8 +151,8 @@ def test_real_mastsel_engine_matches_retained_hybrid_golden(tmp_path: Path) -> N
             ngs_magnitude=magnitudes,
             ngs_magnitude_zeropoint=zeropoint,
         ),
-        load_science_ho_psf_interpolator(science_path),
-        load_ngs_ho_metric_interpolator(ngs_path),
+        load_psf_interpolator(science_path),
+        load_psf_metric_interpolator(ngs_path),
     )
     np.testing.assert_allclose(
         magnitude_result.ngs_flux.value, result.ngs_flux.value, rtol=1e-14
@@ -171,8 +169,8 @@ def test_real_mastsel_engine_matches_retained_hybrid_golden(tmp_path: Path) -> N
 
     no_op = simulate(
         configuration.request,
-        load_science_ho_psf_interpolator(science_path),
-        load_ngs_ho_metric_interpolator(ngs_path),
+        load_psf_interpolator(science_path),
+        load_psf_metric_interpolator(ngs_path),
         ctot_correction=HybridCtotCorrection(noop),
     )
     np.testing.assert_array_equal(no_op.ctot_wavefront, result.ctot_wavefront)
@@ -196,9 +194,9 @@ def test_capture_noise_matches_native_fixed_gain_expression(tmp_path, count):
         ngs_flux=flux,
         wavelength=WAVELENGTH_UM * u.um,
         zenith_angle=20 * u.deg,
-        mastsel_ini=EXAMPLE.read_text(),
+        mastsel_ini=_reference_ini(),
     )
-    metrics = NgsHoMetricPrediction(
+    metrics = PsfMetricPrediction(
         np.array([0.42, 0.40, 0.38])[:count] * u.one,
         np.array([76, 80, 84])[:count] * u.mas,
         np.full(count, 0.24) * u.one,
@@ -226,9 +224,9 @@ def test_capture_noise_matches_native_fixed_gain_expression(tmp_path, count):
     baseline = _mastsel._compute_mastsel_ctot(context)
     expected.clear()
     with _mastsel._capture_mastsel(context) as captured:
-        replay = _mastsel._compute_mastsel_ctot(context)
+        repeated = _mastsel._compute_mastsel_ctot(context)
     completed = _mastsel._complete_mastsel_context(context, captured)
-    np.testing.assert_array_equal(replay, baseline)
+    np.testing.assert_array_equal(repeated, baseline)
     np.testing.assert_allclose(
         np.diag(completed.mastsel_statistics.measurement_noise.value),
         expected,
@@ -238,6 +236,32 @@ def test_capture_noise_matches_native_fixed_gain_expression(tmp_path, count):
     assert completed.mastsel is model
     assert "computeCovMatrices" not in model.__dict__
     assert "buildReconstuctor2" not in model.__dict__
+
+
+def _reference_ini() -> str:
+    """Use the observing settings of the retained golden result."""
+    config = ConfigParser(interpolation=None)
+    config.optionxform = str
+    config.read(DATA / "mastsel_reference.ini", encoding="utf-8")
+    config["telescope"]["ZenithAngle"] = "20.0"
+    config["sources_LO"]["Zenith"] = str([NGS_RADIUS_ARCSEC] * len(NGS_THETA_DEG))
+    config["sources_LO"]["Azimuth"] = str(NGS_THETA_DEG.tolist())
+    config["sources_science"] = {
+        "Wavelength": str([WAVELENGTH_UM * 1e-6]),
+        "Zenith": str(SCIENCE_X_ARCSEC.tolist()),
+        "Azimuth": str(SCIENCE_Y_ARCSEC.tolist()),
+    }
+    config["hybrid"] = {
+        "science_psf_file": "products/science.pkl",
+        "ngs_metric_file": "products/ngs-metrics.pkl",
+        "output": "results/hybrid.h5",
+        "ngs_flux_photon_per_s": "[7.744945e7, 7.744945e7, 7.744945e7]",
+        "non_psd_policy": "error",
+        "diagnostics_level": "debug",
+    }
+    stream = StringIO()
+    config.write(stream)
+    return stream.getvalue()
 
 
 def _ngs_cartesian() -> tuple[np.ndarray, np.ndarray]:

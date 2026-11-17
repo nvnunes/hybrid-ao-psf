@@ -14,7 +14,7 @@ from .contracts import (
     HybridCtotContext,
     HybridMastselStatistics,
     HybridRequest,
-    NgsHoMetricPrediction,
+    PsfMetricPrediction,
 )
 
 
@@ -44,7 +44,7 @@ def _load_mavis_lo() -> Any:
 def _prepare_mastsel_context(
     directory: str,
     request: HybridRequest,
-    metrics: NgsHoMetricPrediction,
+    metrics: PsfMetricPrediction,
     effective_ini: str,
     ngs_frame_rate: u.Quantity,
     ngs_flux: u.Quantity,

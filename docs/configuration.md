@@ -6,7 +6,7 @@ Hybrid AO PSF uses one INI file for one simulation. `[hybrid] lo_model` selects
 ## MASTSEL Configuration
 
 Existing MASTSEL sections retain their familiar names and fields. The separate `[hybrid]` section owns
-artifact selection, standalone output, resolved high-order inputs, and engine
+file selection, standalone output, resolved high-order inputs, and engine
 policy.
 
 ### Hybrid Section
@@ -15,12 +15,12 @@ The `[hybrid]` section requires:
 
 | Field | Meaning |
 | --- | --- |
-| `science_psf_artifact` | Loaded science-HO-PSF artifact path |
-| `ngs_metric_artifact` | Loaded NGS-HO-metric artifact path |
+| `science_psf_file` | Loaded science-HO-PSF file path |
+| `ngs_metric_file` | Loaded NGS-HO-metric file path |
 | `output` | Standalone HDF5 result path |
 | `ngs_flux_photon_per_s` | One resolved photon-rate value per active NGS |
 
-Artifact and output paths are resolved relative to the INI file. The artifact
+File and output paths are resolved relative to the INI file. The file
 paths must exist when the configuration is loaded; the output and its parent
 directory may be created later.
 
@@ -38,7 +38,7 @@ is `clip`. `diagnostics_level` is optional and defaults to `none`. The
 `validation` level retains lightweight PSD validity and angular-Ctot summary
 facts. The `debug` level retains those facts plus the pre-blur PSF cube.
 
-The loaded science-PSF artifact owns the PSF pixel scale. Hybrid AO PSF uses
+The loaded science-PSF file owns the PSF pixel scale. Hybrid AO PSF uses
 that scale for Ctot blur and preserves it in the result metadata; it does not
 relabel or resample the provider output. The retired `pixel_scale_mas` Hybrid
 option is rejected so a stale configuration cannot silently imply otherwise.
@@ -81,8 +81,8 @@ Azimuth = [0.0, 120.0, 240.0]
 SensorFrameRate_LO = 500.0
 
 [hybrid]
-science_psf_artifact = products/science.pkl
-ngs_metric_artifact = products/ngs.pkl
+science_psf_file = products/science.pkl
+ngs_metric_file = products/ngs.pkl
 output = results/hybrid.h5
 ngs_flux_photon_per_s = [1200.0, 950.0, 1100.0]
 non_psd_policy = error
@@ -117,7 +117,7 @@ inputs in `[hybrid]`:
 [e2e]
 precision = float32
 science_psf = products/science.pkl
-ngs_psf = products/ngs-psf.pkl
+ngs_psf = products/ngs.pkl
 ngs_metrics = products/ngs-metrics.pkl
 reconstructor_model = products/reconstructor/model.json
 covariance_model = products/covariance/model.json
@@ -153,9 +153,3 @@ are not imported or executed. Complete prediction opens `science_psf`, the four
 model products and `ngs_metrics`; it does not open `ngs_psf` or native sources.
 The requested wavelength, ZA, directions, magnitudes and feedback strengths
 must lie within the applicable provider/product supports.
-
-The same Python and CLI commands run either selected model:
-
-```bash
-hybrid-ao-psf path/to/e2e.ini --precision float64
-```

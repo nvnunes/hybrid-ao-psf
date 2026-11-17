@@ -74,7 +74,7 @@ Build the small example interpolation products and run one simulation:
 ./.conda/bin/hybrid-ao-psf examples/hybrid.ini
 ```
 
-The combined INI resolves its artifact and result paths relative to
+The combined INI resolves its file and result paths relative to
 `examples/hybrid.ini` and writes `examples/results/hybrid.h5`. The same
 scientific operation is available programmatically through `simulate()`;
 `run_configuration()` provides the complete INI-to-HDF5 convenience route.

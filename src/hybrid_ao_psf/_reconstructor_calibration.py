@@ -23,7 +23,7 @@ from ._calibration_io import validate_observation_precision
 from ._calibration_products import immutable_metadata, load_product, save_product
 from ._covariance_calibration import CovarianceFunctions
 from ._io import atomic_output_path
-from ._validation import clip_support, support_dtype, validate_psf_dtype
+from ._validation import coarsest_precision, snap_coordinate_range, validate_psf_dtype
 
 _KIND = "hybrid-ao-psf-reconstructor-noise"
 _MEASUREMENTS = "hybrid-ao-psf-reconstructor-measurements"
@@ -224,7 +224,7 @@ class ReconstructorNoiseModel(_PhysicalRecord):
         object.__setattr__(
             self,
             "support_precision",
-            support_dtype(self.dtype, self.producer_dtype, self.support_precision),
+            coarsest_precision(self.dtype, self.producer_dtype, self.support_precision),
         )
         photons = _axis(
             self.photons_per_frame, u.photon, "photons_per_frame", dtype=self.dtype
@@ -327,7 +327,7 @@ class ReconstructorNoiseModel(_PhysicalRecord):
         )
         precision = self.support_precision
         values = tuple(
-            clip_support(value, axis, dtype=precision, label=name)
+            snap_coordinate_range(value, axis, dtype=precision, label=name)
             for name, value, axis in zip(names, values, axes, strict=True)
         )
         logarithmic = self.interpolation == "log-linear"
@@ -336,7 +336,7 @@ class ReconstructorNoiseModel(_PhysicalRecord):
             for i, v in enumerate(values)
         ]
         coordinates = [
-            clip_support(value, axis, dtype=precision, label=name)
+            snap_coordinate_range(value, axis, dtype=precision, label=name)
             for value, axis, name in zip(
                 coordinates, self._interpolator.grid, names, strict=True
             )
@@ -459,7 +459,7 @@ def build_reconstructor_calibration(
     model = ReconstructorNoiseModel(
         dtype=dtype,
         producer_dtype=dtype,
-        support_precision=support_dtype(dtype, measurements.dtype),
+        support_precision=coarsest_precision(dtype, measurements.dtype),
         photons_per_frame=measurements.photons_per_frame,
         fwhm=measurements.fwhm,
         ee=measurements.ee,

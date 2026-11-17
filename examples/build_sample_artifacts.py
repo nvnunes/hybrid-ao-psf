@@ -8,13 +8,12 @@ import numpy as np
 from astropy import units as u
 
 from hybrid_ao_psf import (
-    NgsHoMetricSamples,
-    RbfInterpolationConfig,
-    ScienceHoPsfSamples,
-    build_ngs_ho_metric_interpolator,
-    build_science_ho_psf_interpolator,
-    save_ngs_ho_metric_interpolator,
-    save_science_ho_psf_interpolator,
+    PsfMetricSamples,
+    PsfSamples,
+    build_psf_interpolator,
+    build_psf_metric_interpolator,
+    save_psf_interpolator,
+    save_psf_metric_interpolator,
 )
 
 ROOT = Path(__file__).resolve().parent
@@ -27,9 +26,9 @@ PSF_SIZE = 17
 def main() -> None:
     """Write ready-to-evaluate sample products beside the sample INI."""
     PRODUCTS.mkdir(parents=True, exist_ok=True)
-    save_science_ho_psf_interpolator(
-        build_science_ho_psf_interpolator(
-            ScienceHoPsfSamples(
+    save_psf_interpolator(
+        build_psf_interpolator(
+            PsfSamples(
                 zenith_angle=20.0 * u.deg,
                 wavelength=1.654 * u.um,
                 x=SCIENCE_X * u.arcsec,
@@ -38,24 +37,21 @@ def main() -> None:
                 pixel_scale=10.796265491541053 * u.mas,
                 tel_diameter=7.9 * u.m,
                 tel_pupil=np.ones((PSF_SIZE, PSF_SIZE), dtype=np.float32) * u.one,
-                provenance=("Hybrid AO PSF standalone sample",),
             )
         ),
         PRODUCTS / "science.pkl",
         overwrite=True,
     )
-    save_ngs_ho_metric_interpolator(
-        build_ngs_ho_metric_interpolator(
-            NgsHoMetricSamples(
+    save_psf_metric_interpolator(
+        build_psf_metric_interpolator(
+            PsfMetricSamples(
                 zenith_angle=20.0 * u.deg,
                 x=30.0 * np.cos(NGS_THETA) * u.arcsec,
                 y=30.0 * np.sin(NGS_THETA) * u.arcsec,
                 ee=np.array([0.42, 0.40, 0.38]) * u.one,
                 fwhm=np.array([76.0, 80.0, 84.0]) * u.mas,
                 sr=np.array([0.24, 0.22, 0.20]) * u.one,
-                provenance=("Hybrid AO PSF standalone sample",),
             ),
-            interpolation_config=RbfInterpolationConfig(smoothing=0.0),
         ),
         PRODUCTS / "ngs.pkl",
         overwrite=True,

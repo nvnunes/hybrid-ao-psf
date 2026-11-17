@@ -21,7 +21,7 @@ from ._calibration_contracts import (
 )
 from ._sensing_grid import calibration_magnitude_intervals, rectangular_neighbors
 from ._sensing_measurements import SensingCalibrationMeasurements
-from ._validation import clip_support, support_dtype, validate_psf_dtype
+from ._validation import coarsest_precision, snap_coordinate_range, validate_psf_dtype
 
 
 def _immutable_array(value, dtype=None):
@@ -122,7 +122,7 @@ class SensingResponseModel:
                 precision are inconsistent.
         """
         dtype = validate_psf_dtype(arrays["gain"].dtype)
-        support_precision = support_dtype(dtype, producer_dtype, support_precision)
+        support_precision = coarsest_precision(dtype, producer_dtype, support_precision)
         expected = {
             "airmass",
             "zenith_deg",
@@ -377,13 +377,13 @@ class SensingResponseModel:
             )
         angles = self.zenith_angles.value
         angle = (
-            clip_support(angle.value, angles, dtype=precision, label="zenith angle")
+            snap_coordinate_range(angle.value, angles, dtype=precision, label="zenith angle")
             * u.deg
         )
         x, y = positions.value.T
-        x = clip_support(x, self.x.value, dtype=precision, label="sensing x")
-        y = clip_support(y, self.y.value, dtype=precision, label="sensing y")
-        mag = clip_support(
+        x = snap_coordinate_range(x, self.x.value, dtype=precision, label="sensing x")
+        y = snap_coordinate_range(y, self.y.value, dtype=precision, label="sensing y")
+        mag = snap_coordinate_range(
             mag, self.magnitudes.value, dtype=precision, label="sensing magnitude"
         )
         query = np.column_stack(
@@ -535,13 +535,13 @@ class SensingResponseCalibration:
         position = (
             np.array(
                 [
-                    clip_support(
+                    snap_coordinate_range(
                         position.value[0],
                         self.model.x.value,
                         dtype=precision,
                         label="sensing x",
                     ),
-                    clip_support(
+                    snap_coordinate_range(
                         position.value[1],
                         self.model.y.value,
                         dtype=precision,
@@ -552,7 +552,7 @@ class SensingResponseCalibration:
             * u.arcsec
         )
         mag = (
-            clip_support(
+            snap_coordinate_range(
                 mag.value,
                 self.model.magnitudes.value,
                 dtype=precision,
@@ -621,7 +621,7 @@ def build_sensing_response(
     for item in measurements:
         if not isinstance(item, SensingCalibrationMeasurements):
             raise TypeError("typed sensing observations required")
-        coordinate_precision = support_dtype(coordinate_precision, item.dtype)
+        coordinate_precision = coarsest_precision(coordinate_precision, item.dtype)
         item = replace(
             item,
             dtype=dtype,

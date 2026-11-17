@@ -8,7 +8,7 @@ import pytest
 from ao_stats import compute_psf_fwhm
 
 from hybrid_ao_psf import (
-    ScienceHoPsfPrediction,
+    PsfPrediction,
     _mastsel,
     load_result,
     save_result,
@@ -40,7 +40,7 @@ def test_complete_blur_statistics_and_result_keep_selected_values(
     source[:, 4, 4] += 1e-8
     request = replace(_request(), dtype=dtype)
     science = _ScienceProvider(
-        ScienceHoPsfPrediction(
+        PsfPrediction(
             source, old.prediction.pixel_scale, old.prediction.metadata, dtype=dtype
         )
     )

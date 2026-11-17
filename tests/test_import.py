@@ -25,11 +25,10 @@ def test_package_root_exports_supported_contracts() -> None:
         "HybridResult",
         "LowOrderModel",
         "LowOrderDistribution",
-        "NgsHoMetricPrediction",
-        "NgsMetricProvider",
         "NonPsdPolicy",
-        "ScienceHoPsfPrediction",
-        "SciencePsfProvider",
+        "PsfMetricProvider",
+        "PsfProvider",
+        "PsfFileProvider",
         "__version__",
         "apply_finite_fov_otfs",
         "blur_psfs_with_ctot",
@@ -132,3 +131,23 @@ def test_required_dependencies_are_available() -> None:
 
 def test_distribution_metadata_matches_package() -> None:
     assert metadata.version("hybrid-ao-psf") == hybrid_ao_psf.__version__
+
+
+def test_psf_validation_is_internal_and_comparison_remains_public() -> None:
+    for surface in (hybrid_ao_psf, interpolation):
+        for family in ("psf", "psf_metric", "science_ho_psf", "ngs_ho_metric"):
+            for operation in ("interpolator", "coordinates"):
+                name = f"validate_{family}_{operation}"
+                assert name not in surface.__all__
+                assert not hasattr(surface, name)
+        assert callable(surface.compare_psf_interpolator)
+        assert callable(surface.compare_psf_metric_interpolator)
+
+
+def test_interpolation_exports_only_generic_psf_names() -> None:
+    for surface in (hybrid_ao_psf, interpolation):
+        assert not any(
+            name.startswith(("ScienceHo", "NgsHo")) for name in surface.__all__
+        )
+        assert not hasattr(surface, "SciencePsfProvider")
+        assert not hasattr(surface, "NgsMetricProvider")

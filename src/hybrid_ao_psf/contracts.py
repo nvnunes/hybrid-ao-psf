@@ -49,16 +49,15 @@ class DiagnosticsLevel(StrEnum):
 
 
 @dataclass(frozen=True)
-class ScienceHoPsfPrediction:
-    """Science high-order PSFs returned by a loaded provider.
+class PsfPrediction:
+    """PSFs returned for requested coordinates.
 
     Attributes:
-        psfs: One non-negative PSF image per requested science coordinate, in
+        psfs: One non-negative PSF image per requested field coordinate, in
             ``(N, y, x)`` order. Columns increase toward ``+x`` and rows
             toward ``+y`` in the request's Cartesian frame.
         pixel_scale: Scalar angular pixel scale shared by the returned PSFs.
         metadata: Physical PSF metadata compatible with AO Stats.
-        meta: Optional scalar physical metadata propagated from the source.
         dtype: PSF pixel precision, float32 by default. Explicit float64 retains
             double-precision source pixels; other precisions are rejected.
     """
@@ -66,7 +65,6 @@ class ScienceHoPsfPrediction:
     psfs: np.ndarray
     pixel_scale: u.Quantity
     metadata: PsfMetadata
-    meta: Mapping[str, u.Quantity] = field(default_factory=dict)
     dtype: DTypeLike = field(default=np.float32, kw_only=True)
 
     def __post_init__(self) -> None:
@@ -88,16 +86,14 @@ class ScienceHoPsfPrediction:
             metadata.pixel_scale.to_value(u.mas), pixel_scale.to_value(u.mas)
         ):
             raise ValueError("pixel_scale must match scalar metadata.pixel_scale.")
-        meta = _quantity_mapping(self.meta, label="meta", scalar_only=True)
         object.__setattr__(self, "psfs", psfs)
         object.__setattr__(self, "pixel_scale", pixel_scale)
         object.__setattr__(self, "metadata", metadata)
-        object.__setattr__(self, "meta", meta)
 
 
 @dataclass(frozen=True)
-class NgsHoMetricPrediction(_PhysicalRecord):
-    """NGS high-order metrics with immutable values and protected unit metadata.
+class PsfMetricPrediction(_PhysicalRecord):
+    """PSF metrics with immutable values and protected unit metadata.
 
     Quantity access returns a view; changing its unit does not alter the
     record. Numeric storage cannot become writable through NumPy flags.
@@ -105,9 +101,9 @@ class NgsHoMetricPrediction(_PhysicalRecord):
     Attributes:
         dtype: float32 by default or explicit float64. None preserves individual
             stored array precisions when reconstructing a legacy result.
-        ee: Encircled-energy fraction for each requested NGS coordinate.
-        fwhm: Full width at half maximum for each requested NGS coordinate.
-        sr: Strehl ratio for each requested NGS coordinate.
+        ee: Encircled-energy fraction for each requested field coordinate.
+        fwhm: Full width at half maximum for each requested field coordinate.
+        sr: Strehl ratio for each requested field coordinate.
     """
 
     ee: u.Quantity
@@ -126,9 +122,9 @@ class NgsHoMetricPrediction(_PhysicalRecord):
             self.sr, u.dimensionless_unscaled, "sr", ndim=1, dtype=dtype
         )
         if not (ee.shape == fwhm.shape == sr.shape):
-            raise ValueError("NGS metric vectors must have identical shapes.")
+            raise ValueError("PSF metric vectors must have identical shapes.")
         if ee.size == 0:
-            raise ValueError("NGS metric vectors must not be empty.")
+            raise ValueError("PSF metric vectors must not be empty.")
         if np.any(ee.value < 0.0) or np.any(sr.value < 0.0):
             raise ValueError("ee and sr must be non-negative.")
         if np.any(fwhm.value <= 0.0):
@@ -139,33 +135,73 @@ class NgsHoMetricPrediction(_PhysicalRecord):
 
 
 @runtime_checkable
-class SciencePsfProvider(Protocol):
-    """Loaded, reusable provider of interpolated science high-order PSFs."""
+class PsfProvider(Protocol):
+    """Supply PSFs at requested field coordinates, wavelength, and zenith angle.
 
-    def predict(
+    Implementations may read existing images or interpolate samples. They own
+    the supported coordinates, image sampling, flux convention, and source
+    access. Each evaluation returns independent, read-only data.
+    """
+
+    def evaluate(
         self,
         *,
         zenith_angle: u.Quantity,
         wavelength: u.Quantity,
         x: u.Quantity,
         y: u.Quantity,
-    ) -> ScienceHoPsfPrediction:
-        """Evaluate science high-order PSFs at one request's coordinates."""
+    ) -> PsfPrediction:
+        """Return PSFs at one wavelength and zenith angle for the requested field points.
+
+        Args:
+            zenith_angle: Common zenith angle as a scalar angular quantity.
+            wavelength: Common wavelength as a scalar length quantity.
+            x: Field positions along x as an angular quantity.
+            y: Field positions along y as an angular quantity paired with ``x``.
+
+        Returns:
+            One image per coordinate pair in request order, with a common angular
+            pixel scale and physical metadata. Preserve the provider's source
+            flux convention and return rows towards +y and columns towards +x.
+
+        Raises:
+            ValueError: If a requested coordinate, wavelength, or zenith angle
+                cannot be supplied.
+            FileNotFoundError: If the implementation requires an unavailable file.
+        """
         ...
 
 
 @runtime_checkable
-class NgsMetricProvider(Protocol):
-    """Loaded, reusable provider of interpolated NGS high-order metrics."""
+class PsfMetricProvider(Protocol):
+    """Supply PSF metrics at requested field coordinates and zenith angle.
 
-    def predict(
+    Implementations own the source of the values and the coordinates they
+    can satisfy. Results align with the requested field order.
+    """
+
+    def evaluate(
         self,
         *,
         zenith_angle: u.Quantity,
         x: u.Quantity,
         y: u.Quantity,
-    ) -> NgsHoMetricPrediction:
-        """Evaluate NGS high-order metrics at one request's coordinates."""
+    ) -> PsfMetricPrediction:
+        """Return PSF metrics for the requested field points at one zenith angle.
+
+        Args:
+            zenith_angle: Common zenith angle as a scalar angular quantity.
+            x: Field positions along x as an angular quantity.
+            y: Field positions along y as an angular quantity paired with ``x``.
+
+        Returns:
+            Encircled energy, FWHM and Strehl ratio in request order.
+
+        Raises:
+            ValueError: If requested field coordinates or zenith angle cannot
+                be supplied.
+            FileNotFoundError: If the implementation requires an unavailable file.
+        """
         ...
 
 
@@ -388,7 +424,7 @@ class HybridCtotContext:
     mastsel_statistics: HybridMastselStatistics | None
     angle_to_wavefront_scale: u.Quantity
     request: HybridRequest
-    ngs_metrics: NgsHoMetricPrediction
+    ngs_metrics: PsfMetricPrediction
     ngs_flux: u.Quantity
     ngs_frame_rate: u.Quantity
     effective_mastsel_ini: str
@@ -396,8 +432,8 @@ class HybridCtotContext:
     def __post_init__(self) -> None:
         if not isinstance(self.request, HybridRequest):
             raise TypeError("request must be a HybridRequest.")
-        if not isinstance(self.ngs_metrics, NgsHoMetricPrediction):
-            raise TypeError("ngs_metrics must be an NgsHoMetricPrediction.")
+        if not isinstance(self.ngs_metrics, PsfMetricPrediction):
+            raise TypeError("ngs_metrics must be a PsfMetricPrediction.")
         size = self.request.ngs_x.size
         if self.ngs_metrics.ee.size != size:
             raise ValueError("NGS metrics must match the request's active NGS.")
@@ -627,7 +663,6 @@ class HybridResult(_PhysicalRecord):
             None preserves stored per-array precision when loading legacy results.
         psfs: Final PSFs after low-order blurring, in ``(N, y, x)`` order.
         metadata: Physical metadata for ``psfs``.
-        source_metadata: Scalar metadata from the science PSF provider.
         ngs_metrics: Interpolated guide-star high-order metrics.
         ctot_wavefront: MASTSEL conditioned covariance in wavefront units,
             with physical x/y axes; None for E2E-Calibrated.
@@ -660,8 +695,7 @@ class HybridResult(_PhysicalRecord):
 
     psfs: np.ndarray
     metadata: PsfMetadata
-    source_metadata: Mapping[str, u.Quantity]
-    ngs_metrics: NgsHoMetricPrediction
+    ngs_metrics: PsfMetricPrediction
     ctot_wavefront: u.Quantity | None
     ctot_angle: u.Quantity
     angle_to_wavefront_scale: u.Quantity | None
@@ -687,8 +721,36 @@ class HybridResult(_PhysicalRecord):
     def __post_init__(self) -> None:
         dtype = None if self.dtype is None else validate_psf_dtype(self.dtype)
         object.__setattr__(self, "dtype", dtype)
-        lo_model = LowOrderModel(self.lo_model)
-        object.__setattr__(self, "lo_model", lo_model)
+        object.__setattr__(self, "lo_model", LowOrderModel(self.lo_model))
+        self._prepare_image_fields()
+        self._prepare_metric_and_diagnostic_precision()
+
+        num_science = self.psfs.shape[0]
+        num_ngs = self.ngs_metrics.ee.size
+        ctot_angle = _ctot_quantity(
+            self.ctot_angle, u.mas**2, "ctot_angle", num_science, dtype=dtype
+        )
+        object.__setattr__(self, "ctot_angle", ctot_angle)
+        if self.lo_model is LowOrderModel.MASTSEL:
+            self._prepare_mastsel_fields(num_science, num_ngs)
+        else:
+            self._prepare_calibrated_fields(num_science, num_ngs)
+
+        self._prepare_distribution()
+        self._prepare_coordinates(num_science, num_ngs)
+        self._prepare_summary_fields(num_science, num_ngs)
+        self._validate_diagnostic_summaries(num_science)
+        object.__setattr__(
+            self,
+            "provenance",
+            MappingProxyType(
+                {str(key): str(value) for key, value in self.provenance.items()}
+            ),
+        )
+
+    def _prepare_image_fields(self) -> None:
+        """Own the output image cube and its physical metadata at result precision."""
+        dtype = self.dtype
         psfs = _readonly_array(self.psfs, dtype=dtype, label="psfs", ndim=3)
         if np.any(psfs < 0.0):
             raise ValueError("psfs must be non-negative.")
@@ -697,11 +759,18 @@ class HybridResult(_PhysicalRecord):
             raise ValueError("psfs must have positive flux.")
         num_science = psfs.shape[0]
         metadata = _readonly_metadata(self.metadata, num_psfs=num_science, dtype=dtype)
-        source_metadata = _quantity_mapping(
-            self.source_metadata, label="source_metadata", scalar_only=True, dtype=dtype
-        )
-        if not isinstance(self.ngs_metrics, NgsHoMetricPrediction):
-            raise TypeError("ngs_metrics must be an NgsHoMetricPrediction.")
+        object.__setattr__(self, "psfs", psfs)
+        object.__setattr__(self, "metadata", metadata)
+
+    def _prepare_metric_and_diagnostic_precision(self) -> None:
+        """Keep typed dependent records consistent with the declared precision."""
+        dtype = self.dtype
+        if self.diagnostics is not None and not isinstance(
+            self.diagnostics, HybridDiagnostics
+        ):
+            raise TypeError("diagnostics must be a HybridDiagnostics instance.")
+        if not isinstance(self.ngs_metrics, PsfMetricPrediction):
+            raise TypeError("ngs_metrics must be a PsfMetricPrediction.")
         if dtype is not None:
             object.__setattr__(
                 self, "ngs_metrics", replace(self.ngs_metrics, dtype=dtype)
@@ -710,102 +779,57 @@ class HybridResult(_PhysicalRecord):
                 object.__setattr__(
                     self, "diagnostics", replace(self.diagnostics, dtype=dtype)
                 )
-        num_ngs = self.ngs_metrics.ee.size
-        ctot_angle = _ctot_quantity(
-            self.ctot_angle, u.mas**2, "ctot_angle", num_science, dtype=dtype
-        )
-        if lo_model is LowOrderModel.MASTSEL:
-            ctot_wavefront = _ctot_quantity(
-                self.ctot_wavefront, u.nm**2, "ctot_wavefront", num_science, dtype=dtype
-            )
-            angle_to_wavefront_scale = _positive_scalar(
-                self.angle_to_wavefront_scale,
-                u.nm / u.mas,
-                "angle_to_wavefront_scale",
-                dtype=dtype,
-            )
-            expected_ctot_angle = (
-                ctot_wavefront.to_value(u.nm**2)
-                / angle_to_wavefront_scale.to_value(u.nm / u.mas) ** 2
-            )
-            if not np.allclose(
-                ctot_angle.to_value(u.mas**2),
-                expected_ctot_angle,
-                rtol=max(1.0e-10, 8 * np.finfo(psfs.dtype).eps),
-                atol=1.0e-9,
-            ):
-                raise ValueError(
-                    "ctot_angle must equal ctot_wavefront divided by "
-                    "angle_to_wavefront_scale squared."
-                )
-            minimum_eigenvalue = float(
-                np.min(np.linalg.eigvalsh(ctot_wavefront.to_value(u.nm**2)))
-            )
-            if minimum_eigenvalue < -CTOT_PSD_TOLERANCE_NM2:
-                raise ValueError(
-                    "ctot_wavefront must be positive semidefinite within the fixed "
-                    f"{CTOT_PSD_TOLERANCE_NM2:.6g} nm2 tolerance."
-                )
-            ngs_flux = _vector_with_length(
-                self.ngs_flux,
-                u.photon / u.s,
-                "ngs_flux",
-                num_ngs,
-                positive=True,
-                dtype=dtype,
-            )
-            if (self.ngs_magnitude is None) != (self.ngs_magnitude_zeropoint is None):
-                raise ValueError(
-                    "ngs_magnitude and ngs_magnitude_zeropoint must be paired."
-                )
-            ngs_magnitude = None
-            zeropoint = None
-            if self.ngs_magnitude is not None:
-                ngs_magnitude = _vector_with_length(
-                    self.ngs_magnitude,
-                    u.mag,
-                    "ngs_magnitude",
-                    num_ngs,
-                    positive=False,
-                    dtype=dtype,
-                )
-                zeropoint = _positive_scalar(
-                    self.ngs_magnitude_zeropoint,
-                    u.photon / (u.m**2 * u.s),
-                    "ngs_magnitude_zeropoint",
-                    dtype=dtype,
-                )
-            if self.e2e_prediction is not None:
-                raise ValueError("MASTSEL results cannot contain E2E prediction state")
-        else:
-            from ._e2e_prediction import E2ELowOrderPrediction
 
-            if dtype is None:
-                raise ValueError("E2E results require a uniform declared precision")
-            if any(
-                value is not None
-                for value in (
-                    self.ctot_wavefront,
-                    self.angle_to_wavefront_scale,
-                    self.ngs_flux,
-                    self.effective_mastsel_ini,
-                    self.ngs_magnitude_zeropoint,
-                )
-            ):
-                raise ValueError("E2E results cannot contain MASTSEL-only fields")
-            if (
-                not isinstance(self.e2e_prediction, E2ELowOrderPrediction)
-                or self.e2e_prediction.dtype != dtype
-            ):
-                raise ValueError(
-                    "E2E results require matching prediction state/precision"
-                )
-            if (
-                self.e2e_prediction.total.shape != (num_science, 2, 2)
-                or len(self.e2e_prediction.gains) != num_ngs
-            ):
-                raise ValueError("E2E prediction dimensions must match the result")
-            ctot_wavefront = angle_to_wavefront_scale = ngs_flux = zeropoint = None
+    def _prepare_mastsel_fields(self, num_science: int, num_ngs: int) -> None:
+        """Validate the wavefront-to-angle conversion and MASTSEL inputs."""
+        dtype = self.dtype
+        ctot_angle = self.ctot_angle
+        ctot_wavefront = _ctot_quantity(
+            self.ctot_wavefront, u.nm**2, "ctot_wavefront", num_science, dtype=dtype
+        )
+        angle_to_wavefront_scale = _positive_scalar(
+            self.angle_to_wavefront_scale,
+            u.nm / u.mas,
+            "angle_to_wavefront_scale",
+            dtype=dtype,
+        )
+        expected_ctot_angle = (
+            ctot_wavefront.to_value(u.nm**2)
+            / angle_to_wavefront_scale.to_value(u.nm / u.mas) ** 2
+        )
+        if not np.allclose(
+            ctot_angle.to_value(u.mas**2),
+            expected_ctot_angle,
+            rtol=max(1.0e-10, 8 * np.finfo(self.psfs.dtype).eps),
+            atol=1.0e-9,
+        ):
+            raise ValueError(
+                "ctot_angle must equal ctot_wavefront divided by "
+                "angle_to_wavefront_scale squared."
+            )
+        minimum_eigenvalue = float(
+            np.min(np.linalg.eigvalsh(ctot_wavefront.to_value(u.nm**2)))
+        )
+        if minimum_eigenvalue < -CTOT_PSD_TOLERANCE_NM2:
+            raise ValueError(
+                "ctot_wavefront must be positive semidefinite within the fixed "
+                f"{CTOT_PSD_TOLERANCE_NM2:.6g} nm2 tolerance."
+            )
+        ngs_flux = _vector_with_length(
+            self.ngs_flux,
+            u.photon / u.s,
+            "ngs_flux",
+            num_ngs,
+            positive=True,
+            dtype=dtype,
+        )
+        if (self.ngs_magnitude is None) != (self.ngs_magnitude_zeropoint is None):
+            raise ValueError(
+                "ngs_magnitude and ngs_magnitude_zeropoint must be paired."
+            )
+        ngs_magnitude = None
+        zeropoint = None
+        if self.ngs_magnitude is not None:
             ngs_magnitude = _vector_with_length(
                 self.ngs_magnitude,
                 u.mag,
@@ -814,6 +838,70 @@ class HybridResult(_PhysicalRecord):
                 positive=False,
                 dtype=dtype,
             )
+            zeropoint = _positive_scalar(
+                self.ngs_magnitude_zeropoint,
+                u.photon / (u.m**2 * u.s),
+                "ngs_magnitude_zeropoint",
+                dtype=dtype,
+            )
+        if self.e2e_prediction is not None:
+            raise ValueError("MASTSEL results cannot contain E2E prediction state")
+        if (
+            not isinstance(self.effective_mastsel_ini, str)
+            or not self.effective_mastsel_ini.strip()
+        ):
+            raise ValueError("effective_mastsel_ini must not be empty.")
+        effective_mastsel_ini = self.effective_mastsel_ini.strip() + "\n"
+        object.__setattr__(self, "ctot_wavefront", ctot_wavefront)
+        object.__setattr__(self, "angle_to_wavefront_scale", angle_to_wavefront_scale)
+        object.__setattr__(self, "ngs_flux", ngs_flux)
+        object.__setattr__(self, "ngs_magnitude", ngs_magnitude)
+        object.__setattr__(self, "ngs_magnitude_zeropoint", zeropoint)
+        object.__setattr__(self, "effective_mastsel_ini", effective_mastsel_ini)
+
+    def _prepare_calibrated_fields(self, num_science: int, num_ngs: int) -> None:
+        """Check calibrated prediction shape, precision and required magnitudes."""
+        dtype = self.dtype
+        from ._e2e_prediction import E2ELowOrderPrediction
+
+        if dtype is None:
+            raise ValueError("E2E results require a uniform declared precision")
+        if any(
+            value is not None
+            for value in (
+                self.ctot_wavefront,
+                self.angle_to_wavefront_scale,
+                self.ngs_flux,
+                self.effective_mastsel_ini,
+                self.ngs_magnitude_zeropoint,
+            )
+        ):
+            raise ValueError("E2E results cannot contain MASTSEL-only fields")
+        if (
+            not isinstance(self.e2e_prediction, E2ELowOrderPrediction)
+            or self.e2e_prediction.dtype != dtype
+        ):
+            raise ValueError("E2E results require matching prediction state/precision")
+        if (
+            self.e2e_prediction.total.shape != (num_science, 2, 2)
+            or len(self.e2e_prediction.gains) != num_ngs
+        ):
+            raise ValueError("E2E prediction dimensions must match the result")
+        ngs_magnitude = _vector_with_length(
+            self.ngs_magnitude,
+            u.mag,
+            "ngs_magnitude",
+            num_ngs,
+            positive=False,
+            dtype=dtype,
+        )
+        object.__setattr__(self, "ngs_magnitude", ngs_magnitude)
+
+    def _prepare_distribution(self) -> None:
+        """Check the applied mixture against the result and the selected model."""
+        lo_model = self.lo_model
+        dtype = self.dtype
+        ctot_angle = self.ctot_angle
         distribution = self.lo_distribution
         if distribution is None:
             if lo_model is LowOrderModel.E2E_CALIBRATED:
@@ -867,6 +955,11 @@ class HybridResult(_PhysicalRecord):
                 ):
                     raise ValueError("E2E prediction metrics must match result metrics")
         object.__setattr__(self, "lo_distribution", distribution)
+
+    def _prepare_coordinates(self, num_science: int, num_ngs: int) -> None:
+        """Validate geometry shared by both models and required for E2E results."""
+        dtype = self.dtype
+        lo_model = self.lo_model
         for name, count in (
             ("science_positions", num_science),
             ("ngs_positions", num_ngs),
@@ -886,6 +979,12 @@ class HybridResult(_PhysicalRecord):
             object.__setattr__(self, "zenith_angle", angle)
         elif lo_model is LowOrderModel.E2E_CALIBRATED:
             raise ValueError("E2E results require zenith_angle")
+
+    def _prepare_summary_fields(self, num_science: int, num_ngs: int) -> None:
+        """Own frame rates, jitter and clipping flags and check their consistency."""
+        dtype = self.dtype
+        lo_model = self.lo_model
+        ctot_angle = self.ctot_angle
         ngs_frame_rate = _vector_with_length(
             self.ngs_frame_rate,
             u.Hz,
@@ -918,64 +1017,42 @@ class HybridResult(_PhysicalRecord):
             )
         if lo_model is LowOrderModel.E2E_CALIBRATED and psd_clipped.any():
             raise ValueError("E2E results do not apply covariance clipping")
-        effective_mastsel_ini = None
-        if lo_model is LowOrderModel.MASTSEL:
-            if (
-                not isinstance(self.effective_mastsel_ini, str)
-                or not self.effective_mastsel_ini.strip()
-            ):
-                raise ValueError("effective_mastsel_ini must not be empty.")
-            effective_mastsel_ini = self.effective_mastsel_ini.strip() + "\n"
-        provenance = MappingProxyType(
-            {str(key): str(value) for key, value in self.provenance.items()}
-        )
-        if self.diagnostics is not None:
-            if not isinstance(self.diagnostics, HybridDiagnostics):
-                raise TypeError("diagnostics must be a HybridDiagnostics instance.")
-            if self.diagnostics.psd_valid_mask.shape != (num_science,):
-                raise ValueError(
-                    "diagnostic psd_valid_mask must match the science field length."
-                )
-            expected_psd_valid_mask = (
-                _psd_valid_mask(ctot_wavefront)
-                if ctot_wavefront is not None
-                else _psd_valid_mask(ctot_angle, unit=u.mas**2, tolerance=1e-8)
-            )
-            if not np.array_equal(
-                self.diagnostics.psd_valid_mask, expected_psd_valid_mask
-            ):
-                raise ValueError(
-                    "diagnostic psd_valid_mask must match conditioned ctot_wavefront."
-                )
-            expected_summaries = _ctot_angle_summaries(ctot_angle)
-            for name, expected in expected_summaries.items():
-                actual = getattr(self.diagnostics, name)
-                if not np.isclose(
-                    actual.to_value(expected.unit),
-                    expected.value,
-                    rtol=1.0e-6,
-                    atol=1.0e-9,
-                ):
-                    raise ValueError(
-                        f"diagnostic {name} must match conditioned ctot_angle."
-                    )
-            pre_blur = self.diagnostics.pre_blur_psfs
-            if pre_blur is not None and pre_blur.shape != psfs.shape:
-                raise ValueError("diagnostic pre_blur_psfs must match psfs shape.")
-        object.__setattr__(self, "psfs", psfs)
-        object.__setattr__(self, "metadata", metadata)
-        object.__setattr__(self, "source_metadata", source_metadata)
-        object.__setattr__(self, "ctot_wavefront", ctot_wavefront)
-        object.__setattr__(self, "ctot_angle", ctot_angle)
-        object.__setattr__(self, "angle_to_wavefront_scale", angle_to_wavefront_scale)
-        object.__setattr__(self, "ngs_flux", ngs_flux)
-        object.__setattr__(self, "ngs_magnitude", ngs_magnitude)
-        object.__setattr__(self, "ngs_magnitude_zeropoint", zeropoint)
         object.__setattr__(self, "ngs_frame_rate", ngs_frame_rate)
         object.__setattr__(self, "jitter", jitter)
-        object.__setattr__(self, "effective_mastsel_ini", effective_mastsel_ini)
         object.__setattr__(self, "psd_clipped", psd_clipped)
-        object.__setattr__(self, "provenance", provenance)
+
+    def _validate_diagnostic_summaries(self, num_science: int) -> None:
+        """Check optional diagnostics against the validated covariances and images."""
+        if self.diagnostics is None:
+            return
+        if self.diagnostics.psd_valid_mask.shape != (num_science,):
+            raise ValueError(
+                "diagnostic psd_valid_mask must match the science field length."
+            )
+        expected_psd_valid_mask = (
+            _psd_valid_mask(self.ctot_wavefront)
+            if self.ctot_wavefront is not None
+            else _psd_valid_mask(self.ctot_angle, unit=u.mas**2, tolerance=1e-8)
+        )
+        if not np.array_equal(self.diagnostics.psd_valid_mask, expected_psd_valid_mask):
+            raise ValueError(
+                "diagnostic psd_valid_mask must match conditioned ctot_wavefront."
+            )
+        expected_summaries = _ctot_angle_summaries(self.ctot_angle)
+        for name, expected in expected_summaries.items():
+            actual = getattr(self.diagnostics, name)
+            if not np.isclose(
+                actual.to_value(expected.unit),
+                expected.value,
+                rtol=1.0e-6,
+                atol=1.0e-9,
+            ):
+                raise ValueError(
+                    f"diagnostic {name} must match conditioned ctot_angle."
+                )
+        pre_blur = self.diagnostics.pre_blur_psfs
+        if pre_blur is not None and pre_blur.shape != self.psfs.shape:
+            raise ValueError("diagnostic pre_blur_psfs must match psfs shape.")
 
 
 def _readonly_array(
@@ -1153,32 +1230,6 @@ def _shared_or_vector(
     return quantity
 
 
-def _quantity_mapping(
-    value: Mapping[str, u.Quantity],
-    *,
-    label: str,
-    scalar_only: bool,
-    dtype=None,
-) -> Mapping[str, u.Quantity]:
-    normalized: dict[str, u.Quantity] = {}
-    for raw_name, raw_value in value.items():
-        name = str(raw_name).strip()
-        if not name or "/" in name:
-            raise ValueError(
-                f"{label} names must be non-empty and must not contain '/'."
-            )
-        if not isinstance(raw_value, u.Quantity):
-            raise TypeError(f"{label}[{name!r}] must be an Astropy Quantity.")
-        array = np.array(raw_value.value, dtype=dtype, copy=True)
-        if scalar_only and array.ndim != 0:
-            raise ValueError(f"{label}[{name!r}] must be scalar.")
-        if not np.all(np.isfinite(array)):
-            raise ValueError(f"{label}[{name!r}] must be finite.")
-        array.flags.writeable = False
-        normalized[name] = u.Quantity(array, raw_value.unit, copy=False)
-    return MappingProxyType(normalized)
-
-
 __all__ = [
     "DiagnosticsLevel",
     "HybridCtotContext",
@@ -1189,9 +1240,9 @@ __all__ = [
     "HybridResult",
     "LowOrderDistribution",
     "LowOrderModel",
-    "NgsHoMetricPrediction",
-    "NgsMetricProvider",
     "NonPsdPolicy",
-    "ScienceHoPsfPrediction",
-    "SciencePsfProvider",
+    "PsfMetricPrediction",
+    "PsfMetricProvider",
+    "PsfPrediction",
+    "PsfProvider",
 ]

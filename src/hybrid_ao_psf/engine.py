@@ -1,9 +1,16 @@
-"""Stateless Hybrid AO PSF execution with explicit peer low-order models."""
+"""Stateless execution of one science field.
+
+Evaluate the shared science PSF provider, use the selected low-order
+model and apply its displacement distribution with finite-field blur.
+The public entry points follow the execution and numerical helpers.
+"""
 
 from __future__ import annotations
 
+import json
 import tempfile
 from configparser import ConfigParser
+from dataclasses import replace
 from io import StringIO
 
 import numpy as np
@@ -12,6 +19,7 @@ from ngs_photometry import (
     WFSPhotometryConfig,
     magnitudes_to_effective_photons_per_second,
 )
+from numpy.typing import DTypeLike
 from scipy.fft import fft2, ifft2
 
 from ._e2e_model import E2ECalibratedModel
@@ -32,54 +40,42 @@ from .contracts import (
     HybridResult,
     LowOrderDistribution,
     LowOrderModel,
-    NgsMetricProvider,
     NonPsdPolicy,
-    SciencePsfProvider,
+    PsfMetricPrediction,
+    PsfMetricProvider,
+    PsfPrediction,
+    PsfProvider,
     _ctot_angle_summaries,
     _jitter_from_ctot,
     _psd_valid_mask,
 )
+from .interpolation import PsfInterpolator, PsfMetricInterpolator
+from .psf_files import PsfFileProvider
+
+# Shared simulation setup
 
 
-def simulate(
+def _validate_simulation_inputs(
     request: HybridRequest,
-    science_provider: SciencePsfProvider,
-    ngs_provider: NgsMetricProvider | None = None,
-    *,
-    ctot_correction: HybridCtotCorrection | None = None,
-    e2e_model: E2ECalibratedModel | None = None,
-) -> HybridResult:
-    """Run the selected LO model and blur one field of science HO PSFs.
-
-    MASTSEL (the request default) requires ngs_provider and the request's INI,
-    with effective flux or caller-zero-point magnitudes. E2E-Calibrated requires
-    e2e_model, calibrated-convention magnitudes and no external NGS provider or
-    correction. It uses the full calibrated two-Gaussian displacement mixture,
-    without constructing MASTSEL. Both paths use the science provider's physical
-    sampling and flux convention, and share finite-field convolution.
-
-    Providers/models are borrowed and reusable. Concrete state is prepared at
-    request dtype; the result owns its arrays and retains no runtime/model object.
-    Unsupported model-specific inputs fail; no model selection is inferred.
-
-    ctot_correction is MASTSEL-only: it receives unconditioned field covariance
-    and a borrowed transient context, returning replacement wavefront covariance
-    or None. Conditioning remains in the MASTSEL path. Static provenance is
-    retained; runtime context is not. Exceptions propagate.
-    """
+    science_psfs: PsfProvider,
+    ngs_metrics: PsfMetricProvider | None,
+    ctot_correction: HybridCtotCorrection | None,
+    e2e_model: E2ECalibratedModel | None,
+) -> None:
+    """Check that the request and providers agree on the low-order model."""
     if not isinstance(request, HybridRequest):
         raise TypeError("request must be a HybridRequest.")
-    if not isinstance(science_provider, SciencePsfProvider):
-        raise TypeError("science_provider must implement SciencePsfProvider.")
+    if not isinstance(science_psfs, PsfProvider):
+        raise TypeError("science_psfs must implement PsfProvider.")
     if request.lo_model is LowOrderModel.MASTSEL:
-        if not isinstance(ngs_provider, NgsMetricProvider):
-            raise TypeError("ngs_provider must implement NgsMetricProvider.")
+        if not isinstance(ngs_metrics, PsfMetricProvider):
+            raise TypeError("ngs_metrics must implement PsfMetricProvider.")
         if e2e_model is not None:
             raise ValueError("MASTSEL execution does not accept e2e_model")
     else:
         if not isinstance(e2e_model, E2ECalibratedModel):
             raise TypeError("E2E-calibrated execution requires e2e_model")
-        if ngs_provider is not None or ctot_correction is not None:
+        if ngs_metrics is not None or ctot_correction is not None:
             raise ValueError(
                 "E2E-calibrated execution owns its NGS metrics and does not accept a Ctot correction"
             )
@@ -87,11 +83,18 @@ def simulate(
         ctot_correction, HybridCtotCorrection
     ):
         raise TypeError("ctot_correction must be HybridCtotCorrection or None.")
+
+
+def _simulation_provenance(
+    science_psfs: PsfProvider,
+    ngs_metrics: PsfMetricProvider | None,
+    ctot_correction: HybridCtotCorrection | None,
+) -> dict[str, str]:
     provenance = {
-        "science_provider": _type_identity(science_provider),
+        "science_psfs": _type_identity(science_psfs),
         **(
-            {"ngs_provider": _type_identity(ngs_provider)}
-            if ngs_provider is not None
+            {"ngs_metrics": _type_identity(ngs_metrics)}
+            if ngs_metrics is not None
             else {}
         ),
     }
@@ -102,20 +105,23 @@ def simulate(
                 f"Correction provenance collides with engine keys: {sorted(collisions)}."
             )
         provenance.update(ctot_correction.provenance)
+    return provenance
 
-    # Concrete fitted providers prepare once; protocol-only providers have their
-    # returned physical records converted at the same operation boundary.
+
+def _provider_at_precision[Provider](provider: Provider, dtype: np.dtype) -> Provider:
+    """Convert built-in PSF sources internally at the request's precision."""
     if (
-        hasattr(science_provider, "prepare")
-        and getattr(science_provider, "dtype", None) != request.dtype
+        isinstance(provider, (PsfInterpolator, PsfMetricInterpolator, PsfFileProvider))
+        and provider.dtype != dtype
     ):
-        science_provider = science_provider.prepare(dtype=request.dtype)
-    if (
-        hasattr(ngs_provider, "prepare")
-        and getattr(ngs_provider, "dtype", None) != request.dtype
-    ):
-        ngs_provider = ngs_provider.prepare(dtype=request.dtype)
-    science = science_provider.predict(
+        return provider._with_dtype(dtype)
+    return provider
+
+
+def _evaluate_science_psfs(
+    request: HybridRequest, science_psfs: PsfProvider
+) -> PsfPrediction:
+    science = science_psfs.evaluate(
         zenith_angle=request.zenith_angle,
         wavelength=request.wavelength,
         x=request.science_x,
@@ -123,9 +129,21 @@ def simulate(
     )
     if science.psfs.shape[0] != request.science_x.size:
         raise ValueError("Science provider output length does not match the request.")
-    if request.lo_model is LowOrderModel.E2E_CALIBRATED:
-        return _simulate_calibrated(request, science, e2e_model, provenance)
-    metrics = ngs_provider.predict(
+    return science
+
+
+# MASTSEL simulation
+
+
+def _simulate_mastsel(
+    request: HybridRequest,
+    science: PsfPrediction,
+    ngs_metrics: PsfMetricProvider,
+    ctot_correction: HybridCtotCorrection | None,
+    provenance: dict[str, str],
+) -> HybridResult:
+    """Evaluate the MASTSEL covariance and apply its conditioned Gaussian blur."""
+    metrics = ngs_metrics.evaluate(
         zenith_angle=request.zenith_angle,
         x=request.ngs_x,
         y=request.ngs_y,
@@ -133,36 +151,12 @@ def simulate(
     if metrics.ee.size != request.ngs_x.size:
         raise ValueError("NGS provider output length does not match the request.")
 
-    from dataclasses import replace
-
     science = replace(science, dtype=request.dtype)
     metrics = replace(metrics, dtype=request.dtype)
     effective_ini, ngs_frame_rate, ngs_flux = _resolve_effective_mastsel(request)
-    with tempfile.TemporaryDirectory(prefix="hybrid_ao_psf_") as temporary:
-        context = _prepare_mastsel_context(
-            temporary, request, metrics, effective_ini, ngs_frame_rate, ngs_flux
-        )
-        if ctot_correction is None:
-            ctot_raw = _compute_mastsel_ctot(context)
-        else:
-            with _capture_mastsel(context) as captured:
-                ctot_raw = _compute_mastsel_ctot(context)
-            context = _complete_mastsel_context(context, captured)
-        validate_ctot_shape(
-            ctot_raw, expected_size=request.science_x.size, label="MASTSEL Ctot"
-        )
-        angle_to_wavefront_scale = context.angle_to_wavefront_scale
-        ctot_raw = u.Quantity(ctot_raw, dtype=request.dtype)
-        if ctot_correction is not None:
-            ctot_raw.flags.writeable = False
-            corrected = ctot_correction.apply(ctot_raw, context)
-            if corrected is not None:
-                validate_ctot_shape(
-                    corrected,
-                    expected_size=request.science_x.size,
-                    label="Corrected Ctot",
-                )
-                ctot_raw = corrected.to(u.nm**2)
+    ctot_raw, angle_to_wavefront_scale = _predict_mastsel_ctot(
+        request, metrics, effective_ini, ngs_frame_rate, ngs_flux, ctot_correction
+    )
     ctot_wavefront, psd_clipped = condition_ctot(
         ctot_raw,
         policy=request.non_psd_policy,
@@ -193,7 +187,6 @@ def simulate(
         dtype=request.dtype,
         psfs=psfs,
         metadata=science.metadata,
-        source_metadata=science.meta,
         ngs_metrics=metrics,
         ctot_wavefront=ctot_wavefront,
         ctot_angle=ctot_angle,
@@ -217,11 +210,53 @@ def simulate(
     )
 
 
-def _simulate_calibrated(request, science, model, provenance):
-    """Apply the validated calibrated distribution without extra conditioning."""
-    import json
-    from dataclasses import replace
+def _predict_mastsel_ctot(
+    request: HybridRequest,
+    metrics: PsfMetricPrediction,
+    effective_ini: str,
+    ngs_frame_rate: u.Quantity,
+    ngs_flux: u.Quantity,
+    ctot_correction: HybridCtotCorrection | None,
+) -> tuple[u.Quantity, u.Quantity]:
+    """Use the live runtime for covariance prediction and the optional callback."""
+    with tempfile.TemporaryDirectory(prefix="hybrid_ao_psf_") as temporary:
+        context = _prepare_mastsel_context(
+            temporary, request, metrics, effective_ini, ngs_frame_rate, ngs_flux
+        )
+        if ctot_correction is None:
+            ctot_raw = _compute_mastsel_ctot(context)
+        else:
+            with _capture_mastsel(context) as captured:
+                ctot_raw = _compute_mastsel_ctot(context)
+            context = _complete_mastsel_context(context, captured)
+        validate_ctot_shape(
+            ctot_raw, expected_size=request.science_x.size, label="MASTSEL Ctot"
+        )
+        angle_to_wavefront_scale = context.angle_to_wavefront_scale
+        ctot_raw = u.Quantity(ctot_raw, dtype=request.dtype)
+        if ctot_correction is not None:
+            ctot_raw.flags.writeable = False
+            corrected = ctot_correction.apply(ctot_raw, context)
+            if corrected is not None:
+                validate_ctot_shape(
+                    corrected,
+                    expected_size=request.science_x.size,
+                    label="Corrected Ctot",
+                )
+                ctot_raw = corrected.to(u.nm**2)
+    return ctot_raw, angle_to_wavefront_scale
 
+
+# E2E-Calibrated simulation
+
+
+def _simulate_calibrated(
+    request: HybridRequest,
+    science: PsfPrediction,
+    model: E2ECalibratedModel,
+    provenance: dict[str, str],
+) -> HybridResult:
+    """Apply the validated calibrated distribution without extra conditioning."""
     model = model.prepare(dtype=request.dtype)
     science = replace(science, dtype=request.dtype)
     positions = np.column_stack((request.ngs_x.value, request.ngs_y.value)) * u.arcsec
@@ -241,23 +276,7 @@ def _simulate_calibrated(request, science, model, provenance):
     )
     pre_blur = science.psfs.copy()
     psfs = pre_blur.copy()
-    work_shape = tuple(2 * size for size in psfs.shape[-2:])
-    pixel = request.dtype.type(science.pixel_scale.to_value(u.mas))
-    otfs = np.stack(
-        [
-            sum(
-                weight
-                * image_plane_gaussian_otf(
-                    covariance / pixel**2, work_shape, dtype=request.dtype
-                )
-                for weight, covariance in zip(
-                    distribution.weights, matrices, strict=True
-                )
-            )
-            for matrices in distribution.covariances.value
-        ]
-    )
-    apply_finite_fov_otfs(psfs, otfs)
+    _apply_displacement_mixture(psfs, distribution, science.pixel_scale, request.dtype)
     total = distribution.covariance
     diagnostics = None
     if request.diagnostics_level is not DiagnosticsLevel.NONE:
@@ -268,27 +287,7 @@ def _simulate_calibrated(request, science, model, provenance):
             if request.diagnostics_level is DiagnosticsLevel.DEBUG
             else None,
         )
-    identities = {}
-    for name, identity in model.product_identities.items():
-        if hasattr(identity, "entrypoint"):
-            identities[name] = {
-                "entrypoint": str(identity.entrypoint.path),
-                "sha256": identity.entrypoint.sha256,
-                "payloads": [
-                    {"path": str(item.path), "sha256": item.sha256}
-                    for item in identity.payloads
-                ],
-            }
-        else:
-            identities[name] = {"path": str(identity.path), "sha256": identity.sha256}
-    provenance = {
-        **provenance,
-        "e2e_model": _type_identity(model),
-        "e2e_model_inputs": json.dumps(identities, sort_keys=True),
-        "e2e_controller_gain": str(model.covariance.controller.gain),
-        "e2e_controller_delay_frames": str(model.covariance.controller.delay),
-        "e2e_magnitude_band": model.coma.photometry.magnitude_band,
-    }
+    provenance = _calibrated_provenance(model, provenance)
     rate = (
         np.full(
             len(positions),
@@ -301,7 +300,6 @@ def _simulate_calibrated(request, science, model, provenance):
         dtype=request.dtype,
         psfs=psfs,
         metadata=science.metadata,
-        source_metadata=science.meta,
         ngs_metrics=prediction.metrics,
         ctot_wavefront=None,
         ctot_angle=total,
@@ -321,6 +319,62 @@ def _simulate_calibrated(request, science, model, provenance):
         ngs_positions=positions,
         zenith_angle=request.zenith_angle,
     )
+
+
+def _apply_displacement_mixture(
+    psfs: np.ndarray,
+    distribution: LowOrderDistribution,
+    pixel_scale: u.Quantity,
+    dtype: np.dtype,
+) -> None:
+    """Apply the fitted angular distribution on the padded PSF grid in place."""
+    work_shape = tuple(2 * size for size in psfs.shape[-2:])
+    pixel = dtype.type(pixel_scale.to_value(u.mas))
+    otfs = np.stack(
+        [
+            sum(
+                weight
+                * image_plane_gaussian_otf(
+                    covariance / pixel**2, work_shape, dtype=dtype
+                )
+                for weight, covariance in zip(
+                    distribution.weights, matrices, strict=True
+                )
+            )
+            for matrices in distribution.covariances.value
+        ]
+    )
+    apply_finite_fov_otfs(psfs, otfs)
+
+
+def _calibrated_provenance(
+    model: E2ECalibratedModel, provenance: dict[str, str]
+) -> dict[str, str]:
+    """Record the exact fitted inputs and controller behind the prediction."""
+    identities = {}
+    for name, identity in model.product_identities.items():
+        if hasattr(identity, "entrypoint"):
+            identities[name] = {
+                "entrypoint": str(identity.entrypoint.path),
+                "sha256": identity.entrypoint.sha256,
+                "payloads": [
+                    {"path": str(item.path), "sha256": item.sha256}
+                    for item in identity.payloads
+                ],
+            }
+        else:
+            identities[name] = {"path": str(identity.path), "sha256": identity.sha256}
+    return {
+        **provenance,
+        "e2e_model": _type_identity(model),
+        "e2e_model_inputs": json.dumps(identities, sort_keys=True),
+        "e2e_controller_gain": str(model.covariance.controller.gain),
+        "e2e_controller_delay_frames": str(model.covariance.controller.delay),
+        "e2e_magnitude_band": model.coma.photometry.magnitude_band,
+    }
+
+
+# Covariance and diagnostic preparation
 
 
 def _build_diagnostics(
@@ -350,7 +404,7 @@ def condition_ctot(
     ctot_wavefront: u.Quantity,
     *,
     policy: NonPsdPolicy | str = NonPsdPolicy.ERROR,
-    dtype=np.float32,
+    dtype: DTypeLike = np.float32,
 ) -> tuple[u.Quantity, np.ndarray]:
     """Symmetrize Ctot and apply the fixed numerical/non-PSD policy."""
     dtype = validate_psf_dtype(dtype)
@@ -382,6 +436,9 @@ def condition_ctot(
             eigenvectors[clipped],
         )
     return symmetric * u.nm**2, clipped
+
+
+# MASTSEL configuration and photometry
 
 
 def _resolve_effective_mastsel(
@@ -490,6 +547,9 @@ def _parse_numeric_array(value: str) -> np.ndarray:
         raise ValueError("MASTSEL numeric array contains a non-numeric value.") from exc
 
 
+# Finite-field convolution
+
+
 def apply_ctot_blur(
     psfs: np.ndarray,
     ctot_wavefront: u.Quantity,
@@ -550,123 +610,26 @@ def apply_ctot_blur(
     psfs_array[active] = active_psfs
 
 
-def blur_psfs_with_ctot(
-    psfs: np.ndarray,
-    ctot_wavefront: u.Quantity,
-    *,
-    pixel_scale: u.Quantity,
-    angle_to_wavefront_scale: u.Quantity,
-    dtype=np.float32,
-) -> np.ndarray:
-    """Blur external PSFs with an already-conditioned wavefront Ctot cube.
-
-    Return a new array without renormalizing finite-field spill. This focused
-    operation does not run MASTSEL or apply a non-PSD conditioning policy.
-    """
-    dtype = validate_psf_dtype(dtype)
-    source = np.asarray(psfs, dtype=dtype)
-    if source.ndim != 3:
-        raise ValueError(f"psfs must have shape (N, y, x); got {source.shape}.")
-    validate_ctot_shape(ctot_wavefront, expected_size=source.shape[0], label="Ctot")
-    values = quantity_value(
-        ctot_wavefront, u.nm**2, label="ctot_wavefront", dtype=dtype
-    )
-    if not np.allclose(values, np.swapaxes(values, -1, -2)):
-        raise ValueError("Ctot matrices must be symmetric.")
-    if values.size and np.min(np.linalg.eigvalsh(values)) < -CTOT_PSD_TOLERANCE_NM2:
-        raise ValueError(
-            "Ctot must already be positive semidefinite within the fixed "
-            f"{CTOT_PSD_TOLERANCE_NM2:.6g} nm2 tolerance."
-        )
-    result = source.copy()
-    apply_ctot_blur(
-        result,
-        ctot_wavefront,
-        pixel_scale=pixel_scale,
-        angle_to_wavefront_scale=angle_to_wavefront_scale,
-    )
-    return result
-
-
-def image_plane_gaussian_otf(
-    covariance_pix2: np.ndarray,
-    shape: tuple[int, int],
-    *,
-    mean_shift_pix: np.ndarray | None = None,
-    dtype=np.float32,
-) -> np.ndarray:
-    """Return a finite-field Gaussian OTF for an x/y covariance in pixel squared.
-
-    ``shape`` is the padded image shape in y/x order. ``mean_shift_pix`` is an
-    optional x/y displacement in pixels. The returned array uses NumPy's
-    unshifted FFT frequency convention and can be passed to
-    :func:`apply_finite_fov_otfs`.
-    """
-    dtype = validate_psf_dtype(dtype)
-    covariance_pix2 = np.asarray(covariance_pix2, dtype=dtype)
-    if covariance_pix2.shape != (2, 2) or not np.all(np.isfinite(covariance_pix2)):
-        raise ValueError("covariance_pix2 must be a finite 2 x 2 matrix.")
-    if len(shape) != 2 or any(int(size) != size or size < 1 for size in shape):
-        raise ValueError(f"shape must contain two positive integers; got {shape}.")
-    mean = (
-        np.zeros(2, dtype=dtype)
-        if mean_shift_pix is None
-        else np.asarray(mean_shift_pix, dtype=dtype)
-    )
-    if mean.shape != (2,) or not np.all(np.isfinite(mean)):
-        raise ValueError("mean_shift_pix must contain finite x/y displacements.")
-    ny, nx = shape
-    fy = np.fft.fftfreq(ny).astype(dtype)
-    fx = np.fft.fftfreq(nx).astype(dtype)
-    fx_grid, fy_grid = np.meshgrid(fx, fy)
-    covariance = 0.5 * (covariance_pix2 + covariance_pix2.T)
-    exponent = (
-        -2.0
-        * np.pi**2
-        * (
-            covariance[0, 0] * fx_grid**2
-            + covariance[1, 1] * fy_grid**2
-            + 2.0 * covariance[0, 1] * fx_grid * fy_grid
-        )
-    )
-    phase = -2j * np.pi * (mean[0] * fx_grid + mean[1] * fy_grid)
-    return np.exp(exponent + phase)
-
-
-def apply_finite_fov_otfs(psfs: np.ndarray, otfs: np.ndarray) -> None:
-    """Blur a PSF cube in place with matching precomputed finite-field OTFs.
-
-    ``psfs`` has shape ``(N, y, x)`` and ``otfs`` has shape
-    ``(N, 2*y, 2*x)`` in NumPy's unshifted FFT convention. Each PSF is padded,
-    blurred, cropped, and clipped for numerical negatives. Cropped flux is
-    not renormalized. Invalid shapes, non-finite values, or non-positive
-    retained flux raise ``ValueError``.
-    """
-    psfs_array = np.asarray(psfs)
-    dtype = validate_psf_dtype(psfs_array.dtype)
-    complex_dtype = np.complex64 if dtype.itemsize == 4 else np.complex128
-    otfs_array = np.asarray(otfs, dtype=complex_dtype)
-    if psfs_array.ndim != 3:
-        raise ValueError(f"psfs must have shape (N, y, x); got {psfs_array.shape}.")
-    expected = (psfs_array.shape[0], 2 * psfs_array.shape[1], 2 * psfs_array.shape[2])
-    if otfs_array.shape != expected:
-        raise ValueError(f"otfs must have shape {expected}; got {otfs_array.shape}.")
-    if not np.all(np.isfinite(psfs_array)) or not np.all(np.isfinite(otfs_array)):
-        raise ValueError("psfs and otfs must contain only finite values.")
-    if np.any(np.sum(psfs_array, axis=(-2, -1), dtype=psfs_array.dtype) <= 0.0):
-        raise ValueError("psfs must have strictly positive finite total flux.")
-    work_shape = tuple(otfs_array.shape[-2:])
-    original_shape = tuple(psfs_array.shape[-2:])
-    for index, otf in enumerate(otfs_array):
-        padded = _centered_pad(psfs_array[index], work_shape)
-        raw = np.real(ifft2(fft2(padded) * otf))
-        raw = _center_crop(raw, original_shape)
-        raw = np.clip(raw.astype(psfs_array.dtype, copy=False), 0.0, None)
-        if float(np.sum(raw, dtype=psfs_array.dtype)) <= 0.0:
-            raise ValueError(
-                f"Finite-FOV blur produced non-positive flux for PSF {index}."
-            )
-        psfs_array[index] = raw
+def _validated_otf_covariance(values: np.ndarray, dtype: np.dtype) -> np.ndarray:
+    """Accept a physically valid pixel covariance with dtype-scale round-off."""
+    covariance = np.asarray(values)
+    if covariance.shape != (2, 2) or covariance.dtype.kind not in "fiu":
+        raise ValueError("covariance_pix2 must be a finite real 2 x 2 matrix.")
+    covariance = covariance.astype(dtype, copy=False)
+    if not np.all(np.isfinite(covariance)):
+        raise ValueError("covariance_pix2 must be a finite real 2 x 2 matrix.")
+    scale = float(np.max(np.abs(covariance)))
+    tolerance = 8 * np.finfo(dtype).eps * scale
+    if not np.allclose(covariance, covariance.T, rtol=0, atol=tolerance):
+        raise ValueError("covariance_pix2 must be symmetric.")
+    covariance = 0.5 * (covariance + covariance.T)
+    eigenvalues = np.linalg.eigvalsh(covariance)
+    if eigenvalues[0] < -tolerance:
+        raise ValueError("covariance_pix2 must be positive semidefinite.")
+    if eigenvalues[0] < 0:
+        eigenvalues, eigenvectors = np.linalg.eigh(covariance)
+        covariance = (eigenvectors * np.maximum(eigenvalues, 0)) @ eigenvectors.T
+    return covariance
 
 
 def _centered_pad(psf: np.ndarray, shape: tuple[int, int]) -> np.ndarray:
@@ -723,6 +686,215 @@ def validate_ctot_shape(
         )
     if not np.all(np.isfinite(ctot.value)):
         raise ValueError(f"{label} contains non-finite values.")
+
+
+# Public simulation and image operations
+
+
+def image_plane_gaussian_otf(
+    covariance_pix2: np.ndarray,
+    shape: tuple[int, int],
+    *,
+    mean_shift_pix: np.ndarray | None = None,
+    dtype: DTypeLike = np.float32,
+) -> np.ndarray:
+    """Sample the Gaussian optical transfer function on the padded FFT grid.
+
+    Args:
+        covariance_pix2: Finite ``(2, 2)`` covariance in squared pixels, with both
+            axes in x/y order. The calculation uses its symmetric part.
+        shape: Number of rows and columns in the padded image.
+        mean_shift_pix: Optional finite x/y displacement in pixels. The
+            default uses a centred Gaussian.
+        dtype: Real calculation precision, float32 or float64.
+
+    Returns:
+        Complex OTF sampled at NumPy's unshifted FFT frequencies, suitable for
+        [`apply_finite_fov_otfs()`][hybrid_ao_psf.apply_finite_fov_otfs].
+
+    Raises:
+        ValueError: If the dimensions, covariance, displacement or dtype
+            are invalid.
+    """
+    dtype = validate_psf_dtype(dtype)
+    covariance = _validated_otf_covariance(covariance_pix2, dtype)
+    if len(shape) != 2 or any(int(size) != size or size < 1 for size in shape):
+        raise ValueError(f"shape must contain two positive integers; got {shape}.")
+    mean = (
+        np.zeros(2, dtype=dtype)
+        if mean_shift_pix is None
+        else np.asarray(mean_shift_pix, dtype=dtype)
+    )
+    if mean.shape != (2,) or not np.all(np.isfinite(mean)):
+        raise ValueError("mean_shift_pix must contain finite x/y displacements.")
+    ny, nx = shape
+    fy = np.fft.fftfreq(ny).astype(dtype)
+    fx = np.fft.fftfreq(nx).astype(dtype)
+    fx_grid, fy_grid = np.meshgrid(fx, fy)
+    exponent = (
+        -2.0
+        * np.pi**2
+        * (
+            covariance[0, 0] * fx_grid**2
+            + covariance[1, 1] * fy_grid**2
+            + 2.0 * covariance[0, 1] * fx_grid * fy_grid
+        )
+    )
+    phase = -2j * np.pi * (mean[0] * fx_grid + mean[1] * fy_grid)
+    return np.exp(exponent + phase)
+
+
+def apply_finite_fov_otfs(psfs: np.ndarray, otfs: np.ndarray) -> None:
+    """Pad, blur and crop each image in place using its supplied OTF.
+
+    Clip numerical negatives after cropping. The retained flux can differ
+    from the input flux because light can leave the output field. If a blur
+    fails partway through the cube, earlier images may already be updated.
+
+    Args:
+        psfs: Writable float32 or float64 cube with shape ``(N, y, x)``.
+        otfs: Matching OTFs of shape ``(N, 2*y, 2*x)`` in NumPy's unshifted
+            FFT frequency order.
+
+    Raises:
+        ValueError: If shapes, precision, values or retained flux are invalid,
+            or if the input cube is read-only.
+    """
+    psfs_array = np.asarray(psfs)
+    dtype = validate_psf_dtype(psfs_array.dtype)
+    complex_dtype = np.complex64 if dtype.itemsize == 4 else np.complex128
+    otfs_array = np.asarray(otfs, dtype=complex_dtype)
+    if psfs_array.ndim != 3:
+        raise ValueError(f"psfs must have shape (N, y, x); got {psfs_array.shape}.")
+    expected = (psfs_array.shape[0], 2 * psfs_array.shape[1], 2 * psfs_array.shape[2])
+    if otfs_array.shape != expected:
+        raise ValueError(f"otfs must have shape {expected}; got {otfs_array.shape}.")
+    if not np.all(np.isfinite(psfs_array)) or not np.all(np.isfinite(otfs_array)):
+        raise ValueError("psfs and otfs must contain only finite values.")
+    if np.any(np.sum(psfs_array, axis=(-2, -1), dtype=psfs_array.dtype) <= 0.0):
+        raise ValueError("psfs must have strictly positive finite total flux.")
+    work_shape = tuple(otfs_array.shape[-2:])
+    original_shape = tuple(psfs_array.shape[-2:])
+    for index, otf in enumerate(otfs_array):
+        padded = _centered_pad(psfs_array[index], work_shape)
+        raw = np.real(ifft2(fft2(padded) * otf))
+        raw = _center_crop(raw, original_shape)
+        raw = np.clip(raw.astype(psfs_array.dtype, copy=False), 0.0, None)
+        if float(np.sum(raw, dtype=psfs_array.dtype)) <= 0.0:
+            raise ValueError(
+                f"Finite-FOV blur produced non-positive flux for PSF {index}."
+            )
+        psfs_array[index] = raw
+
+
+def blur_psfs_with_ctot(
+    psfs: np.ndarray,
+    ctot_wavefront: u.Quantity,
+    *,
+    pixel_scale: u.Quantity,
+    angle_to_wavefront_scale: u.Quantity,
+    dtype: DTypeLike = np.float32,
+) -> np.ndarray:
+    """Blur PSFs with supplied, already-conditioned wavefront covariance.
+
+    Use a Gaussian kernel derived from the angular covariance and crop to
+    the original image. The returned flux reflects any light lost in the crop.
+
+    Args:
+        psfs: Source image cube in ``(points, rows, columns)`` order.
+        ctot_wavefront: Symmetric, positive semidefinite ``(points, 2, 2)``
+            covariance in square nanometres, with both matrix axes in x/y order.
+        pixel_scale: Angular pixel scale, compatible with milliarcseconds.
+        angle_to_wavefront_scale: Scalar conversion from milliarcseconds
+            to nanometres of wavefront tilt, in nanometres per milliarcsecond.
+        dtype: Pixel calculation and output precision, float32 or float64.
+
+    Returns:
+        A new image cube with the same shape as the input.
+
+    Raises:
+        TypeError: If a physical input lacks an Astropy quantity.
+        ValueError: If precision, shapes, units, covariance or flux are invalid.
+    """
+    dtype = validate_psf_dtype(dtype)
+    source = np.asarray(psfs, dtype=dtype)
+    if source.ndim != 3:
+        raise ValueError(f"psfs must have shape (N, y, x); got {source.shape}.")
+    validate_ctot_shape(ctot_wavefront, expected_size=source.shape[0], label="Ctot")
+    values = quantity_value(
+        ctot_wavefront, u.nm**2, label="ctot_wavefront", dtype=dtype
+    )
+    if not np.allclose(values, np.swapaxes(values, -1, -2)):
+        raise ValueError("Ctot matrices must be symmetric.")
+    if values.size and np.min(np.linalg.eigvalsh(values)) < -CTOT_PSD_TOLERANCE_NM2:
+        raise ValueError(
+            "Ctot must already be positive semidefinite within the fixed "
+            f"{CTOT_PSD_TOLERANCE_NM2:.6g} nm2 tolerance."
+        )
+    result = source.copy()
+    apply_ctot_blur(
+        result,
+        ctot_wavefront,
+        pixel_scale=pixel_scale,
+        angle_to_wavefront_scale=angle_to_wavefront_scale,
+    )
+    return result
+
+
+def simulate(
+    request: HybridRequest,
+    science_psfs: PsfProvider,
+    ngs_metrics: PsfMetricProvider | None = None,
+    *,
+    ctot_correction: HybridCtotCorrection | None = None,
+    e2e_model: E2ECalibratedModel | None = None,
+) -> HybridResult:
+    """Run the selected low-order model and blur one field of science PSFs.
+
+    The science provider determines the sampling and flux convention. Both
+    low-order models use the same finite-field convolution. E2E-Calibrated
+    uses the full calibrated two-Gaussian mixture. The operation borrows the
+    providers, prepares them for the request dtype when needed, and returns
+    independent result arrays.
+
+    Args:
+        request: Science coordinates, asterism and selected low-order model.
+            MASTSEL requires its INI with effective flux or magnitudes and
+            their zeropoint. E2E-Calibrated requires calibrated-convention
+            magnitudes.
+        science_psfs: Image provider evaluated at the science coordinates,
+            zenith angle and wavelength of the request.
+        ngs_metrics: Metric provider required for MASTSEL. Pass ``None`` for
+            E2E-Calibrated, which supplies its own NGS metrics.
+        ctot_correction: Optional MASTSEL callback. It receives unconditioned
+            wavefront covariance and a transient runtime context. It may
+            return replacement covariance or ``None`` to use the original.
+            The result retains the callback's declared provenance.
+        e2e_model: Prepared E2E-Calibrated model. Pass ``None`` for MASTSEL.
+
+    Returns:
+        Blurred PSFs, the applied low-order distribution and any requested
+        diagnostics.
+
+    Raises:
+        TypeError: If the request or required providers have incompatible types.
+        ValueError: If inputs conflict with the selected model, are outside
+            provider support or produce invalid scientific results.
+    """
+    _validate_simulation_inputs(
+        request, science_psfs, ngs_metrics, ctot_correction, e2e_model
+    )
+    provenance = _simulation_provenance(science_psfs, ngs_metrics, ctot_correction)
+
+    science_psfs = _provider_at_precision(science_psfs, request.dtype)
+    ngs_metrics = _provider_at_precision(ngs_metrics, request.dtype)
+    science = _evaluate_science_psfs(request, science_psfs)
+
+    if request.lo_model is LowOrderModel.E2E_CALIBRATED:
+        return _simulate_calibrated(request, science, e2e_model, provenance)
+    return _simulate_mastsel(
+        request, science, ngs_metrics, ctot_correction, provenance
+    )
 
 
 __all__ = [

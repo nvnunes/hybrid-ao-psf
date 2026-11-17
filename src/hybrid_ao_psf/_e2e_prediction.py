@@ -16,7 +16,7 @@ from ._lo_model import (
 )
 from ._units import _PhysicalRecord
 from ._validation import validate_psf_dtype
-from .contracts import NgsHoMetricPrediction
+from .contracts import PsfMetricPrediction
 
 
 def _immutable_array(value: object, dtype: np.dtype) -> NDArray:
@@ -73,7 +73,7 @@ class E2ELowOrderPrediction(_PhysicalRecord):
 
     dtype: np.dtype
     photons_per_frame: u.Quantity
-    metrics: NgsHoMetricPrediction
+    metrics: PsfMetricPrediction
     coma_response: u.Quantity
     gains: u.Quantity
     noise_variances: u.Quantity
@@ -162,8 +162,8 @@ def _prepare_prediction_fields(
                 raise TypeError(f"{name} must be a quantity")
             value = _quantity(value, units[name], name, value.ndim, dtype=dtype)
         elif name == "metrics":
-            if not isinstance(value, NgsHoMetricPrediction):
-                raise TypeError("metrics must be NgsHoMetricPrediction")
+            if not isinstance(value, PsfMetricPrediction):
+                raise TypeError("metrics must be PsfMetricPrediction")
             value = replace(value, dtype=dtype)
         elif name == "symmetric_feedback_fallback":
             if not isinstance(value, (bool, np.bool_)):

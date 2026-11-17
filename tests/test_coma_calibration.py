@@ -91,9 +91,9 @@ def test_offline_coma_build_preserves_scalar_matrix_and_noise_diagnostics(tmp_pa
         1 + 10 ** (0.4 * (magnitude.value - 18.5))
     )
     np.testing.assert_allclose(actual.to_value(u.mas / u.nm), expected, rtol=1e-8)
-    with pytest.raises(ValueError, match="support"):
+    with pytest.raises(ValueError, match="range"):
         model.predict(magnitude=21 * u.mag, zenith_angle=20 * u.deg)
-    with pytest.raises(ValueError, match="support"):
+    with pytest.raises(ValueError, match="range"):
         model.predict(magnitude=10 * u.mag, zenith_angle=41 * u.deg)
     with pytest.raises(ValueError):
         model.a0.value.flags.writeable = True
@@ -107,7 +107,7 @@ def test_measured_support_is_not_expanded():
     planes = [measurement(angle) for angle in (10, 20, 30)]
     result = build_coma_calibration(planes, heldout_zenith=None, dtype=np.float64)
     np.testing.assert_array_equal(result.model.zenith_support.value, [10, 30])
-    with pytest.raises(ValueError, match="support"):
+    with pytest.raises(ValueError, match="range"):
         result.model.predict(magnitude=10 * u.mag, zenith_angle=0 * u.deg)
     with pytest.raises(ValueError, match="three"):
         build_coma_calibration(planes[:2], dtype=np.float64)

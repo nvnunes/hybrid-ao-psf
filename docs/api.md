@@ -28,15 +28,19 @@ They reject MASTSEL INI text, flux, an external magnitude zeropoint and the
 Coordinates, Ctot axes, and PSF image orientation follow the
 [coordinate contract](architecture.md#coordinate-and-image-orientation).
 
-`SciencePsfProvider` and `NgsMetricProvider` define the two reusable loaded
-provider boundaries. Their predictions use `ScienceHoPsfPrediction` and
-`NgsHoMetricPrediction`. The science provider owns the PSF pixel scale and
-metadata; simulation preserves both and has no independent output-scale
-setting. `ScienceHoPsfInterpolator` and
-`NgsHoMetricInterpolator` are the concrete immutable providers. Their complete
-sample, configuration, build, validation, evaluation, replay, save, and load
-surface is exported from both `hybrid_ao_psf` and
-`hybrid_ao_psf.interpolation`; see [Interpolation products](interpolation.md).
+`simulate()` accepts `science_psfs` implementing `PsfProvider` and,
+for MASTSEL, `ngs_metrics` implementing `PsfMetricProvider`. These contracts
+define the requested coordinates and the returned images or metrics.
+The source of the data belongs to the implementation. Both contracts expose
+`evaluate()` for requested coordinates. Build or load an interpolator, then
+evaluate it directly or pass it to `simulate()`.
+
+`PsfInterpolator` supplies interpolated images. `PsfFileProvider` supplies
+existing images through a caller-supplied reader. Both return `PsfPrediction`
+with the images' pixel scale and physical metadata.
+`PsfMetricInterpolator` returns `PsfMetricPrediction`.
+See [Interpolation products](interpolation.md) for building interpolators
+and reading saved PSFs.
 
 ## E2E Calibration
 
@@ -44,7 +48,7 @@ The package root exports `E2ECalibration`, physical sample/settings/result types
 family-specific measure/build/save/load operations and fitted-product identities.
 The four model types are `ReconstructorNoiseModel`, `CovarianceFunctions`,
 `ComaResponseModel` and `SensingCalibration`. The configured subclass supplies
-native observations; standalone builders, numerical replay and loaded model
+native observations; standalone builders, numerical simulation and loaded model
 evaluation need no native software. See [Calibration](calibration.md) for
 stages, physical conventions, configuration and product contracts.
 
@@ -60,7 +64,7 @@ for loading, support, units and the boundary with complete PSF simulation.
 ## Results
 
 `HybridResult` is the immutable standard result. It carries the final
-selected-precision PSF cube, neutral `ao_stats.PsfMetadata`, source metadata, NGS
+selected-precision PSF cube, neutral `ao_stats.PsfMetadata`, NGS
 metrics, angular Ctot, frame rates, jitter, PSD-clipping mask, provenance, model
 identity and the applied `LowOrderDistribution`. Its weights and covariances
 have shapes `(component,)` and `(science, component, 2, 2)`; their weighted
@@ -80,9 +84,9 @@ contract described in [Result files](results.md).
 
 ## Simulation
 
-`simulate(request, science_provider, ngs_provider=None, *, ctot_correction=None,
+`simulate(request, science_psfs, ngs_metrics=None, *, ctot_correction=None,
 e2e_model=None)` is the one stateless scientific operation. MASTSEL requires
-`ngs_provider`; E2E requires `e2e_model` and rejects an external NGS provider or
+`ngs_metrics`; E2E requires `e2e_model` and rejects an external NGS provider or
 correction callback. The engine evaluates the selected LO prediction, applies
 the corresponding Gaussian or full mixture blur, derives jitter and returns
 `HybridResult`. Providers are borrowed and
@@ -119,8 +123,8 @@ First build the sample products from the project root:
 from hybrid_ao_psf import (
     HybridCtotCorrection,
     load_configuration,
-    load_ngs_ho_metric_interpolator,
-    load_science_ho_psf_interpolator,
+    load_psf_metric_interpolator,
+    load_psf_interpolator,
     simulate,
 )
 
@@ -131,8 +135,8 @@ correction = HybridCtotCorrection(
 )
 result = simulate(
     configuration.request,
-    load_science_ho_psf_interpolator(configuration.science_psf_artifact),
-    load_ngs_ho_metric_interpolator(configuration.ngs_metric_artifact),
+    load_psf_interpolator(configuration.science_psf_file),
+    load_psf_metric_interpolator(configuration.ngs_metric_file),
     ctot_correction=correction,
 )
 ```
@@ -143,18 +147,17 @@ rejects collisions with engine-owned keys. `save_result()` and `load_result()`
 preserve this metadata, not the callable or runtime. No correction is enabled
 by default, and the INI/CLI does not select one.
 
-`blur_psfs_with_ctot(psfs, ctot_wavefront, *, pixel_scale,
-angle_to_wavefront_scale)` is a narrower public operation for externally
-supplied PSFs. It accepts a symmetric, already-conditioned wavefront Ctot cube
-in `nm2`, checks for materially non-PSD matrices, and returns a separate array
-with the same dtype. It uses the engine's finite-field blur without
-renormalizing spill, running MASTSEL, or applying a clipping policy. Zero Ctot
-leaves the corresponding PSF unchanged.
+Use `blur_psfs_with_ctot()` for externally supplied PSFs with symmetric,
+already-conditioned wavefront Ctot in square nanometres. Supply the angular
+pixel scale and the angle-to-wavefront conversion. The result uses the
+selected `dtype`, which defaults to float32. Pass `dtype=np.float64` for
+float64 calculations and results. The finite-field blur retains the flux
+inside the crop and rejects materially non-PSD covariance.
 
-For comparisons that already have pixel-space covariance or OTFs,
-`image_plane_gaussian_otf(covariance_pix2, shape, *, mean_shift_pix=None)`
-constructs one Gaussian OTF, and `apply_finite_fov_otfs(psfs, otfs)` applies a
-matching OTF cube to PSFs in place. OTF shapes are twice the retained PSF
+`image_plane_gaussian_otf()` takes pixel-space covariance and constructs a
+Gaussian OTF at the requested precision (float32 by default).
+`apply_finite_fov_otfs()` applies a matching OTF cube to PSFs in place.
+OTF shapes are twice the retained PSF
 height and width; both operations use NumPy's unshifted FFT convention. The
 application crops and clips numerical negatives without renormalizing flux.
 
@@ -178,8 +181,10 @@ Run one INI directly:
 hybrid-ao-psf path/to/simulation.ini
 ```
 
-`--output` overrides the path in `[hybrid]`; `--overwrite` explicitly permits
-replacement. The command loads the same providers, calls the same `simulate()`
+`--output` overrides the path in `[hybrid]`. An explicit relative path is
+relative to the working directory. Paths in the INI are relative to the INI.
+Pass `--overwrite` to replace an existing result.
+The command loads the same providers, calls the same `simulate()`
 operation, and uses the same `save_result()` contract as Python callers.
 
 Package version inspection is available:

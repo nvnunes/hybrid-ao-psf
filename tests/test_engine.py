@@ -16,9 +16,9 @@ from hybrid_ao_psf import (
     DiagnosticsLevel,
     HybridCtotCorrection,
     HybridRequest,
-    NgsHoMetricPrediction,
     NonPsdPolicy,
-    ScienceHoPsfPrediction,
+    PsfMetricPrediction,
+    PsfPrediction,
     _mastsel,
     apply_finite_fov_otfs,
     blur_psfs_with_ctot,
@@ -29,17 +29,17 @@ from hybrid_ao_psf import (
 
 @dataclass(frozen=True)
 class _ScienceProvider:
-    prediction: ScienceHoPsfPrediction
+    prediction: PsfPrediction
 
-    def predict(self, **_: object) -> ScienceHoPsfPrediction:
+    def evaluate(self, **_: object) -> PsfPrediction:
         return self.prediction
 
 
 @dataclass(frozen=True)
 class _NgsProvider:
-    prediction: NgsHoMetricPrediction
+    prediction: PsfMetricPrediction
 
-    def predict(self, **_: object) -> NgsHoMetricPrediction:
+    def evaluate(self, **_: object) -> PsfMetricPrediction:
         return self.prediction
 
 
@@ -91,15 +91,14 @@ def _providers() -> tuple[_ScienceProvider, _NgsProvider]:
         tel_pupil=np.ones((8, 8)) * u.one,
     )
     science = _ScienceProvider(
-        ScienceHoPsfPrediction(
+        PsfPrediction(
             psfs=psfs,
             pixel_scale=8.0 * u.mas,
             metadata=metadata,
-            meta={"airmass": 1.2 * u.one},
         )
     )
     ngs = _NgsProvider(
-        NgsHoMetricPrediction(
+        PsfMetricPrediction(
             ee=np.array([0.4, 0.5]) * u.one,
             fwhm=np.array([100.0, 110.0]) * u.mas,
             sr=np.array([0.1, 0.2]) * u.one,
@@ -293,7 +292,7 @@ def test_centre_missing_adds_only_required_covariance(hook_runtime, count):
     )
     science, ngs = _providers()
     ngs = _NgsProvider(
-        NgsHoMetricPrediction(
+        PsfMetricPrediction(
             ngs.prediction.ee[:count],
             ngs.prediction.fwhm[:count],
             ngs.prediction.sr[:count],
@@ -330,7 +329,7 @@ def test_provenance_collision_and_invalid_hook_fail_before_runtime(hook_runtime)
             _request(),
             *_providers(),
             ctot_correction=HybridCtotCorrection(
-                lambda ctot, context: None, {"science_provider": "other"}
+                lambda ctot, context: None, {"science_psfs": "other"}
             ),
         )
     with pytest.raises(TypeError, match="ctot_correction"):
@@ -722,6 +721,23 @@ def test_public_blur_rejects_unconditioned_ctot() -> None:
             pixel_scale=4.0 * u.mas,
             angle_to_wavefront_scale=2.0 * u.nm / u.mas,
         )
+
+
+@pytest.mark.parametrize("dtype", [np.float32, np.float64])
+def test_gaussian_otf_rejects_invalid_covariances_and_has_unit_dc(dtype):
+    with pytest.raises(ValueError, match="positive semidefinite"):
+        image_plane_gaussian_otf(np.diag([-1.0, 1.0]), (18, 18), dtype=dtype)
+    with pytest.raises(ValueError, match="symmetric"):
+        image_plane_gaussian_otf(
+            np.array([[1.0, 0.4], [0.0, 1.0]]), (18, 18), dtype=dtype
+        )
+    with pytest.raises(ValueError, match="real"):
+        image_plane_gaussian_otf(np.eye(2) * 1j, (18, 18), dtype=dtype)
+
+    covariance = np.array([[1.0, 0.4], [0.4, 2.0]])
+    transfer = image_plane_gaussian_otf(covariance, (18, 18), dtype=dtype)
+    assert transfer[0, 0] == 1
+    assert np.max(np.abs(transfer)) <= 1
 
 
 def test_finite_field_otf_applies_mean_shift_without_renormalizing() -> None:

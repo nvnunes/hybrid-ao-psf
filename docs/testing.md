@@ -43,13 +43,20 @@ surface.
 
 ## PSF Precision Coverage
 
-`test_psf_precision.py` checks explicit float64 source-node pixels, flux,
-off-node interpolation and replay through save/load and prediction, while
+`test_psf_precision.py` checks explicit float64 pixels at source sample points, flux,
+interpolation between sample points and source comparisons through save/load and prediction, while
 preserving existing float32 defaults and rejecting unsupported precisions.
 It also checks physical metadata, NGS metrics, immutable runtime preparation
 and retention of producer precision. `test_execution_precision.py` adds independent FFT comparisons, a source
 pixel perturbation below float32 resolution, metrics, both-mode result
 round trips, legacy mixed-array preservation and declared-precision rejection.
+
+## PSF File Providers
+
+`test_psf_files.py` compares file and interpolator input through the simulation
+entry point at stored coordinates in both precisions. It covers request ordering,
+repeated coordinates, reads from multiple files, missing and duplicate matches,
+unavailable files, and retained flux.
 
 ## Calibration Input Coverage
 
@@ -67,7 +74,7 @@ independent recurrences, impulse sums and closed forms. The four family suites
 cover retained observations, offline building, support/units/settings rejection,
 immutable model state and numerical persistence. `test_calibration_workflows.py`
 exercises all four configured workflows with a synthetic subclass, including
-configured spot loading, calibrated reconstruction validation, noise-only replay
+configured spot loading, calibrated reconstruction validation, noise-only simulation
 and complete shape fitting without native files. Publication tests interrupt
 payload writes and manifest replacement and verify complete usable products and
 preserved permissions. Native conversion and source/reuse tests belong downstream.

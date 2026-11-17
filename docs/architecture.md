@@ -1,13 +1,13 @@
 # Architecture
 
 This document is the source of truth for Hybrid AO PSF package structure,
-scientific ownership, public API boundaries, and persisted contracts.
+scientific ownership, public API boundaries, and saved file contracts.
 
 ## Project Boundary
 
 Hybrid AO PSF owns:
 
-- science-HO-PSF and NGS-HO-metric interpolation products;
+- PSF image and metric interpolation products;
 - translation of Hybrid inputs into MASTSEL configuration;
 - explicit MASTSEL and E2E-Calibrated low-order execution;
 - a downstream field-wide Ctot hook with transient runtime/statistics context;
@@ -37,31 +37,37 @@ re-exports every supported user-facing contract and operation. The
 `hybrid_ao_psf.interpolation` submodule is also public for focused
 interpolation workflows, and its public names are the same names re-exported
 from the package root. Other submodules are implementation details; storage
-mechanics and MASTSEL adaptation are private. Concrete fitted providers expose
-immutable public `prepare(dtype=...)` conversion. The
+mechanics and MASTSEL adaptation are private. PSF providers expose `evaluate()`.
+Precision conversion stays internal; callers choose `dtype` when building or
+loading an interpolator, or on the Hybrid request. The
 package-root OTF helpers are the supported numerical primitives for external
 finite-field blur comparisons; other numerical helpers remain private.
 
 Physical values use Astropy quantities. Public requests and results are
 immutable typed objects. One simulation call accepts one request and
-loaded interpolation providers and returns one result; orchestration and
+PSF and metric providers and returns one result; orchestration and
 provider reuse belong to the caller.
 
 The science provider owns its PSF pixel scale and metadata. The engine uses
 that scale for blur and preserves it in the result; it does not relabel or
 resample provider output. Concrete providers also encapsulate their fitted
-state behind immutable interfaces so reuse cannot be altered through exposed
+state behind read-only interfaces so reuse cannot be altered through exposed
 SciPy objects or writable arrays.
 
-The public contract names are `HybridRequest`, `SciencePsfProvider`,
-`NgsMetricProvider`, `HybridResult`, and `HybridDiagnostics`. `LowOrderModel`
+The public contract names are `HybridRequest`, `PsfProvider`,
+`PsfMetricProvider`, `HybridResult`, and `HybridDiagnostics`. `LowOrderModel`
 selects the LO peer; `LowOrderDistribution` records the applied centred Gaussian
 mixture in angular x/y coordinates. Provider
-predictions use `ScienceHoPsfPrediction` and `NgsHoMetricPrediction`. The
-immutable concrete provider types are
-`ScienceHoPsfInterpolator` and `NgsHoMetricInterpolator`; file loading remains outside
-the stateless engine. The engine prepares concrete providers at request precision
-when needed; callers may prepare and reuse them beforehand. The combined
+predictions use `PsfPrediction` and `PsfMetricPrediction`. The
+read-only concrete provider types are
+`PsfInterpolator` and `PsfMetricInterpolator`. `PsfFileProvider` reads
+existing images using a caller-supplied reader returning `PsfSamples`.
+The provider owns file access and matches saved coordinates. The stateless
+engine accepts either through `science_psfs`. Built and loaded interpolators
+are validated, ready to evaluate and reusable. Coordinate checks run inside
+evaluation; validation helpers are private. Public comparison operations measure
+interpolation errors against reference samples. The engine converts built-in
+providers internally when the request requires another precision. The combined
 configuration boundary is `HybridConfiguration` plus `load_configuration()`;
 standalone results use `save_result()` and `load_result()`.
 
@@ -90,7 +96,7 @@ photometry and controller settings. It convolves the science PSFs with the full
 calibrated Gaussian mixture; it does not construct MASTSEL or accept its INI,
 external metric provider, zeropoint or correction callback. Both paths share
 science-provider preparation, physical axes, finite-field FFT/crop and result
-contracts. Preparation may be reused; simulation does not mutate providers.
+contracts. Providers may be reused; simulation does not mutate them.
 `blur_psfs_with_ctot()` is a focused operation for externally supplied PSFs
 and already-conditioned Ctot; it uses the same finite-field blur without
 running MASTSEL or producing a complete simulation result.
@@ -101,7 +107,7 @@ provide pixel-space covariance or precomputed OTFs directly.
 ## E2E Calibration Boundary
 
 Hybrid AO PSF owns physical calibration contracts, common configuration,
-measurement/build/replay operations, numerical diagnostics, model persistence
+measurement/build/simulation operations, numerical diagnostics, model persistence
 and fitted-product identities. `E2ECalibration` supplies common workflows with
 distinct native reading/measurement hooks. Downstream subclasses own E2E setup,
 source compatibility/conversion, normalization, native execution and reuse
@@ -137,32 +143,38 @@ image-axis rotation or flip. Hybrid preserves the source array orientation;
 it does not infer or apply a transform from metadata. This contract does not
 assign celestial north or east to either Cartesian axis.
 
-## Persisted Contracts
+## Saved File Contracts
 
-Interpolator artifacts and standalone HDF5 results use project-owned schema
+Interpolator files and standalone HDF5 results use project-owned schema
 identities and explicit versions. Loaders accept only the current supported
-Hybrid AO PSF contracts. Conversion from other artifact formats occurs outside
+Hybrid AO PSF contracts. Conversion from other file formats occurs outside
 the canonical loaders.
 
-Science-HO-PSF fitted state uses a version-2 pickle with identity
-`hybrid_ao_psf_science_ho_psf_interpolator` and a prepared SciPy regular-grid
-interpolator. Its prepared pixel arrays retain float32 by default or explicit
-float64; loading validates and preserves that stored precision. NGS-HO-metric
+PSF image interpolation data uses a version-3 pickle with identity
+`hybrid_ao_psf_science_ho_psf_interpolator` and a SciPy regular-grid evaluator.
+The image interpolator caches this evaluator for repeated calls, building it on
+first use or loading it from the saved file. Changing precision creates a new
+interpolator with its own evaluator. Pixel arrays retain float32 by default or
+explicit float64; loading validates and preserves that stored precision. PSF metric
 state may contain ready-to-evaluate SciPy RBF
-objects and uses a version-1 pickle with identity
+objects and uses a version-4 pickle with identity
 `hybrid_ao_psf_ngs_ho_metric_interpolator`. Pickle-owned classes resolve only
-through stable `hybrid_ao_psf` module paths; persisted interpolation
-configuration types live in `hybrid_ao_psf.interpolation.config`. Both pickle
-inputs must be trusted, while all artifact writers protect existing
+through stable `hybrid_ao_psf` module paths. Both pickle inputs must be trusted, while all file writers protect existing
 destinations with atomic replacement.
-New artifacts respect the process umask, and replacements preserve the
+Both formats store `grid_precision` alongside the interpolation data. Metric
+files use the current format with the selected `interpolation_type` and
+interpolation data. Metric builders
+select linear interpolation for complete rectangular field grids and a fixed
+scaled RBF for scattered samples; callers do not configure numerical methods.
+
+New files respect the process umask, and replacements preserve the
 destination's existing mode.
 
 The standalone result keeps quantities, provenance, effective configuration,
 and optional diagnostics together without imposing a batch dataset structure.
-Its root schema identity is `hybrid-ao-psf-result`, currently at version 3. It
+Its root schema identity is `hybrid-ao-psf-result`, currently at version 4. It
 records explicit model identity, effective precision, the applied distribution
-and model-specific scientific state. Versions 1 and 2 load as MASTSEL results;
-legacy mixed arrays retain their stored precision without a uniform arithmetic
-claim. Results load without fitted products or native sources. See
+and model-specific scientific state. The loader also accepts version 3 and
+interprets versions 1 and 2 as MASTSEL results. Legacy mixed arrays retain
+their stored precision. Results load without fitted products or native sources. See
 [Result files](results.md) for the layout and validation contract.

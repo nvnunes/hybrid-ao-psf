@@ -23,7 +23,7 @@ def main(argv: Sequence[str] | None = None) -> int:
     parser.add_argument(
         "--output",
         type=Path,
-        help="override the output path declared in [hybrid]",
+        help="override [hybrid] output (relative paths use the working directory)",
     )
     parser.add_argument(
         "--overwrite",

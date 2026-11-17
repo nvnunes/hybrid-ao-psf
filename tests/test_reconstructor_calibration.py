@@ -114,7 +114,7 @@ def test_measure_offline_build_roundtrip_and_support(calibration, tmp_path, sepa
         np.diag(np.repeat(expected, 2)),
         rtol=1e-14,
     )
-    with pytest.raises(ValueError, match="support"):
+    with pytest.raises(ValueError, match="range"):
         model.predict(
             photons_per_frame=1e10 * u.photon, ee=0.5 * u.one, fwhm=100 * u.mas
         )

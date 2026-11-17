@@ -1,4 +1,4 @@
-"""Shared interpolation artifact primitives."""
+"""Shared interpolation file primitives."""
 
 from __future__ import annotations
 
@@ -15,65 +15,83 @@ from scipy.interpolate import RBFInterpolator
 
 from .._io import atomic_output_path
 from .._units import quantity_value
-from .config import RbfInterpolationConfig, RegularGridInterpolationConfig
 
-SUPPORTED_REGULAR_GRID_METHODS = frozenset({"linear", "nearest"})
+_RBF_KERNEL = "thin_plate_spline"
+_RBF_SMOOTHING = 0.05
+_RBF_POLYNOMIAL_DEGREE = 1
 _AXIS_ATOL = 1.0e-10
 
 
-class _FrozenRbfInterpolator:
-    """Owned, read-only callable wrapper around one fitted SciPy RBF model."""
+class _ReadOnlyRbfInterpolator:
+    """Owned, read-only callable wrapper around one fitted SciPy RBF evaluator."""
 
     __slots__ = ("__interpolator",)
 
     def __init__(self, interpolator: RBFInterpolator) -> None:
         object.__setattr__(
-            self, "_FrozenRbfInterpolator__interpolator", deepcopy(interpolator)
+            self, "_ReadOnlyRbfInterpolator__interpolator", deepcopy(interpolator)
         )
-        _freeze_object_arrays(self.__interpolator)
+        _make_object_arrays_read_only(self.__interpolator)
 
     def __call__(self, coordinates: np.ndarray) -> np.ndarray:
         return self.__interpolator(coordinates)
 
     def __setattr__(self, name: str, value: object) -> None:
         raise AttributeError(
-            f"{type(self).__name__} is immutable; cannot set {name!r}."
+            f"{type(self).__name__} is read-only; cannot set {name!r}."
         )
 
     def __getstate__(self) -> RBFInterpolator:
-        return self.__interpolator
+        return deepcopy(self.__interpolator)
 
     def __setstate__(self, interpolator: RBFInterpolator) -> None:
-        object.__setattr__(self, "_FrozenRbfInterpolator__interpolator", interpolator)
-        _freeze_object_arrays(self.__interpolator)
+        object.__setattr__(self, "_ReadOnlyRbfInterpolator__interpolator", interpolator)
+        _make_object_arrays_read_only(self.__interpolator)
 
 
-def _freeze_object_arrays(value: object) -> None:
+def _make_object_arrays_read_only(value: object) -> None:
     for item in vars(value).values():
         if isinstance(item, np.ndarray):
             item.flags.writeable = False
 
 
-def freeze_artifact_value(value: Any) -> Any:
-    """Return recursively owned, read-only artifact state where applicable."""
+def make_read_only(value: Any) -> Any:
+    """Return recursively owned, read-only file state where applicable."""
     if isinstance(value, u.Quantity):
-        data = np.array(value.value, copy=True)
-        data.flags.writeable = False
-        return u.Quantity(data, value.unit, copy=False)
+        data = make_read_only(np.asarray(value))
+        return u.Quantity(data, value.unit, dtype=data.dtype, copy=False)
     if isinstance(value, np.ndarray):
-        data = np.array(value, copy=True)
-        data.flags.writeable = False
-        return data
+        owner = value
+        while isinstance(owner, np.ndarray):
+            owner = owner.base
+        if isinstance(owner, bytes):
+            return value.view()
+        return np.frombuffer(value.tobytes(), dtype=value.dtype).reshape(value.shape)
     if isinstance(value, Mapping):
         return MappingProxyType(
-            {str(name): freeze_artifact_value(item) for name, item in value.items()}
+            {str(name): make_read_only(item) for name, item in value.items()}
         )
     if isinstance(value, list | tuple):
-        return tuple(freeze_artifact_value(item) for item in value)
+        return tuple(make_read_only(item) for item in value)
     return value
 
 
-def cast_artifact_value(value: Any, dtype: np.dtype) -> Any:
+def interpolator_views(value: Any) -> Any:
+    """Share read-only buffers through views with independent metadata."""
+    if isinstance(value, u.Quantity):
+        return u.Quantity(np.asarray(value), value.unit, dtype=value.dtype, copy=False)
+    if isinstance(value, np.ndarray):
+        return value.view()
+    if isinstance(value, Mapping):
+        return MappingProxyType(
+            {name: interpolator_views(item) for name, item in value.items()}
+        )
+    if isinstance(value, tuple):
+        return tuple(interpolator_views(item) for item in value)
+    return value
+
+
+def cast_interpolator_value(value: Any, dtype: np.dtype) -> Any:
     """Copy owned physical/numerical state without altering nonfloating metadata."""
     if isinstance(value, u.Quantity):
         return u.Quantity(value.value, value.unit, dtype=dtype, copy=True)
@@ -85,54 +103,24 @@ def cast_artifact_value(value: Any, dtype: np.dtype) -> Any:
         )
         return value.astype(target)
     if isinstance(value, Mapping):
-        return {name: cast_artifact_value(item, dtype) for name, item in value.items()}
+        return {
+            name: cast_interpolator_value(item, dtype) for name, item in value.items()
+        }
     if isinstance(value, tuple):
-        return tuple(cast_artifact_value(item, dtype) for item in value)
+        return tuple(cast_interpolator_value(item, dtype) for item in value)
     return value
 
 
-def thaw_artifact_value(value: Any) -> Any:
-    """Return ordinary containers suitable for project-owned pickle output."""
+def to_file_containers(value: Any) -> Any:
+    """Convert protected mappings to ordinary containers for saving.
+
+    Arrays and fitted evaluators are unchanged; this does not make data writable.
+    """
     if isinstance(value, Mapping):
-        return {str(name): thaw_artifact_value(item) for name, item in value.items()}
+        return {str(name): to_file_containers(item) for name, item in value.items()}
     if isinstance(value, tuple):
-        return tuple(thaw_artifact_value(item) for item in value)
+        return tuple(to_file_containers(item) for item in value)
     return value
-
-
-def validate_rbf_config(config: RbfInterpolationConfig) -> RbfInterpolationConfig:
-    """Return a validated RBF configuration."""
-
-    if not isinstance(config, RbfInterpolationConfig):
-        raise TypeError(
-            "interpolation_config must be a RbfInterpolationConfig instance."
-        )
-    kernel = str(config.kernel).strip()
-    if not kernel:
-        raise ValueError("interpolation_config.kernel must be non-empty.")
-    smoothing = float(config.smoothing)
-    if not np.isfinite(smoothing) or smoothing < 0.0:
-        raise ValueError("interpolation_config.smoothing must be finite and >= 0.")
-    degree = int(config.degree)
-    if degree < -1:
-        raise ValueError("interpolation_config.degree must be >= -1.")
-    return RbfInterpolationConfig(kernel=kernel, smoothing=smoothing, degree=degree)
-
-
-def validate_regular_grid_config(
-    config: RegularGridInterpolationConfig,
-) -> RegularGridInterpolationConfig:
-    """Return a validated regular-grid interpolation configuration."""
-
-    if not isinstance(config, RegularGridInterpolationConfig):
-        raise TypeError(
-            "interpolation_config must be a RegularGridInterpolationConfig instance."
-        )
-    method = str(config.method).strip()
-    if method not in SUPPORTED_REGULAR_GRID_METHODS:
-        supported = ", ".join(sorted(SUPPORTED_REGULAR_GRID_METHODS))
-        raise ValueError(f"interpolation_config.method must be one of: {supported}.")
-    return RegularGridInterpolationConfig(method=method)
 
 
 def zenith_angle_to_airmass(zenith_angle: u.Quantity) -> u.Quantity:
@@ -238,7 +226,7 @@ def field_coordinates(x: Any, y: Any) -> np.ndarray:
 def rectangular_field_axes(
     x: Any, y: Any, *, label: str
 ) -> tuple[np.ndarray, np.ndarray]:
-    """Return sorted rectangular field axes after validating complete support."""
+    """Return sorted rectangular field axes after validating a complete field grid."""
 
     coordinates = field_coordinates(x, y)
     x_axis = unique_sorted(coordinates[:, 0], label="x")
@@ -289,7 +277,7 @@ def grid_field_values(
     return grid
 
 
-def validate_rectangular_field_query(
+def validate_rectangular_field_coordinates(
     x_axis: Any,
     y_axis: Any,
     coordinates: np.ndarray,
@@ -297,7 +285,7 @@ def validate_rectangular_field_query(
     label: str,
     atol: float,
 ) -> None:
-    """Validate query coordinates against rectangular field-axis bounds."""
+    """Validate requested coordinates against rectangular field-axis bounds."""
 
     x_axis = require_finite_vector(x_axis, label="x_axis")
     y_axis = require_finite_vector(y_axis, label="y_axis")
@@ -306,54 +294,52 @@ def validate_rectangular_field_query(
     y = np.asarray(coordinates[:, 1], dtype=float)
     if np.any(x < x_axis[0] - atol) or np.any(x > x_axis[-1] + atol):
         raise ValueError(
-            f"x query is outside {label} field support [{x_axis[0]}, {x_axis[-1]}]."
+            f"requested x coordinate is outside {label} x range [{x_axis[0]}, {x_axis[-1]}]."
         )
     if np.any(y < y_axis[0] - atol) or np.any(y > y_axis[-1] + atol):
         raise ValueError(
-            f"y query is outside {label} field support [{y_axis[0]}, {y_axis[-1]}]."
+            f"requested y coordinate is outside {label} y range [{y_axis[0]}, {y_axis[-1]}]."
         )
 
 
-def snap_rectangular_field_query(
+def clip_rectangular_field_coordinates(
     x_axis: Any, y_axis: Any, coordinates: np.ndarray
 ) -> np.ndarray:
-    """Clip near-boundary rectangular field queries onto their field axes."""
+    """Clip requested coordinates to the rectangular field bounds."""
 
-    snapped = np.asarray(coordinates, dtype=float).copy()
+    clipped = np.asarray(coordinates, dtype=float).copy()
     x_axis = require_finite_vector(x_axis, label="x_axis")
     y_axis = require_finite_vector(y_axis, label="y_axis")
-    snapped[:, 0] = np.clip(snapped[:, 0], x_axis[0], x_axis[-1])
-    snapped[:, 1] = np.clip(snapped[:, 1], y_axis[0], y_axis[-1])
-    return snapped
+    clipped[:, 0] = np.clip(clipped[:, 0], x_axis[0], x_axis[-1])
+    clipped[:, 1] = np.clip(clipped[:, 1], y_axis[0], y_axis[-1])
+    return clipped
 
 
-def make_scaled_rbf_model(
+def fit_scaled_rbfs(
     coordinates: np.ndarray,
     values_by_name: Mapping[str, np.ndarray],
-    config: RbfInterpolationConfig,
 ) -> dict[str, Any]:
-    """Fit scaled RBF models, dropping coordinate dimensions with no variation."""
+    """Fit scaled RBF evaluators and return their private interpolation data."""
 
     dtype = np.asarray(next(iter(values_by_name.values()))).dtype
-    config = validate_rbf_config(config)
     coordinates = np.asarray(coordinates, dtype=dtype)
     if coordinates.ndim != 2 or coordinates.shape[0] == 0:
         raise ValueError("coordinates must be a non-empty 2-D array.")
     if not np.all(np.isfinite(coordinates)):
         raise ValueError("coordinates must contain only finite values.")
 
-    coord_mean = np.nanmean(coordinates, axis=0)
-    coord_std = np.nanstd(coordinates, axis=0)
-    active_dims = coord_std > 0.0
-    if not np.any(active_dims):
+    coordinate_mean = np.nanmean(coordinates, axis=0)
+    coordinate_scale = np.nanstd(coordinates, axis=0)
+    varying_axes = coordinate_scale > 0.0
+    if not np.any(varying_axes):
         raise ValueError("At least one interpolation coordinate dimension must vary.")
 
-    active_coordinates = coordinates[:, active_dims]
-    active_mean = coord_mean[active_dims]
-    active_scale = coord_std[active_dims]
-    scaled_coordinates = (active_coordinates - active_mean) / active_scale
+    varying_coordinates = coordinates[:, varying_axes]
+    varying_mean = coordinate_mean[varying_axes]
+    varying_scale = coordinate_scale[varying_axes]
+    scaled_coordinates = (varying_coordinates - varying_mean) / varying_scale
 
-    models: dict[str, _FrozenRbfInterpolator] = {}
+    evaluators: dict[str, _ReadOnlyRbfInterpolator] = {}
     for name, values in values_by_name.items():
         values = np.asarray(values, dtype=dtype)
         if values.shape[0] != coordinates.shape[0]:
@@ -362,41 +348,40 @@ def make_scaled_rbf_model(
             )
         if not np.all(np.isfinite(values)):
             raise ValueError(f"{name} contains non-finite values.")
-        models[str(name)] = _FrozenRbfInterpolator(
+        evaluators[str(name)] = _ReadOnlyRbfInterpolator(
             RBFInterpolator(
                 scaled_coordinates,
                 values,
-                kernel=config.kernel,
-                smoothing=config.smoothing,
-                degree=config.degree,
+                kernel=_RBF_KERNEL,
+                smoothing=_RBF_SMOOTHING,
+                degree=_RBF_POLYNOMIAL_DEGREE,
             )
         )
 
     return {
-        "coord_mean": coord_mean,
-        "coord_scale": coord_std,
-        "active_dims": active_dims,
-        "config": config,
-        "models": models,
+        "coordinate_mean": coordinate_mean,
+        "coordinate_scale": coordinate_scale,
+        "varying_axes": varying_axes,
+        "evaluators": evaluators,
     }
 
 
-def evaluate_scaled_rbf_model(
-    model: Mapping[str, Any], coordinates: np.ndarray
+def evaluate_scaled_rbfs(
+    interpolation_data: Mapping[str, Any], coordinates: np.ndarray
 ) -> dict[str, np.ndarray]:
-    """Evaluate a scaled RBF model produced by ``make_scaled_rbf_model``."""
+    """Evaluate the scaled RBFs using their private interpolation data."""
 
-    dtype = np.asarray(model["coord_mean"]).dtype
+    dtype = np.asarray(interpolation_data["coordinate_mean"]).dtype
     coordinates = np.asarray(coordinates, dtype=dtype)
-    active_dims = np.asarray(model["active_dims"], dtype=bool)
-    coord_mean = np.asarray(model["coord_mean"], dtype=dtype)
-    coord_scale = np.asarray(model["coord_scale"], dtype=dtype)
-    scaled = (coordinates[:, active_dims] - coord_mean[active_dims]) / coord_scale[
-        active_dims
-    ]
+    varying_axes = np.asarray(interpolation_data["varying_axes"], dtype=bool)
+    coordinate_mean = np.asarray(interpolation_data["coordinate_mean"], dtype=dtype)
+    coordinate_scale = np.asarray(interpolation_data["coordinate_scale"], dtype=dtype)
+    scaled = (
+        coordinates[:, varying_axes] - coordinate_mean[varying_axes]
+    ) / coordinate_scale[varying_axes]
     return {
         name: np.asarray(interpolator(scaled), dtype=dtype)
-        for name, interpolator in dict(model["models"]).items()
+        for name, interpolator in dict(interpolation_data["evaluators"]).items()
     }
 
 
@@ -407,7 +392,7 @@ def unique_sorted(values: np.ndarray, *, label: str) -> np.ndarray:
     if values.size == 0:
         raise ValueError(f"{label} must not be empty.")
     # Ten decimal places are below float32 resolution; scaling by 1e10
-    # can itself move representable nodes such as 30 or 60.
+    # can itself move representable sample points such as 30 or 60.
     rounded = (
         values if values.dtype == np.dtype("float32") else np.round(values, decimals=10)
     )
@@ -437,15 +422,15 @@ def interpolation_axis_weights(
         if np.isclose(value, axis[0], rtol=0.0, atol=_AXIS_ATOL):
             return [(0, 1.0)]
         raise ValueError(
-            f"{label}={value} is outside the supported range [{axis[0]}, {axis[0]}]."
+            f"{label}={value} is outside the sampled range [{axis[0]}, {axis[0]}]."
         )
     if value < axis[0] and not np.isclose(value, axis[0], rtol=0.0, atol=_AXIS_ATOL):
         raise ValueError(
-            f"{label}={value} is below the supported range minimum {axis[0]}."
+            f"{label}={value} is below the sampled range minimum {axis[0]}."
         )
     if value > axis[-1] and not np.isclose(value, axis[-1], rtol=0.0, atol=_AXIS_ATOL):
         raise ValueError(
-            f"{label}={value} is above the supported range maximum {axis[-1]}."
+            f"{label}={value} is above the sampled range maximum {axis[-1]}."
         )
     if np.isclose(value, axis[0], rtol=0.0, atol=_AXIS_ATOL):
         return [(0, 1.0)]
@@ -461,42 +446,52 @@ def interpolation_axis_weights(
     return [(lower, 1.0 - weight), (upper, weight)]
 
 
-def save_payload(payload: Mapping[str, Any], path: Path, *, overwrite: bool) -> None:
-    """Persist a structured artifact payload."""
+def save_file_contents(
+    file_contents: Mapping[str, Any], path: Path, *, overwrite: bool
+) -> None:
+    """Save file contents to a pickle, replacing the destination atomically."""
 
     path = Path(path)
     if path.exists() and not overwrite:
-        raise FileExistsError(f"Refusing to overwrite existing artifact: {path}")
+        raise FileExistsError(f"Refusing to overwrite existing file: {path}")
     path.parent.mkdir(parents=True, exist_ok=True)
     with (
         atomic_output_path(path) as temporary_path,
         temporary_path.open("wb") as handle,
     ):
         pickle.dump(
-            thaw_artifact_value(payload),
+            to_file_containers(file_contents),
             handle,
             protocol=pickle.HIGHEST_PROTOCOL,
         )
 
 
-def load_payload(path: Path) -> dict[str, Any]:
-    """Load a structured artifact payload from a trusted pickle file."""
+def load_file_contents(path: Path) -> dict[str, Any]:
+    """Load the contents of a trusted pickle and require a dictionary."""
 
     with Path(path).open("rb") as handle:
-        payload = pickle.load(handle)
-    if not isinstance(payload, dict):
+        file_contents = pickle.load(handle)
+    if not isinstance(file_contents, dict):
         raise TypeError(
-            f"{path} does not contain a Hybrid AO PSF interpolation artifact payload."
+            f"{path} does not contain a Hybrid AO PSF interpolation dictionary."
         )
-    return payload
+    return file_contents
 
 
-def validate_payload_kind(
-    payload: Mapping[str, Any], *, kind: str, version: int
+def validate_file_format(
+    file_contents: Mapping[str, Any], *, kind: str, versions: tuple[int, ...]
 ) -> None:
-    """Validate common persisted artifact kind and version fields."""
+    """Check the saved file type and supported format versions."""
 
-    if payload.get("kind") != kind:
-        raise ValueError(f"Unsupported artifact kind: {payload.get('kind')!r}.")
-    if payload.get("version") != version:
-        raise ValueError(f"Unsupported artifact version: {payload.get('version')!r}.")
+    if file_contents.get("kind") != kind:
+        raise ValueError(f"Unsupported file kind: {file_contents.get('kind')!r}.")
+    if file_contents.get("version") not in versions:
+        raise ValueError(f"Unsupported file version: {file_contents.get('version')!r}.")
+
+
+def file_grid_precision(file_contents: Mapping[str, Any]) -> str:
+    """Read the required coordinate precision from a current interpolator file."""
+    grid_precision = file_contents.get("grid_precision")
+    if not isinstance(grid_precision, str):
+        raise TypeError("Interpolator file requires a grid_precision string.")
+    return grid_precision

@@ -14,18 +14,18 @@ from hybrid_ao_psf import (
     HybridRequest,
     LowOrderDistribution,
     LowOrderModel,
-    ScienceHoPsfPrediction,
-    ScienceHoPsfSamples,
-    build_science_ho_psf_interpolator,
+    PsfPrediction,
+    PsfSamples,
+    build_psf_interpolator,
     load_configuration,
     load_result,
     run_configuration,
     save_coma_calibration,
     save_covariance_calibration,
-    save_ngs_ho_metric_interpolator,
+    save_psf_interpolator,
+    save_psf_metric_interpolator,
     save_reconstructor_calibration,
     save_result,
-    save_science_ho_psf_interpolator,
     save_sensing_calibration,
     simulate,
 )
@@ -45,8 +45,8 @@ class Science:
         self.image *= dtype(0.7) / self.image.sum()
         self.dtype = dtype
 
-    def predict(self, *, x, **kwargs):
-        return ScienceHoPsfPrediction(
+    def evaluate(self, *, x, **kwargs):
+        return PsfPrediction(
             np.repeat(self.image[None], len(x), axis=0),
             1 * u.mas,
             PsfMetadata(
@@ -138,7 +138,7 @@ def test_calibrated_engine_matches_independent_mixture_and_roundtrip(
     assert result.psfs.dtype == dtype
     assert np.all(result.psfs.sum((1, 2)) < source.image.sum())
     np.testing.assert_array_equal(
-        source.image, source.predict(x=[0] * u.arcsec).psfs[0]
+        source.image, source.evaluate(x=[0] * u.arcsec).psfs[0]
     )
     path = save_result(tmp_path / "result.h5", result)
     with h5py.File(path) as root:
@@ -245,6 +245,13 @@ def test_result_rejects_corrupted_calibrated_state(synthetic, tmp_path, corrupt)
         ("strengths", "scalar decomposition"),
         ("noise_prior_negative", "noise_prior must be symmetric positive semidefinite"),
         (
+            "atmospheric_command_negative",
+            "atmospheric_command must be symmetric positive semidefinite",
+        ),
+        ("ho_command_negative", "ho_command must be symmetric positive semidefinite"),
+        ("science_atmospheric_command", "atmospheric residual covariance disagrees"),
+        ("science_ho_command", "HO covariance contribution disagrees"),
+        (
             "noise_prior_asymmetric",
             "noise_prior must be symmetric positive semidefinite",
         ),
@@ -266,6 +273,10 @@ def test_result_rejects_inconsistent_scientific_diagnostics(
             state["noise_prior"][...] = -0.1 * np.eye(4)
         elif corrupt == "noise_prior_asymmetric":
             state["noise_prior"][0, 1] += 0.1
+        elif corrupt.endswith("_negative"):
+            state[corrupt.removesuffix("_negative")][...] = -100 * np.eye(2)
+        elif corrupt.startswith("science_"):
+            state[corrupt][0, 0, 0] += 0.1
     with pytest.raises(ValueError, match=error):
         load_result(path)
 
@@ -295,13 +306,13 @@ def configured(synthetic, tmp_path):
         ("reconstructor", save_reconstructor_calibration),
     ):
         save(getattr(model, name), tmp_path / name / "model.json")
-    save_ngs_ho_metric_interpolator(model.ngs_metrics, tmp_path / "metrics.pkl")
+    save_psf_metric_interpolator(model.ngs_metrics, tmp_path / "metrics.pkl")
     provider = Science(np.float64)
     image = provider.image
     xy = record.positions.value
-    save_science_ho_psf_interpolator(
-        build_science_ho_psf_interpolator(
-            ScienceHoPsfSamples(
+    save_psf_interpolator(
+        build_psf_interpolator(
+            PsfSamples(
                 x=xy[:, 0] * u.arcsec,
                 y=xy[:, 1] * u.arcsec,
                 psfs=np.repeat(image[None], len(xy), axis=0),
@@ -402,7 +413,7 @@ def test_legacy_mastsel_loads_without_model_or_distribution(version, tmp_path):
 
 
 @pytest.mark.parametrize(
-    "field", ["precision", "ngs_flux_photon_per_s", "ngs_metric_artifact"]
+    "field", ["precision", "ngs_flux_photon_per_s", "ngs_metric_file"]
 )
 def test_e2e_configuration_rejects_foreign_hybrid_fields(configured, field):
     with configured.open("a") as stream:

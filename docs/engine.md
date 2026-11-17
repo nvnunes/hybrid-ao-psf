@@ -1,7 +1,8 @@
 # Engine
 
-`simulate()` accepts one `HybridRequest`, one loaded
-`SciencePsfProvider`, and either an NGS metric provider for MASTSEL or an
+`simulate()` accepts one `HybridRequest`, `science_psfs` implementing
+`PsfProvider`, and either `ngs_metrics` implementing `PsfMetricProvider`
+for MASTSEL or an
 `E2ECalibratedModel` for E2E. `request.lo_model` selects the path explicitly;
 MASTSEL remains the default. It returns one
 immutable `HybridResult` and retains no mutable run state. Loading and provider
@@ -25,11 +26,11 @@ For MASTSEL, one call:
 7. constructs the standard result, jitter, PSD facts, effective configuration,
    provenance, and selected diagnostics.
 
-For E2E, the engine evaluates the calibrated model at the requested NGS
-positions/magnitudes and science positions. It adds the noiseless Gaussian
-covariance to each calibrated noise component, builds their weighted Gaussian
-OTF sum and applies that full mixture. The weighted covariance supplies Ctot
-and jitter; a single Gaussian with the same Ctot is not substituted.
+`E2ECalibratedModel.predict()` returns the full low-order displacement
+mixture at the requested science positions for the supplied asterism.
+The engine converts the angular component covariances to pixel units,
+forms the weighted Gaussian OTF and convolves the science PSFs. The
+mixture's weighted covariance supplies Ctot and jitter.
 
 Both paths use the provider-owned pixel scale, physical x/y axes and the same
 finite-field FFT/crop on a private selected-precision PSF copy. The crop is not renormalized. Energy blurred beyond the retained

@@ -25,6 +25,7 @@ def test_result_hdf5_round_trip(tmp_path: Path) -> None:
     with h5py.File(path, "r") as root:
         assert root.attrs["schema"] == RESULT_SCHEMA
         assert root.attrs["schema_version"] == RESULT_SCHEMA_VERSION
+        assert "result/source_metadata" not in root
         assert "configuration/effective_mastsel_ini" in root
         assert "diagnostics/psd_valid_mask" in root
         assert "diagnostics/ctot_angle_trace_mean" in root
@@ -64,6 +65,20 @@ def test_result_hdf5_round_trip(tmp_path: Path) -> None:
         expected.diagnostics.pre_blur_psfs,
     )
     assert not actual.psfs.flags.writeable
+
+
+def test_version_three_result_with_source_metadata_still_loads(tmp_path: Path) -> None:
+    expected = make_result()
+    path = save_result(tmp_path / "result-v3.h5", expected)
+    with h5py.File(path, "r+") as root:
+        root.attrs["schema_version"] = 3
+        source_metadata = root["result"].create_group("source_metadata")
+        value = source_metadata.create_dataset("old_value", data=expected.dtype.type(1))
+        value.attrs["unit"] = "1"
+
+    loaded = load_result(path)
+    np.testing.assert_array_equal(loaded.psfs, expected.psfs)
+    assert loaded.metadata.pixel_scale == expected.metadata.pixel_scale
 
 
 def test_correction_identity_round_trips_without_runtime_state(tmp_path):

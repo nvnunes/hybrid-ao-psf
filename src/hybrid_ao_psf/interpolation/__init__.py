@@ -1,71 +1,60 @@
-"""Versioned interpolation artifacts for Hybrid workflows.
+"""Versioned interpolation files for Hybrid workflows.
 
-This public submodule owns the Hybrid AO PSF artifact contract for
-science high-order PSF interpolation and NGS high-order metric interpolation.
-Objects are built, validated, evaluated, replay-tested, saved, and loaded
-through the functions exported here. The supported surface is also available
-from the package root.
+This public submodule owns the Hybrid AO PSF file contract for
+PSF image and metric interpolation.
+Objects are built, evaluated, compared with reference samples, saved, and
+loaded through the functions exported here. Validation is internal to those
+operations. The supported surface is also available from the package root.
 """
 
-from ._core import zenith_angle_to_airmass
-from .config import RbfInterpolationConfig, RegularGridInterpolationConfig
-from .ngs_ho_metric import (
-    NgsHoMetricInterpolator,
-    NgsHoMetricPrediction,
-    NgsHoMetricReplaySummary,
-    NgsHoMetricSamples,
-    NgsHoPsfSamples,
-    build_ngs_ho_metric_interpolator,
-    build_ngs_ho_metric_interpolator_from_psfs,
-    build_ngs_ho_metric_samples_from_psfs,
-    evaluate_ngs_ho_metric_interpolator,
-    load_ngs_ho_metric_interpolator,
-    replay_ngs_ho_metric_interpolator,
-    save_ngs_ho_metric_interpolator,
-    validate_ngs_ho_metric_interpolator,
-    validate_ngs_ho_metric_query,
+from ..contracts import (
+    PsfMetricPrediction,
 )
-from .science_ho_psf import (
-    ScienceHoPsfInterpolator,
-    ScienceHoPsfPrediction,
-    ScienceHoPsfReplaySummary,
-    ScienceHoPsfSamples,
-    build_science_ho_psf_interpolator,
-    evaluate_science_ho_psf_interpolator,
-    load_science_ho_psf_interpolator,
-    replay_science_ho_psf_interpolator,
-    save_science_ho_psf_interpolator,
-    validate_science_ho_psf_interpolator,
-    validate_science_ho_psf_query,
+from ._core import zenith_angle_to_airmass
+from .psf import (
+    PsfComparisonSummary,
+    PsfInterpolator,
+    PsfPrediction,
+    PsfSamples,
+    build_psf_interpolator,
+    compare_psf_interpolator,
+    load_psf_interpolator,
+    save_psf_interpolator,
+)
+from .psf_metrics import (
+    PsfMetricComparisonSummary,
+    PsfMetricInterpolator,
+    PsfMetricSamples,
+    build_psf_metric_interpolator,
+    build_psf_metric_interpolator_from_psfs,
+    compare_psf_metric_interpolator,
+    load_psf_metric_interpolator,
+    measure_psf_metrics,
+    save_psf_metric_interpolator,
 )
 
-__all__ = [
-    "NgsHoMetricInterpolator",
-    "NgsHoMetricPrediction",
-    "NgsHoMetricReplaySummary",
-    "NgsHoMetricSamples",
-    "NgsHoPsfSamples",
-    "RbfInterpolationConfig",
-    "RegularGridInterpolationConfig",
-    "ScienceHoPsfInterpolator",
-    "ScienceHoPsfPrediction",
-    "ScienceHoPsfReplaySummary",
-    "ScienceHoPsfSamples",
-    "build_ngs_ho_metric_interpolator",
-    "build_ngs_ho_metric_interpolator_from_psfs",
-    "build_ngs_ho_metric_samples_from_psfs",
-    "build_science_ho_psf_interpolator",
-    "evaluate_ngs_ho_metric_interpolator",
-    "evaluate_science_ho_psf_interpolator",
-    "load_ngs_ho_metric_interpolator",
-    "load_science_ho_psf_interpolator",
-    "replay_ngs_ho_metric_interpolator",
-    "replay_science_ho_psf_interpolator",
-    "save_ngs_ho_metric_interpolator",
-    "save_science_ho_psf_interpolator",
-    "validate_ngs_ho_metric_interpolator",
-    "validate_ngs_ho_metric_query",
-    "validate_science_ho_psf_interpolator",
-    "validate_science_ho_psf_query",
+# Keep canonical exports in scientific workflow order.
+__all__ = [  # noqa: RUF022
+    # PSF images
+    "PsfSamples",
+    "PsfInterpolator",
+    "PsfPrediction",
+    "build_psf_interpolator",
+    "PsfComparisonSummary",
+    "compare_psf_interpolator",
+    "save_psf_interpolator",
+    "load_psf_interpolator",
+    # PSF metrics
+    "PsfMetricSamples",
+    "PsfMetricInterpolator",
+    "PsfMetricPrediction",
+    "build_psf_metric_interpolator_from_psfs",
+    "measure_psf_metrics",
+    "build_psf_metric_interpolator",
+    "PsfMetricComparisonSummary",
+    "compare_psf_metric_interpolator",
+    "save_psf_metric_interpolator",
+    "load_psf_metric_interpolator",
+    # Coordinate conversion
     "zenith_angle_to_airmass",
 ]

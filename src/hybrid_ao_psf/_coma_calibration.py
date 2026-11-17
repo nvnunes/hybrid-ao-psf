@@ -28,7 +28,7 @@ from ._calibration_products import (
 )
 from ._coma_fitting import _ResponseArrays, fit_airmass, fit_response
 from ._io import atomic_output_path
-from ._validation import clip_support, support_dtype, validate_psf_dtype
+from ._validation import coarsest_precision, snap_coordinate_range, validate_psf_dtype
 
 _KIND = "hybrid-ao-psf-coma-response"
 _MEASUREMENTS = "hybrid-ao-psf-coma-measurements"
@@ -135,7 +135,7 @@ class ComaResponseModel(_PhysicalRecord):
         object.__setattr__(
             self,
             "support_precision",
-            support_dtype(self.dtype, self.producer_dtype, self.support_precision),
+            coarsest_precision(self.dtype, self.producer_dtype, self.support_precision),
         )
         values = {
             name: _quantity(getattr(self, name), unit, name, ndim, dtype=self.dtype)
@@ -218,13 +218,13 @@ class ComaResponseModel(_PhysicalRecord):
         ):
             raise ValueError("finite real magnitude/angle values required")
         precision = self.support_precision
-        mag = clip_support(
+        mag = snap_coordinate_range(
             mag,
             self.magnitude_support.value,
             dtype=precision,
             label="coma-response magnitude",
         )
-        angle = clip_support(
+        angle = snap_coordinate_range(
             angle,
             self.zenith_support.value,
             dtype=precision,
@@ -315,7 +315,7 @@ def build_coma_calibration(
     ):
         raise ValueError("at least three typed coma measurement planes required")
     dtype = validate_psf_dtype(dtype)
-    coordinate_precision = support_dtype(dtype, *(item.dtype for item in measurements))
+    coordinate_precision = coarsest_precision(dtype, *(item.dtype for item in measurements))
     measurements = [
         replace(
             item,

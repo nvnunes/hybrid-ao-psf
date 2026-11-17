@@ -13,9 +13,9 @@ from hybrid_ao_psf import (
     HybridMastselStatistics,
     HybridRequest,
     HybridResult,
-    NgsHoMetricPrediction,
     NonPsdPolicy,
-    ScienceHoPsfPrediction,
+    PsfMetricPrediction,
+    PsfPrediction,
 )
 
 
@@ -73,8 +73,7 @@ def make_result(*, diagnostics: bool = True) -> HybridResult:
     return HybridResult(
         psfs=psfs,
         metadata=_metadata(),
-        source_metadata={"airmass": 1.2 * u.dimensionless_unscaled},
-        ngs_metrics=NgsHoMetricPrediction(
+        ngs_metrics=PsfMetricPrediction(
             ee=np.array([0.4, 0.5]) * u.dimensionless_unscaled,
             fwhm=np.array([100.0, 110.0]) * u.mas,
             sr=np.array([0.1, 0.2]) * u.dimensionless_unscaled,
@@ -87,7 +86,7 @@ def make_result(*, diagnostics: bool = True) -> HybridResult:
         jitter=np.full(2, np.sqrt(1.75)) * u.mas,
         effective_mastsel_ini="[telescope]\nZenithAngle = 30\n",
         psd_clipped=np.array([False, True]),
-        provenance={"science_psf_artifact": "science.pkl"},
+        provenance={"science_psf_file": "science.pkl"},
         diagnostics=(
             HybridDiagnostics(
                 psd_valid_mask=np.array([True, True]),
@@ -203,7 +202,7 @@ def test_request_requires_one_complete_ngs_input_path() -> None:
 
 def test_provider_prediction_owns_inputs() -> None:
     psfs = np.ones((1, 4, 4), dtype=np.float64)
-    prediction = ScienceHoPsfPrediction(
+    prediction = PsfPrediction(
         psfs=psfs, pixel_scale=8.8 * u.mas, metadata=_metadata()
     )
     psfs.fill(0.0)
@@ -320,7 +319,7 @@ def test_ngs_metrics_own_immutable_values_and_unit_metadata(dtype):
         "fwhm": np.array([100, 110], dtype=np.float32) * u.mas,
         "sr": np.array([0.1, 0.2], dtype=np.float64) * u.one,
     }
-    metrics = NgsHoMetricPrediction(**source, dtype=dtype)
+    metrics = PsfMetricPrediction(**source, dtype=dtype)
     for name, supplied in source.items():
         expected = supplied.astype(dtype) if dtype is not None else supplied.copy()
         supplied[0] = 0 * supplied.unit

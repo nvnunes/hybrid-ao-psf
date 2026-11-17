@@ -40,7 +40,7 @@ from ._reconstructor_calibration import (
 )
 from ._sensing_calibration import SensingCalibration, load_sensing_calibration
 from ._validation import validate_psf_dtype
-from .interpolation import NgsHoMetricInterpolator, load_ngs_ho_metric_interpolator
+from .interpolation import PsfMetricInterpolator, load_psf_metric_interpolator
 
 
 @dataclass(frozen=True, kw_only=True, eq=False)
@@ -69,7 +69,7 @@ class E2ECalibratedModel(_LowOrderModel):
     coma: ComaResponseModel
     sensing: SensingCalibration
     reconstructor: ReconstructorNoiseModel
-    ngs_metrics: NgsHoMetricInterpolator
+    ngs_metrics: PsfMetricInterpolator
     dtype: DTypeLike = np.float32
     product_identities: Mapping[
         str, CalibrationProductIdentity | CalibrationFileIdentity
@@ -83,7 +83,7 @@ class E2ECalibratedModel(_LowOrderModel):
             ("coma", ComaResponseModel),
             ("sensing", SensingCalibration),
             ("reconstructor", ReconstructorNoiseModel),
-            ("ngs_metrics", NgsHoMetricInterpolator),
+            ("ngs_metrics", PsfMetricInterpolator),
         ):
             value = getattr(self, name)
             if not isinstance(value, cls):
@@ -91,7 +91,9 @@ class E2ECalibratedModel(_LowOrderModel):
             object.__setattr__(
                 self,
                 name,
-                value.prepare(dtype=dtype),
+                value._with_dtype(dtype)
+                if isinstance(value, PsfMetricInterpolator)
+                else value.prepare(dtype=dtype),
             )
         covariance_controller = self.covariance.controller
         sensing_controller = self.sensing.controller
@@ -201,7 +203,7 @@ class E2ECalibratedModel(_LowOrderModel):
         coma_responses = self.coma.predict(
             magnitude=magnitudes, zenith_angle=zenith_angle
         )
-        metrics = self.ngs_metrics.predict(
+        metrics = self.ngs_metrics.evaluate(
             zenith_angle=zenith_angle, x=ngs_positions[:, 0], y=ngs_positions[:, 1]
         )
         photons_per_frame = self.coma.photometry.photons_per_frame(magnitudes)
@@ -411,7 +413,7 @@ def load_e2e_calibrated_model(
         coma=load_coma_calibration(paths["coma"]),
         sensing=load_sensing_calibration(paths["sensing"]),
         reconstructor=load_reconstructor_calibration(paths["reconstructor"]),
-        ngs_metrics=load_ngs_ho_metric_interpolator(config.ngs_metrics),
+        ngs_metrics=load_psf_metric_interpolator(config.ngs_metrics),
         dtype=config.dtype if dtype is None else dtype,
         product_identities=identities,
     )

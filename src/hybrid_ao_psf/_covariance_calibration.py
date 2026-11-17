@@ -47,7 +47,7 @@ from ._covariance_validation import (
     precision_report,
 )
 from ._io import atomic_output_path
-from ._validation import support_dtype, validate_psf_dtype
+from ._validation import coarsest_precision, validate_psf_dtype
 
 _KIND = "hybrid-ao-psf-covariance-functions"
 _MEASUREMENTS = "hybrid-ao-psf-covariance-measurements"
@@ -501,7 +501,7 @@ class CovarianceFunctions:
             or len(arrays["y_arcsec"]) < 2
         ):
             raise ValueError("invalid covariance spatial/feedback/zenith support")
-        support_precision = support_dtype(dtype, producer_dtype, support_precision)
+        support_precision = coarsest_precision(dtype, producer_dtype, support_precision)
         if not np.allclose(
             arrays["airmass"],
             1 / np.cos(np.deg2rad(za)),
@@ -899,7 +899,7 @@ def build_covariance_calibration(
     ):
         raise ValueError("provide accepted covariance measurement planes")
     dtype = validate_psf_dtype(dtype)
-    coordinate_precision = support_dtype(dtype, *(plane.dtype for plane in planes))
+    coordinate_precision = coarsest_precision(dtype, *(plane.dtype for plane in planes))
     planes = [
         replace(plane, dtype=dtype, controller=replace(plane.controller, dtype=dtype))
         for plane in planes

@@ -19,14 +19,14 @@ from hybrid_ao_psf import (
     E2ECalibration,
     E2ECalibrationConfiguration,
     FixedGainIntegrator,
+    PsfSamples,
     ReconstructorCalibrationResult,
     ReconstructorCalibrationSettings,
     ReconstructorNoiseMeasurements,
-    ScienceHoPsfSamples,
     SensingCalibrationSettings,
     SensingNoiseRequest,
     SensingWfsMeasurements,
-    build_science_ho_psf_interpolator,
+    build_psf_interpolator,
     build_sensing_response,
     load_coma_calibration,
     load_covariance_calibration,
@@ -34,8 +34,8 @@ from hybrid_ao_psf import (
     load_sensing_calibration,
     save_coma_calibration,
     save_covariance_calibration,
+    save_psf_interpolator,
     save_reconstructor_calibration,
-    save_science_ho_psf_interpolator,
     save_sensing_calibration,
 )
 
@@ -159,9 +159,9 @@ def pipeline(tmp_path_factory, request):
         ),
     )
     positions = np.array([[-1, -1], [-1, 1], [1, -1], [1, 1]])
-    save_science_ho_psf_interpolator(
-        build_science_ho_psf_interpolator(
-            ScienceHoPsfSamples(
+    save_psf_interpolator(
+        build_psf_interpolator(
+            PsfSamples(
                 x=positions[:, 0] * u.arcsec,
                 y=positions[:, 1] * u.arcsec,
                 psfs=np.full((4, 4, 4), 0.5 / 16),

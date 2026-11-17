@@ -24,7 +24,9 @@ def test_mkdocs_navigation_targets_exist() -> None:
                         collect(value)
 
     collect(config["nav"])
-    missing = [target for target in targets if not (REPO_ROOT / "docs" / target).is_file()]
+    missing = [
+        target for target in targets if not (REPO_ROOT / "docs" / target).is_file()
+    ]
     assert missing == []
 
 
@@ -69,4 +71,7 @@ def test_public_documentation_excludes_internal_project_history() -> None:
 def test_generated_reference_uses_canonical_package_boundary() -> None:
     reference = (REPO_ROOT / "docs/reference/api.md").read_text(encoding="utf-8")
 
-    assert reference.strip() == "# Python API\n\n::: hybrid_ao_psf"
+    directives = [
+        line.strip() for line in reference.splitlines() if line.startswith(":::")
+    ]
+    assert directives == ["::: hybrid_ao_psf"]

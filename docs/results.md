@@ -1,9 +1,9 @@
 # Result Files
 
 `save_result()` writes one `HybridResult` to HDF5. Files identify themselves
-with root attributes `schema = "hybrid-ao-psf-result"`, `schema_version = 3`,
+with root attributes `schema = "hybrid-ao-psf-result"`, `schema_version = 4`,
 `lo_model = mastsel|e2e-calibrated` and `precision = float32|float64`.
-`load_result()` also accepts MASTSEL versions 1 and 2. Version 1 preserves each
+`load_result()` also accepts version 3 and MASTSEL versions 1 and 2. Version 1 preserves each
 stored array and exposes `result.dtype=None` because no uniform precision was
 recorded. Saving a legacy mixed result retains its arrays and records
 `precision=mixed`. Unsupported identities/versions and declared precision
@@ -16,7 +16,6 @@ mismatches are rejected.
 ├── result/
 │   ├── psfs
 │   ├── metadata/{wavelength,pixel_scale,tel_diameter,tel_pupil}
-│   ├── source_metadata/<name>
 │   ├── ngs_metrics/{ee,fwhm,sr}
 │   ├── ctot/{angle,psd_clipped,wavefront?,angle_to_wavefront_scale?}
 │   ├── ngs/{frame_rate,flux?,magnitude?,magnitude_zeropoint?}

@@ -10,6 +10,7 @@ from pathlib import Path
 
 import numpy as np
 from astropy import units as u
+from numpy.typing import DTypeLike
 
 from ._calibration_config import load_e2e_calibration_configuration
 from .contracts import DiagnosticsLevel, HybridRequest, LowOrderModel, NonPsdPolicy
@@ -23,8 +24,8 @@ class HybridConfiguration:
 
     Attributes:
         request: Validated engine request derived from the combined INI file.
-        science_psf_artifact: Science high-order PSF provider artifact.
-        ngs_metric_artifact: External MASTSEL metric provider path; None for E2E,
+        science_psf_file: Science high-order PSF provider file.
+        ngs_metric_file: External MASTSEL metric provider path; None for E2E,
             whose metrics belong to the loaded calibrated model.
         output: Configured standalone result path.
         source: Absolute source INI path.
@@ -33,22 +34,34 @@ class HybridConfiguration:
     """
 
     request: HybridRequest
-    science_psf_artifact: Path
-    ngs_metric_artifact: Path | None
+    science_psf_file: Path
+    ngs_metric_file: Path | None
     output: Path
     source: Path
     e2e_configuration: Path | None = None
 
 
-def load_configuration(path: str | Path, *, dtype=None) -> HybridConfiguration:
-    """Resolve one INI into a model-specific request and explicit file paths.
+def load_configuration(
+    path: str | Path, *, dtype: DTypeLike | None = None
+) -> HybridConfiguration:
+    """Read a Hybrid INI and resolve its model-specific inputs.
 
-    MASTSEL is the default and retains its combined INI/polar source format.
-    E2E uses Cartesian [hybrid] request fields plus the shared [e2e] model and
-    provider paths. Relative paths resolve from this INI. Precision resolves
-    from model-specific INI defaults then explicit dtype; no second policy is
-    inferred from file presence. Missing/unsupported request inputs raise.
-    This operation does not load fitted models or start calibration.
+    Paths in the INI are relative to the INI's directory. MASTSEL is the
+    default and reads the combined INI with polar source coordinates.
+    E2E-Calibrated reads Cartesian coordinates and the shared `[e2e]` section.
+    The returned configuration carries file paths for later provider loading.
+
+    Args:
+        path: Path to the Hybrid configuration.
+        dtype: Optional float32 or float64 precision override. By default,
+            use the configured model precision.
+
+    Returns:
+        A validated request, provider paths and the output destination.
+
+    Raises:
+        FileNotFoundError: If the INI or required path is missing.
+        ValueError: If the model, required fields or precision are invalid.
     """
     source = Path(path).expanduser().resolve()
     if not source.is_file():
@@ -75,9 +88,15 @@ def load_configuration(path: str | Path, *, dtype=None) -> HybridConfiguration:
             raise ValueError(f"Configuration requires [{section}].")
 
     hybrid = parser[HYBRID_SECTION]
+    for option in ("science_psf_file", "ngs_metric_file"):
+        previous = option.removesuffix("_file") + "_artifact"
+        if previous in hybrid:
+            if option in hybrid and hybrid[option] != hybrid[previous]:
+                raise ValueError(f"Conflicting hybrid.{option} paths.")
+            hybrid[option] = hybrid.pop(previous)
     if "pixel_scale_mas" in hybrid:
         raise ValueError(
-            "hybrid.pixel_scale_mas is not supported; the science PSF artifact "
+            "hybrid.pixel_scale_mas is not supported; the science PSF file "
             "owns the pixel scale."
         )
     science_r = _array(
@@ -123,14 +142,14 @@ def load_configuration(path: str | Path, *, dtype=None) -> HybridConfiguration:
     )
     return HybridConfiguration(
         request=request,
-        science_psf_artifact=_resolved_path(
+        science_psf_file=_resolved_path(
             hybrid,
-            "science_psf_artifact",
+            "science_psf_file",
             source=source,
         ),
-        ngs_metric_artifact=_resolved_path(
+        ngs_metric_file=_resolved_path(
             hybrid,
-            "ngs_metric_artifact",
+            "ngs_metric_file",
             source=source,
         ),
         output=_resolved_path(hybrid, "output", source=source, must_exist=False),
@@ -182,12 +201,12 @@ def _load_calibrated_configuration(parser, source, dtype):
     )
     if not calibrated.science_psf.is_file():
         raise FileNotFoundError(
-            f"science PSF artifact not found: {calibrated.science_psf}"
+            f"science PSF file not found: {calibrated.science_psf}"
         )
     return HybridConfiguration(
         request=request,
-        science_psf_artifact=calibrated.science_psf,
-        ngs_metric_artifact=None,
+        science_psf_file=calibrated.science_psf,
+        ngs_metric_file=None,
         output=_resolved_path(hybrid, "output", source=source, must_exist=False),
         source=source,
         e2e_configuration=source,
@@ -210,7 +229,7 @@ def _resolved_path(
     path = path.resolve()
     if must_exist and not path.is_file():
         raise FileNotFoundError(
-            f"Hybrid AO PSF artifact not found for hybrid.{option}: {path}"
+            f"Hybrid AO PSF file not found for hybrid.{option}: {path}"
         )
     return path
 

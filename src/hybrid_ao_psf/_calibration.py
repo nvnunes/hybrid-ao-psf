@@ -578,7 +578,7 @@ class E2ECalibration(ABC):
         import numpy as np
 
         from ._calibration_contracts import _angle, _quantity
-        from .interpolation import load_science_ho_psf_interpolator
+        from .interpolation import load_psf_interpolator
 
         zenith_angle = _angle(zenith_angle, dtype=self.configuration.dtype)
         positions = _quantity(
@@ -598,9 +598,9 @@ class E2ECalibration(ABC):
             raise ValueError("wavelength must be positive")
         settings = self.configuration.sensing
         seeds = iter([settings.seed] * len(magnitudes) if seeds is None else seeds)
-        provider = load_science_ho_psf_interpolator(
-            self.configuration.ngs_psf
-        ).prepare(dtype=self.configuration.dtype)
+        provider = load_psf_interpolator(
+            self.configuration.ngs_psf, dtype=self.configuration.dtype
+        )
         photometry = self.photometry(zenith_angle)
         previous = None
         prediction = None
@@ -609,7 +609,7 @@ class E2ECalibration(ABC):
             if seed is None:
                 raise ValueError("one effective seed is required per sensing point")
             if previous is None or not np.array_equal(position.value, previous):
-                prediction = provider.predict(
+                prediction = provider.evaluate(
                     zenith_angle=zenith_angle,
                     wavelength=wavelength,
                     x=position[0:1],

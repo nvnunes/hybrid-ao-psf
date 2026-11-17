@@ -46,7 +46,7 @@ Serve the documentation locally with:
 
 Use [Testing](testing.md) for canonical verification. Consult
 [Architecture](architecture.md) before changing public contracts, scientific
-ownership, artifact schemas, or result persistence.
+ownership, file schemas, or result persistence.
 
 ## Git Hook
 

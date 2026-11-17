@@ -17,11 +17,11 @@ from .contracts import (
     HybridResult,
     LowOrderDistribution,
     LowOrderModel,
-    NgsHoMetricPrediction,
+    PsfMetricPrediction,
 )
 
 RESULT_SCHEMA = "hybrid-ao-psf-result"
-RESULT_SCHEMA_VERSION = 3
+RESULT_SCHEMA_VERSION = 4
 
 
 def save_result(
@@ -30,7 +30,20 @@ def save_result(
     *,
     overwrite: bool = False,
 ) -> Path:
-    """Write one result using the current Hybrid AO PSF HDF5 schema."""
+    """Atomically save one standalone result using the current HDF5 schema.
+
+    Args:
+        path: Destination path. Create its parent directories if needed.
+        result: Validated simulation result.
+        overwrite: Whether an existing result file may be replaced.
+
+    Returns:
+        The absolute path of the saved result.
+
+    Raises:
+        FileExistsError: If the destination exists and overwrite is false.
+        TypeError: If result is not a HybridResult.
+    """
     if not isinstance(result, HybridResult):
         raise TypeError("result must be a HybridResult.")
     output = Path(path).expanduser().resolve()
@@ -52,9 +65,6 @@ def _write_result(output: Path, result: HybridResult) -> None:
         result_group = root.create_group("result")
         result_group.create_dataset("psfs", data=result.psfs)
         _write_metadata(result_group.create_group("metadata"), result.metadata)
-        _write_quantity_mapping(
-            result_group.create_group("source_metadata"), result.source_metadata
-        )
         metrics = result_group.create_group("ngs_metrics")
         _write_quantity(metrics, "ee", result.ngs_metrics.ee)
         _write_quantity(metrics, "fwhm", result.ngs_metrics.fwhm)
@@ -154,14 +164,23 @@ def _write_result(output: Path, result: HybridResult) -> None:
 
 
 def load_result(path: str | Path) -> HybridResult:
-    """Load self-contained version-3 results or MASTSEL versions 1 and 2.
+    """Load a self-contained result from a Hybrid HDF5 file.
 
-    Version 3 requires explicit model identity, applied distribution and matching
-    model-specific fields. No provider/native files are opened. Fitted E2E
-    numerical state is validated by its scientific owner. Versions 1 and 2 are
-    MASTSEL-only; unlabelled/mixed results retain each stored array precision
-    with dtype=None. Uniform declarations must match all floating datasets.
-    Unsupported schemas, precision, shapes or covariance relationships raise.
+    Versions 3 and 4 store the selected model, covariance and applied distribution.
+    Versions 1 and 2 are interpreted as MASTSEL results. Files with legacy
+    mixed precision retain their stored array dtypes and use ``dtype=None``.
+    The file contains the numerical state needed to load the result.
+
+    Args:
+        path: Path to a standalone result.
+
+    Returns:
+        A validated immutable result with the stored arrays and quantities.
+
+    Raises:
+        FileNotFoundError: If the result path is missing.
+        KeyError: If required result fields are missing.
+        ValueError: If the schema, precision or scientific fields are invalid.
     """
     source = Path(path).expanduser().resolve()
     if not source.is_file():
@@ -169,7 +188,7 @@ def load_result(path: str | Path) -> HybridResult:
     with h5py.File(source, "r") as root:
         schema = _text(root.attrs.get("schema", ""))
         version = int(root.attrs.get("schema_version", -1))
-        if schema != RESULT_SCHEMA or version not in (1, 2, RESULT_SCHEMA_VERSION):
+        if schema != RESULT_SCHEMA or version not in (1, 2, 3, RESULT_SCHEMA_VERSION):
             raise ValueError(
                 "Unsupported Hybrid AO PSF result schema: "
                 f"schema={schema!r}, version={version}."
@@ -231,7 +250,7 @@ def load_result(path: str | Path) -> HybridResult:
         }
         if version >= 3:
             if "lo_model" not in root.attrs:
-                raise ValueError("version-3 result requires explicit lo_model")
+                raise ValueError(f"version-{version} result requires explicit lo_model")
             lo_model = LowOrderModel(_text(root.attrs["lo_model"]))
             distribution_group = result_group["lo_distribution"]
             distribution = LowOrderDistribution(
@@ -242,7 +261,7 @@ def load_result(path: str | Path) -> HybridResult:
         else:
             lo_model = LowOrderModel.MASTSEL
             distribution = None
-        metric_values = NgsHoMetricPrediction(
+        metric_values = PsfMetricPrediction(
             dtype=dtype,
             ee=_read_quantity(metrics["ee"]),
             fwhm=_read_quantity(metrics["fwhm"]),
@@ -273,7 +292,6 @@ def load_result(path: str | Path) -> HybridResult:
             dtype=dtype,
             psfs=result_group["psfs"][...],
             metadata=metadata,
-            source_metadata=_read_quantity_mapping(result_group["source_metadata"]),
             ngs_metrics=metric_values,
             ctot_wavefront=_read_quantity(ctot["wavefront"])
             if "wavefront" in ctot
@@ -338,17 +356,6 @@ def _write_quantity(
 def _read_quantity(dataset: h5py.Dataset) -> u.Quantity:
     unit = u.Unit(_text(dataset.attrs["unit"]))
     return np.asarray(dataset[()]) * unit
-
-
-def _write_quantity_mapping(
-    group: h5py.Group, values: dict[str, u.Quantity] | object
-) -> None:
-    for name, value in values.items():
-        _write_quantity(group, str(name), value)
-
-
-def _read_quantity_mapping(group: h5py.Group) -> dict[str, u.Quantity]:
-    return {str(name): _read_quantity(dataset) for name, dataset in group.items()}
 
 
 def _text(value: object) -> str:

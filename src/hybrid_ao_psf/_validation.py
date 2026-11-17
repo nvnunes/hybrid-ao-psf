@@ -2,35 +2,8 @@
 
 from __future__ import annotations
 
-import re
-from typing import Any
-
 import numpy as np
 from numpy.typing import DTypeLike
-
-_DIRECT_FIELD_NAME_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
-_PSF_METADATA_NAMES = frozenset(
-    {"wavelength", "pixel_scale", "tel_diameter", "tel_pupil"}
-)
-
-
-def validate_meta_field_name(name: Any, *, label: str = "meta field") -> str:
-    """Return one valid provider-owned scalar PSF metadata field name."""
-    if not isinstance(name, str):
-        raise TypeError(f"{label} names must be strings.")
-    normalized = name.strip()
-    if not normalized:
-        raise ValueError(f"{label} names must be non-empty.")
-    if "/" in normalized or not _DIRECT_FIELD_NAME_RE.match(normalized):
-        raise ValueError(
-            f"{label} name {normalized!r} must start with a letter or underscore "
-            "and contain only letters, digits, and underscores."
-        )
-    if normalized in _PSF_METADATA_NAMES:
-        raise ValueError(
-            f"{label} name {normalized!r} collides with a core /meta field."
-        )
-    return normalized
 
 
 def validate_psf_dtype(dtype: DTypeLike) -> np.dtype:
@@ -46,7 +19,7 @@ def validate_psf_dtype(dtype: DTypeLike) -> np.dtype:
     return dtype
 
 
-def support_dtype(*precisions):
+def coarsest_precision(*precisions):
     """Coarsest coordinate rounding retained through preparation and loading."""
     return min(
         (validate_psf_dtype(value) for value in precisions if value is not None),
@@ -54,9 +27,9 @@ def support_dtype(*precisions):
     )
 
 
-def coordinate_support_dtype(dtype, *coordinates):
+def coordinate_precision(dtype, *coordinates):
     """Retain float32 source-axis rounding; integer coordinates remain exact."""
-    return support_dtype(
+    return coarsest_precision(
         dtype,
         *(
             np.dtype("float32")
@@ -66,16 +39,16 @@ def coordinate_support_dtype(dtype, *coordinates):
     )
 
 
-def clip_support(value, axis, *, dtype, label):
-    """Snap representational endpoint roundoff, rejecting extrapolation."""
+def snap_coordinate_range(value, axis, *, dtype, label):
+    """Snap coordinate roundoff to axis sample points, rejecting extrapolation."""
     axis = np.asarray(axis)
     epsilon = 2 * np.finfo(dtype).eps
     lower = epsilon * max(1.0, abs(float(axis[0])))
     upper = epsilon * max(1.0, abs(float(axis[-1])))
     if np.any(value < axis[0] - lower) or np.any(value > axis[-1] + upper):
-        raise ValueError(f"query outside calibrated {label} support")
+        raise ValueError(f"requested {label} coordinates are outside the calibrated range")
     result = np.clip(value, axis[0], axis[-1])
     nearest = np.argmin(np.abs(np.asarray(result)[..., None] - axis), axis=-1)
-    # Node roundoff scales locally, including axes spanning orders of magnitude.
+    # Sample-point roundoff scales locally, including axes spanning orders of magnitude.
     tolerance = epsilon * np.maximum(1.0, np.abs(axis[nearest]))
     return np.where(np.abs(result - axis[nearest]) <= tolerance, axis[nearest], result)
