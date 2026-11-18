@@ -2,20 +2,28 @@
 
 from __future__ import annotations
 
-import ast
-from configparser import ConfigParser, SectionProxy
+from configparser import ConfigParser
 from dataclasses import dataclass
 from io import StringIO
 from pathlib import Path
 
-import numpy as np
+from ao_models import (
+    parse_ini,
+    polar_to_cartesian,
+    read_ini,
+    read_ini_array,
+    read_ini_scalar,
+    resolve_ini_path,
+)
 from astropy import units as u
 from numpy.typing import DTypeLike
 
-from ._calibration_config import load_e2e_calibration_configuration
+from ._calibration_config import _read_e2e_calibration_configuration
 from .contracts import DiagnosticsLevel, HybridRequest, LowOrderModel, NonPsdPolicy
 
 HYBRID_SECTION = "hybrid"
+
+type _IniSections = tuple[tuple[str, tuple[tuple[str, str], ...]], ...]
 
 
 @dataclass(frozen=True)
@@ -66,10 +74,7 @@ def load_configuration(
     source = Path(path).expanduser().resolve()
     if not source.is_file():
         raise FileNotFoundError(f"Hybrid AO PSF configuration not found: {source}")
-    parser = ConfigParser(interpolation=None)
-    parser.optionxform = str
-    with source.open(encoding="utf-8") as stream:
-        parser.read_file(stream)
+    source, parser = read_ini(source)
     if not parser.has_section(HYBRID_SECTION):
         raise ValueError("Configuration requires [hybrid].")
     model = LowOrderModel(
@@ -99,31 +104,40 @@ def load_configuration(
             "hybrid.pixel_scale_mas is not supported; the science PSF file "
             "owns the pixel scale."
         )
-    science_r = _array(
+    science_r = read_ini_array(
         parser["sources_science"], "Zenith", label="sources_science.Zenith"
     )
-    science_theta = _array(
+    science_theta = read_ini_array(
         parser["sources_science"], "Azimuth", label="sources_science.Azimuth"
     )
-    science_x, science_y = _polar_to_cartesian(science_r, science_theta)
-    ngs_r = _array(parser["sources_LO"], "Zenith", label="sources_LO.Zenith")
-    ngs_theta = _array(parser["sources_LO"], "Azimuth", label="sources_LO.Azimuth")
-    ngs_x, ngs_y = _polar_to_cartesian(ngs_r, ngs_theta)
+    science_x, science_y = polar_to_cartesian(science_r, science_theta)
+    ngs_r = read_ini_array(parser["sources_LO"], "Zenith", label="sources_LO.Zenith")
+    ngs_theta = read_ini_array(
+        parser["sources_LO"], "Azimuth", label="sources_LO.Azimuth"
+    )
+    ngs_x, ngs_y = polar_to_cartesian(ngs_r, ngs_theta)
 
-    wavelength_values = _array(
+    wavelength_values = read_ini_array(
         parser["sources_science"],
         "Wavelength",
         label="sources_science.Wavelength",
     )
     if wavelength_values.size != 1:
         raise ValueError("sources_science.Wavelength must contain exactly one value.")
-    ngs_flux = _array(
+    ngs_flux = read_ini_array(
         hybrid, "ngs_flux_photon_per_s", label="hybrid.ngs_flux_photon_per_s"
     )
     if ngs_flux.shape != ngs_r.shape:
         raise ValueError(
             "hybrid.ngs_flux_photon_per_s must match sources_LO coordinates."
         )
+    mastsel_sections = tuple(
+        (section, tuple(parser.items(section, raw=True)))
+        for section in parser.sections()
+        if section.casefold() != HYBRID_SECTION
+    )
+    stream = StringIO()
+    _mastsel_parser(mastsel_sections).write(stream)
     request = HybridRequest(
         dtype=hybrid.get("precision", "float32") if dtype is None else dtype,
         science_x=science_x * u.arcsec,
@@ -132,14 +146,16 @@ def load_configuration(
         ngs_y=ngs_y * u.arcsec,
         ngs_flux=ngs_flux * (u.photon / u.s),
         wavelength=float(wavelength_values[0]) * u.m,
-        zenith_angle=_scalar(
+        zenith_angle=read_ini_scalar(
             parser["telescope"], "ZenithAngle", label="telescope.ZenithAngle"
         )
         * u.deg,
-        mastsel_ini=_mastsel_ini(parser),
+        mastsel_ini=stream.getvalue(),
         non_psd_policy=hybrid.get("non_psd_policy", NonPsdPolicy.ERROR.value),
         diagnostics_level=hybrid.get("diagnostics_level", DiagnosticsLevel.NONE.value),
     )
+    # Keep the immutable options outside the public dataclass fields.
+    object.__setattr__(request, "_mastsel_sections", mastsel_sections)
     return HybridConfiguration(
         request=request,
         science_psf_file=_resolved_path(
@@ -178,21 +194,31 @@ def _load_calibrated_configuration(parser, source, dtype):
         raise ValueError(
             f"unsupported E2E [hybrid] keys: {sorted(unknown)}; precision belongs in [e2e]"
         )
-    calibrated = load_e2e_calibration_configuration(source)
+    calibrated = _read_e2e_calibration_configuration(parser, source)
     request = HybridRequest(
         lo_model=LowOrderModel.E2E_CALIBRATED,
         dtype=calibrated.dtype if dtype is None else dtype,
-        science_x=_array(hybrid, "science_x_arcsec", label="hybrid.science_x_arcsec")
+        science_x=read_ini_array(
+            hybrid, "science_x_arcsec", label="hybrid.science_x_arcsec"
+        )
         * u.arcsec,
-        science_y=_array(hybrid, "science_y_arcsec", label="hybrid.science_y_arcsec")
+        science_y=read_ini_array(
+            hybrid, "science_y_arcsec", label="hybrid.science_y_arcsec"
+        )
         * u.arcsec,
-        ngs_x=_array(hybrid, "ngs_x_arcsec", label="hybrid.ngs_x_arcsec") * u.arcsec,
-        ngs_y=_array(hybrid, "ngs_y_arcsec", label="hybrid.ngs_y_arcsec") * u.arcsec,
-        ngs_magnitude=_array(hybrid, "ngs_magnitude", label="hybrid.ngs_magnitude")
+        ngs_x=read_ini_array(hybrid, "ngs_x_arcsec", label="hybrid.ngs_x_arcsec")
+        * u.arcsec,
+        ngs_y=read_ini_array(hybrid, "ngs_y_arcsec", label="hybrid.ngs_y_arcsec")
+        * u.arcsec,
+        ngs_magnitude=read_ini_array(
+            hybrid, "ngs_magnitude", label="hybrid.ngs_magnitude"
+        )
         * u.mag,
-        wavelength=_scalar(hybrid, "wavelength_um", label="hybrid.wavelength_um")
+        wavelength=read_ini_scalar(
+            hybrid, "wavelength_um", label="hybrid.wavelength_um"
+        )
         * u.um,
-        zenith_angle=_scalar(
+        zenith_angle=read_ini_scalar(
             hybrid, "zenith_angle_deg", label="hybrid.zenith_angle_deg"
         )
         * u.deg,
@@ -200,9 +226,7 @@ def _load_calibrated_configuration(parser, source, dtype):
         non_psd_policy=hybrid.get("non_psd_policy", NonPsdPolicy.ERROR.value),
     )
     if not calibrated.science_psf.is_file():
-        raise FileNotFoundError(
-            f"science PSF file not found: {calibrated.science_psf}"
-        )
+        raise FileNotFoundError(f"science PSF file not found: {calibrated.science_psf}")
     return HybridConfiguration(
         request=request,
         science_psf_file=calibrated.science_psf,
@@ -213,80 +237,19 @@ def _load_calibrated_configuration(parser, source, dtype):
     )
 
 
-def _resolved_path(
-    section: SectionProxy,
-    option: str,
-    *,
-    source: Path,
-    must_exist: bool = True,
-) -> Path:
-    raw = section.get(option, "").strip()
-    if not raw:
-        raise ValueError(f"hybrid.{option} must not be empty.")
-    path = Path(raw).expanduser()
-    if not path.is_absolute():
-        path = source.parent / path
-    path = path.resolve()
-    if must_exist and not path.is_file():
-        raise FileNotFoundError(
-            f"Hybrid AO PSF file not found for hybrid.{option}: {path}"
-        )
-    return path
+def _resolved_path(section, option, *, source, must_exist=True) -> Path:
+    return resolve_ini_path(
+        section.get(option, ""),
+        source=source,
+        label=f"hybrid.{option}",
+        must_exist=must_exist,
+    )
 
 
-def _array(section: SectionProxy, option: str, *, label: str) -> np.ndarray:
-    if option not in section:
-        raise ValueError(f"Configuration requires {label}.")
-    raw = section.get(option, "")
-    try:
-        parsed = ast.literal_eval(raw)
-    except (SyntaxError, ValueError) as exc:
-        raise ValueError(f"{label} must be a numeric scalar or list.") from exc
-    values = np.asarray(parsed, dtype=float)
-    if values.ndim == 0:
-        values = values.reshape(1)
-    if values.ndim != 1 or values.size == 0:
-        raise ValueError(f"{label} must be a non-empty one-dimensional list.")
-    if not np.all(np.isfinite(values)):
-        raise ValueError(f"{label} must contain only finite values.")
-    return values
-
-
-def _scalar(section: SectionProxy, option: str, *, label: str) -> float:
-    if option not in section:
-        raise ValueError(f"Configuration requires {label}.")
-    try:
-        value = float(section[option])
-    except ValueError as exc:
-        raise ValueError(f"{label} must be a finite scalar.") from exc
-    if not np.isfinite(value):
-        raise ValueError(f"{label} must be a finite scalar.")
-    return value
-
-
-def _polar_to_cartesian(
-    r: np.ndarray, theta: np.ndarray
-) -> tuple[np.ndarray, np.ndarray]:
-    if r.shape != theta.shape:
-        raise ValueError(
-            "Polar coordinate radius and azimuth vectors must have identical shapes."
-        )
-    radians = np.deg2rad(theta)
-    return r * np.cos(radians), r * np.sin(radians)
-
-
-def _mastsel_ini(parser: ConfigParser) -> str:
-    mastsel = ConfigParser(interpolation=None)
-    mastsel.optionxform = str
-    for section in parser.sections():
-        if section.casefold() == HYBRID_SECTION:
-            continue
-        mastsel.add_section(section)
-        for option, value in parser.items(section, raw=True):
-            mastsel.set(section, option, value)
-    stream = StringIO()
-    mastsel.write(stream)
-    return stream.getvalue()
+def _mastsel_parser(sections: _IniSections) -> ConfigParser:
+    mastsel = parse_ini("")
+    mastsel.read_dict({section: dict(options) for section, options in sections})
+    return mastsel
 
 
 __all__ = ["HYBRID_SECTION", "HybridConfiguration", "load_configuration"]

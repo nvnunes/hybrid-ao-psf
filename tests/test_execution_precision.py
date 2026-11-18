@@ -9,7 +9,6 @@ from ao_stats import compute_psf_fwhm
 
 from hybrid_ao_psf import (
     PsfPrediction,
-    _mastsel,
     load_result,
     save_result,
     simulate,
@@ -21,7 +20,7 @@ from .test_engine import _providers, _request, _ScienceProvider
 
 @pytest.mark.parametrize("dtype", [np.float32, np.float64])
 def test_complete_blur_statistics_and_result_keep_selected_values(
-    monkeypatch, tmp_path, dtype
+    stub_mastsel, tmp_path, dtype
 ):
     class Mavis:
         error = False
@@ -33,7 +32,7 @@ def test_complete_blur_statistics_and_result_keep_selected_values(
         def computeTotalResidualMatrix(self, *args, **kwargs):
             return np.broadcast_to([[32.0, 4.0], [4.0, 20.0]], (2, 2, 2)).copy()
 
-    monkeypatch.setattr(_mastsel, "_load_mavis_lo", lambda: Mavis)
+    stub_mastsel(Mavis)
     old, ngs = _providers()
     y, x = np.mgrid[-4:5, -4:5]
     source = np.broadcast_to(np.exp(-(x * x + y * y) / 5.0), (2, 9, 9)).copy()

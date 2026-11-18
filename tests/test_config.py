@@ -1,10 +1,11 @@
+from dataclasses import asdict, replace
 from pathlib import Path
 
 import numpy as np
 import pytest
 from astropy import units as u
 
-from hybrid_ao_psf import DiagnosticsLevel, NonPsdPolicy, load_configuration
+from hybrid_ao_psf import DiagnosticsLevel, NonPsdPolicy, engine, load_configuration
 
 
 def _write_config(
@@ -46,7 +47,9 @@ diagnostics_level = debug
     )
 
 
-def test_load_configuration_resolves_paths_and_cartesian_coordinates(tmp_path: Path) -> None:
+def test_load_configuration_resolves_paths_and_cartesian_coordinates(
+    tmp_path: Path,
+) -> None:
     path = tmp_path / "case" / "simulation.ini"
     path.parent.mkdir()
     _write_config(path)
@@ -106,3 +109,32 @@ def test_conflicting_previous_interpolator_path_is_rejected(tmp_path: Path) -> N
     _write_config(path, hybrid_extra="science_psf_artifact = other.pkl")
     with pytest.raises(ValueError, match="Conflicting hybrid.science_psf_file"):
         load_configuration(path)
+
+
+def test_loaded_request_reuses_ini_and_isolates_each_run(tmp_path, monkeypatch):
+    path = tmp_path / "simulation.ini"
+    _write_config(path)
+    configuration = load_configuration(path)
+    assert all(not key.startswith("_") for key in asdict(configuration.request))
+    parse = engine.parse_ini
+    parsed = []
+
+    def record_parse(text):
+        parsed.append(text)
+        return parse(text)
+
+    monkeypatch.setattr(engine, "parse_ini", record_parse)
+    first, _, _ = engine._resolve_effective_mastsel(configuration.request)
+    first["RTC"]["SensorFrameRate_LO"] = "100"
+    second, rates, _ = engine._resolve_effective_mastsel(configuration.request)
+    assert not parsed
+    assert second["RTC"]["SensorFrameRate_LO"] == "500.0"
+    np.testing.assert_array_equal(rates.to_value(u.Hz), [500, 500])
+
+    override = configuration.request.mastsel_ini.replace(
+        "SensorFrameRate_LO = 500.0", "SensorFrameRate_LO = 200"
+    )
+    edited = replace(configuration.request, mastsel_ini=override)
+    _, rates, _ = engine._resolve_effective_mastsel(edited)
+    np.testing.assert_array_equal(rates.to_value(u.Hz), [200, 200])
+    assert parsed == [override]

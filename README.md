@@ -7,7 +7,7 @@ from an INI file or use the typed Python API from a larger orchestration system.
 
 The project owns Hybrid-specific interpolation products, both low-order models,
 scientific execution, engine diagnostics, and standalone results. It depends
-on [AO Stats](https://github.com/nvnunes/ao-stats) for neutral PSF metadata and
+on AO Models for shared configuration, [AO Stats](https://github.com/nvnunes/ao-stats) for neutral PSF metadata and
 measurements, and [NGS Photometry](https://github.com/nvnunes/ngs-photometry)
 for magnitude-to-effective-flux conversion.
 
@@ -20,14 +20,16 @@ regression suite on the minimum and current selected MASTSEL releases.
 
 ## Installation
 
-From a source checkout, install AO Stats and NGS Photometry from their public
-repositories, then install Hybrid AO PSF:
+Install AO Stats and NGS Photometry from their public repositories. The
+commands below use the compatible sibling AO Models checkout described in
+[AO Models setup](docs/development.md#ao-models).
 
 ```bash
 python -m pip install \
   'ao-stats @ git+https://github.com/nvnunes/ao-stats.git@main'
 python -m pip install \
   'ngs-photometry @ git+https://github.com/nvnunes/ngs-photometry.git'
+python -m pip install ../ao-models
 python -m pip install .
 ```
 

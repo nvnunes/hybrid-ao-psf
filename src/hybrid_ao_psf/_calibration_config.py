@@ -9,6 +9,7 @@ from dataclasses import dataclass, field, fields, replace
 from pathlib import Path
 
 import numpy as np
+from ao_models import read_ini, resolve_ini_path
 from astropy import units as u
 from numpy.typing import DTypeLike
 
@@ -300,11 +301,14 @@ def load_e2e_calibration_configuration(path: str | Path) -> E2ECalibrationConfig
         FileNotFoundError: If the INI is missing.
         ValueError: If required keys are missing or owned settings are invalid.
     """
-    source = Path(path).expanduser().resolve()
-    parser = ConfigParser(interpolation=None)
-    parser.optionxform = str
-    with source.open(encoding="utf-8") as stream:
-        parser.read_file(stream)
+    source, parser = read_ini(path)
+    return _read_e2e_calibration_configuration(parser, source)
+
+
+def _read_e2e_calibration_configuration(
+    parser: ConfigParser, source: Path
+) -> E2ECalibrationConfiguration:
+    """Read calibration values and resolve paths from an already parsed INI."""
     unknown_sections = {
         section for section in parser.sections() if section.startswith("calibration.")
     } - {f"calibration.{name}" for name in _SETTINGS}
@@ -318,12 +322,8 @@ def load_e2e_calibration_configuration(path: str | Path) -> E2ECalibrationConfig
         raise ValueError(f"[e2e] requires exactly {', '.join(_MODEL_KEYS)}")
     values = {"dtype": validate_psf_dtype(parser["e2e"].get("precision", "float32"))}
     for key in _MODEL_KEYS:
-        raw = parser["e2e"][key].strip()
-        if not raw:
-            raise ValueError(f"[e2e] {key} must not be empty")
-        p = Path(raw).expanduser()
-        values[key] = (
-            (source.parent / p).resolve() if not p.is_absolute() else p.resolve()
+        values[key] = resolve_ini_path(
+            parser["e2e"][key], source=source, label=f"[e2e] {key}", must_exist=False
         )
     for family, cls in _SETTINGS.items():
         section = f"calibration.{family}"

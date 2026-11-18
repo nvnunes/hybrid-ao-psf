@@ -8,6 +8,7 @@ from pathlib import Path
 
 import numpy as np
 import pytest
+from ao_models import parse_ini
 from astropy import units as u
 from ngs_photometry import WFSPhotometryConfig, photons_per_frame_to_magnitudes
 
@@ -181,7 +182,7 @@ def test_real_mastsel_engine_matches_retained_hybrid_golden(tmp_path: Path) -> N
 
 @pytest.mark.slow_mastsel
 @pytest.mark.parametrize("count", [1, 2, 3])
-def test_capture_noise_matches_native_fixed_gain_expression(tmp_path, count):
+def test_capture_noise_matches_native_fixed_gain_expression(count):
     """Compare recovered noise with native zero-atmosphere expressions per NGS."""
     ngs_x, ngs_y = _ngs_cartesian()
     rates = np.array([500, 450, 400])[:count] * u.Hz
@@ -201,41 +202,46 @@ def test_capture_noise_matches_native_fixed_gain_expression(tmp_path, count):
         np.array([76, 80, 84])[:count] * u.mas,
         np.full(count, 0.24) * u.one,
     )
-    context = _mastsel._prepare_mastsel_context(
-        str(tmp_path), request, metrics, request.mastsel_ini, rates, flux
-    )
-    model = context.mastsel
-    native = model.computeNoiseResidual
-    expected = []
+    with _mastsel._prepare_mastsel_context(
+        request,
+        metrics,
+        parse_ini(request.mastsel_ini),
+        request.mastsel_ini,
+        rates,
+        flux,
+    ) as context:
+        model = context.mastsel
+        native = model.computeNoiseResidual
+        expected = []
 
-    def record_native(fmin, fmax, samples, variance, bias):
-        result = native(fmin, fmax, samples, variance, bias)
-        f = np.linspace(fmin, fmax, samples)
-        gain = bias * model.LoopGain_LO
-        expected.extend(
-            (
-                float(abs(np.sum(model.fTipS_lambda1(gain, f, np.zeros(samples))))),
-                float(abs(np.sum(model.fTiltS_lambda1(gain, f, np.zeros(samples))))),
+        def record_native(fmin, fmax, samples, variance, bias):
+            result = native(fmin, fmax, samples, variance, bias)
+            f = np.linspace(fmin, fmax, samples)
+            gain = bias * model.LoopGain_LO
+            expected.extend(
+                (
+                    float(abs(np.sum(model.fTipS_lambda1(gain, f, np.zeros(samples))))),
+                    float(abs(np.sum(model.fTiltS_lambda1(gain, f, np.zeros(samples))))),
+                )
             )
-        )
-        return result
+            return result
 
-    model.computeNoiseResidual = record_native
-    baseline = _mastsel._compute_mastsel_ctot(context)
-    expected.clear()
-    with _mastsel._capture_mastsel(context) as captured:
-        repeated = _mastsel._compute_mastsel_ctot(context)
-    completed = _mastsel._complete_mastsel_context(context, captured)
-    np.testing.assert_array_equal(repeated, baseline)
-    np.testing.assert_allclose(
-        np.diag(completed.mastsel_statistics.measurement_noise.value),
-        expected,
-        rtol=2e-13,
-        atol=1e-13,
-    )
-    assert completed.mastsel is model
-    assert "computeCovMatrices" not in model.__dict__
-    assert "buildReconstuctor2" not in model.__dict__
+        model.computeNoiseResidual = record_native
+        baseline = _mastsel._compute_mastsel_ctot(context)
+        expected.clear()
+        with _mastsel._capture_mastsel(context) as captured:
+            repeated = _mastsel._compute_mastsel_ctot(context)
+        completed = _mastsel._complete_mastsel_context(context, captured)
+        np.testing.assert_array_equal(repeated, baseline)
+        np.testing.assert_allclose(
+            np.diag(completed.mastsel_statistics.measurement_noise.value),
+            expected,
+            rtol=2e-13,
+            atol=1e-13,
+        )
+        assert completed.mastsel is model
+        assert "computeCovMatrices" not in model.__dict__
+        assert "buildReconstuctor2" not in model.__dict__
 
 
 def _reference_ini() -> str:

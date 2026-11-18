@@ -8,12 +8,12 @@ The public entry points follow the execution and numerical helpers.
 from __future__ import annotations
 
 import json
-import tempfile
 from configparser import ConfigParser
 from dataclasses import replace
 from io import StringIO
 
 import numpy as np
+from ao_models import parse_ini
 from astropy import units as u
 from ngs_photometry import (
     WFSPhotometryConfig,
@@ -31,6 +31,7 @@ from ._mastsel import (
 )
 from ._units import quantity_value
 from ._validation import validate_psf_dtype
+from .config import _mastsel_parser
 from .contracts import (
     CTOT_PSD_TOLERANCE_NM2,
     DiagnosticsLevel,
@@ -153,9 +154,18 @@ def _simulate_mastsel(
 
     science = replace(science, dtype=request.dtype)
     metrics = replace(metrics, dtype=request.dtype)
-    effective_ini, ngs_frame_rate, ngs_flux = _resolve_effective_mastsel(request)
+    parser, ngs_frame_rate, ngs_flux = _resolve_effective_mastsel(request)
+    stream = StringIO()
+    parser.write(stream)
+    effective_ini = stream.getvalue()
     ctot_raw, angle_to_wavefront_scale = _predict_mastsel_ctot(
-        request, metrics, effective_ini, ngs_frame_rate, ngs_flux, ctot_correction
+        request,
+        metrics,
+        parser,
+        effective_ini,
+        ngs_frame_rate,
+        ngs_flux,
+        ctot_correction,
     )
     ctot_wavefront, psd_clipped = condition_ctot(
         ctot_raw,
@@ -213,16 +223,16 @@ def _simulate_mastsel(
 def _predict_mastsel_ctot(
     request: HybridRequest,
     metrics: PsfMetricPrediction,
+    parser: ConfigParser,
     effective_ini: str,
     ngs_frame_rate: u.Quantity,
     ngs_flux: u.Quantity,
     ctot_correction: HybridCtotCorrection | None,
 ) -> tuple[u.Quantity, u.Quantity]:
     """Use the live runtime for covariance prediction and the optional callback."""
-    with tempfile.TemporaryDirectory(prefix="hybrid_ao_psf_") as temporary:
-        context = _prepare_mastsel_context(
-            temporary, request, metrics, effective_ini, ngs_frame_rate, ngs_flux
-        )
+    with _prepare_mastsel_context(
+        request, metrics, parser, effective_ini, ngs_frame_rate, ngs_flux
+    ) as context:
         if ctot_correction is None:
             ctot_raw = _compute_mastsel_ctot(context)
         else:
@@ -443,11 +453,12 @@ def condition_ctot(
 
 def _resolve_effective_mastsel(
     request: HybridRequest,
-) -> tuple[str, u.Quantity, u.Quantity]:
-    """Resolve the effective MASTSEL INI, frame rates, and effective flux."""
-    parser = ConfigParser(interpolation=None)
-    parser.optionxform = str
-    parser.read_string(request.mastsel_ini)
+) -> tuple[ConfigParser, u.Quantity, u.Quantity]:
+    """Resolve the effective MASTSEL options, frame rates, and effective flux."""
+    sections = getattr(request, "_mastsel_sections", None)
+    parser = (
+        parse_ini(request.mastsel_ini) if sections is None else _mastsel_parser(sections)
+    )
     for section in ("telescope", "sources_LO"):
         if not parser.has_section(section):
             raise ValueError(f"MASTSEL configuration requires [{section}].")
@@ -515,9 +526,7 @@ def _resolve_effective_mastsel(
         )
         if np.any(ngs_flux.to_value(u.photon / u.s) <= 0.0):
             raise ValueError("ngs_magnitude resolves to non-positive ngs_flux.")
-    stream = StringIO()
-    parser.write(stream)
-    return stream.getvalue(), ngs_frame_rate, ngs_flux
+    return parser, ngs_frame_rate, ngs_flux
 
 
 def _cartesian_to_polar(x: u.Quantity, y: u.Quantity) -> tuple[u.Quantity, u.Quantity]:

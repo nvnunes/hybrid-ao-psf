@@ -36,6 +36,15 @@ case "$ngs_photometry_source" in
     conda run --prefix "$env_prefix" python -m pip install -e "$ngs_photometry_source"
     ;;
 esac
+ao_models_source="${HYBRID_AO_PSF_AO_MODELS_SOURCE:-../ao-models}"
+case "$ao_models_source" in
+  git+*|http://*|https://*|*.whl)
+    conda run --prefix "$env_prefix" python -m pip install "$ao_models_source"
+    ;;
+  *)
+    conda run --prefix "$env_prefix" python -m pip install -e "$ao_models_source"
+    ;;
+esac
 conda run --prefix "$env_prefix" python -m pip install -e ".[dev,docs]"
 
 echo "[bootstrap] Configuring Git hooks path..."

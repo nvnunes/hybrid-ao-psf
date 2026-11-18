@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+from ast import literal_eval
+from contextlib import nullcontext
 from dataclasses import dataclass, replace
 from pathlib import Path
 
@@ -19,7 +21,6 @@ from hybrid_ao_psf import (
     NonPsdPolicy,
     PsfMetricPrediction,
     PsfPrediction,
-    _mastsel,
     apply_finite_fov_otfs,
     blur_psfs_with_ctot,
     engine,
@@ -108,7 +109,7 @@ def _providers() -> tuple[_ScienceProvider, _NgsProvider]:
 
 
 @pytest.fixture
-def hook_runtime(monkeypatch):
+def hook_runtime(stub_mastsel):
     """A deterministic runtime exposing the same baseline method boundaries."""
     instances = []
 
@@ -122,8 +123,8 @@ def hook_runtime(monkeypatch):
         PixelScale_LO = (270.0, 280.0)
         N_sa_tot_LO = (1, 1)
 
-        def __init__(self, directory, name, **kwargs):
-            self.path = Path(directory) / f"{name}.ini"
+        def __init__(self, *, config_dict, verbose):
+            self.config = config_dict
             self.calls = {"total": 0, "covariance": 0, "reconstructor": 0}
             self.bias = [0.7, 0.8]
             self.avar = [(0.01, 0.02), (0.02, 0.03)]
@@ -146,12 +147,11 @@ def hook_runtime(monkeypatch):
 
         def computeTotalResidualMatrix(self, science, ngs, *args, **kwargs):
             self.calls["total"] += 1
-            assert self.path.exists()
             self.computeCovMatrices(science, ngs)
             self.buildReconstuctor2(science, ngs)
             return np.array([[[100, 20], [20, 400]], [[200, -30], [-30, 500]]])
 
-    monkeypatch.setattr(_mastsel, "_load_mavis_lo", lambda: Runtime)
+    stub_mastsel(Runtime)
     return Runtime, instances
 
 
@@ -164,7 +164,8 @@ def test_noop_preserves_complete_result_and_runtime_lifetime(hook_runtime):
     def noop(ctot, context):
         calls.append(context)
         assert context.mastsel is instances[-1]
-        assert context.mastsel.path.read_text() == context.effective_mastsel_ini
+        assert context.mastsel.config["telescope"]["ZenithAngle"] == 30
+        assert "ZenithAngle = 30" in context.effective_mastsel_ini
         assert not ctot.flags.writeable
         statistics = context.mastsel_statistics
         np.testing.assert_array_equal(
@@ -187,7 +188,40 @@ def test_noop_preserves_complete_result_and_runtime_lifetime(hook_runtime):
         np.testing.assert_array_equal(getattr(actual, name), getattr(baseline, name))
     assert actual.provenance["fit"] == "fit.json"
     assert instances[-1].calls == {"total": 1, "covariance": 1, "reconstructor": 1}
-    assert not instances[-1].path.exists()
+
+
+@pytest.mark.parametrize("fail", [False, True])
+def test_legacy_mastsel_keeps_ini_during_correction_and_cleans_up(
+    hook_runtime, stub_mastsel, fail
+):
+    runtime, instances = hook_runtime
+
+    class FileRuntime(runtime):
+        def __init__(self, directory, name, *, verbose):
+            self.ini_path = Path(directory) / f"{name}.ini"
+            assert self.ini_path.is_file()
+            super().__init__(config_dict=None, verbose=verbose)
+
+    stub_mastsel(FileRuntime, decoder=None)
+    observed_paths = []
+
+    def correct(ctot, context):
+        path = context.mastsel.ini_path
+        assert path.read_text(encoding="utf-8") == context.effective_mastsel_ini
+        observed_paths.append(path)
+        if fail:
+            raise RuntimeError("legacy correction failed")
+
+    expected = pytest.raises(RuntimeError, match="legacy correction failed")
+    with expected if fail else nullcontext():
+        engine.simulate(
+            _request(),
+            *_providers(),
+            ctot_correction=HybridCtotCorrection(correct),
+        )
+
+    assert observed_paths == [instances[0].ini_path]
+    assert not observed_paths[0].parent.exists()
 
 
 def test_doubling_uses_one_effective_covariance_for_blur_and_diagnostics(hook_runtime):
@@ -236,7 +270,6 @@ def test_invalid_correction_rejects_and_cleans_up(hook_runtime, replacement, err
             *_providers(),
             ctot_correction=HybridCtotCorrection(lambda ctot, context: replacement),
         )
-    assert not instances[-1].path.exists()
     assert "computeCovMatrices" not in instances[-1].__dict__
 
 
@@ -277,7 +310,6 @@ def test_failures_restore_instance_bindings_and_configuration(hook_runtime, stag
     model = instances[-1]
     assert model.computeCovMatrices is model.original_covariance
     assert "buildReconstuctor2" not in model.__dict__
-    assert not model.path.exists()
 
 
 @pytest.mark.parametrize("count", [1, 2])
@@ -340,7 +372,7 @@ def test_provenance_collision_and_invalid_hook_fail_before_runtime(hook_runtime)
 
 
 def test_simulate_builds_owned_result_and_passes_resolved_mastsel_inputs(
-    monkeypatch: pytest.MonkeyPatch,
+    stub_mastsel,
 ) -> None:
     calls: dict[str, object] = {}
 
@@ -348,8 +380,8 @@ def test_simulate_builds_owned_result_and_passes_resolved_mastsel_inputs(
         error = False
         mas2nm = 2.0
 
-        def __init__(self, path: str, name: str, *, verbose: bool) -> None:
-            calls["constructor"] = (path, name, verbose)
+        def __init__(self, *, config_dict, verbose: bool) -> None:
+            calls["constructor"] = config_dict
 
         def computeTotalResidualMatrix(
             self, *args: object, **kwargs: object
@@ -358,10 +390,36 @@ def test_simulate_builds_owned_result_and_passes_resolved_mastsel_inputs(
             calls["kwargs"] = kwargs
             return np.stack([400.0 * np.eye(2), 800.0 * np.eye(2)])
 
-    monkeypatch.setattr(_mastsel, "_load_mavis_lo", lambda: FakeMavisLO)
-    science, ngs = _providers()
-    result = engine.simulate(_request(), science, ngs)
+    def decode(raw):
+        if raw == "500 * 1e-9":
+            calls["decoded_expression"] = raw
+            return 500e-9
+        return literal_eval(raw)
 
+    stub_mastsel(FakeMavisLO, decoder=decode)
+    science, ngs = _providers()
+    request = _request()
+    request = replace(
+        request,
+        mastsel_ini=request.mastsel_ini
+        + """
+[atmosphere]
+Reference = 1e-9
+Wavelength = 500 * %(Reference)s
+
+[pass_through]
+Label = 50% transmission
+""",
+    )
+    result = engine.simulate(request, science, ngs)
+
+    config = calls["constructor"]
+    assert config["atmosphere"]["Wavelength"] == pytest.approx(500e-9)
+    assert calls["decoded_expression"] == "500 * 1e-9"
+    assert "Label" in config["pass_through"]
+    config["sources_science"]["Zenith"][0] = 99
+    np.testing.assert_array_equal(config["sources_science"]["Zenith"], [0, 1])
+    np.testing.assert_allclose(config["sources_LO"]["Zenith"], [10, 10])
     args = calls["args"]
     np.testing.assert_allclose(args[0], [[0.0, 0.0], [1.0, 0.0]])
     np.testing.assert_allclose(args[1], [[10.0, 0.0], [-5.0, 5.0 * np.sqrt(3.0)]])
@@ -403,7 +461,7 @@ def test_simulate_builds_owned_result_and_passes_resolved_mastsel_inputs(
 
 
 def test_magnitude_request_resolves_the_same_flux_and_psf_as_direct_flux(
-    monkeypatch: pytest.MonkeyPatch,
+    stub_mastsel,
 ) -> None:
     calls: list[np.ndarray] = []
 
@@ -411,7 +469,7 @@ def test_magnitude_request_resolves_the_same_flux_and_psf_as_direct_flux(
         error = False
         mas2nm = 2.0
 
-        def __init__(self, path: str, name: str, *, verbose: bool) -> None:
+        def __init__(self, *, config_dict, verbose: bool) -> None:
             pass
 
         def computeTotalResidualMatrix(
@@ -420,7 +478,7 @@ def test_magnitude_request_resolves_the_same_flux_and_psf_as_direct_flux(
             calls.append(np.asarray(args[2]))
             return np.stack([400.0 * np.eye(2), 800.0 * np.eye(2)])
 
-    monkeypatch.setattr(_mastsel, "_load_mavis_lo", lambda: FakeMavisLO)
+    stub_mastsel(FakeMavisLO)
     zeropoint = 6_277_173_913.043478 * u.photon / (u.m**2 * u.s)
     magnitudes = np.array([12.0, 15.0]) * u.mag
     photometry = WFSPhotometryConfig(
@@ -462,7 +520,7 @@ def test_magnitude_request_resolves_the_same_flux_and_psf_as_direct_flux(
 
 
 def test_directional_field_pairs_and_covariance_axes_reach_mastsel(
-    monkeypatch: pytest.MonkeyPatch,
+    stub_mastsel,
 ) -> None:
     calls: dict[str, np.ndarray] = {}
     ctot = np.array(
@@ -486,7 +544,7 @@ def test_directional_field_pairs_and_covariance_axes_reach_mastsel(
             calls["ngs"] = np.asarray(ngs)
             return ctot
 
-    monkeypatch.setattr(_mastsel, "_load_mavis_lo", lambda: FakeMavisLO)
+    stub_mastsel(FakeMavisLO)
     request = replace(
         _request(),
         science_x=np.array([12.0, -4.0]) * u.arcsec,
@@ -514,7 +572,7 @@ def test_directional_field_pairs_and_covariance_axes_reach_mastsel(
     np.testing.assert_array_equal(result.psfs, expected)
 
 
-def test_simulate_uses_frame_rate_from_ini(monkeypatch: pytest.MonkeyPatch) -> None:
+def test_simulate_uses_frame_rate_from_ini(stub_mastsel) -> None:
     calls: dict[str, np.ndarray] = {}
 
     class FakeMavisLO:
@@ -528,7 +586,7 @@ def test_simulate_uses_frame_rate_from_ini(monkeypatch: pytest.MonkeyPatch) -> N
             calls["frame_rate"] = np.asarray(args[3], dtype=float)
             return np.stack([400.0 * np.eye(2), 800.0 * np.eye(2)])
 
-    monkeypatch.setattr(_mastsel, "_load_mavis_lo", lambda: FakeMavisLO)
+    stub_mastsel(FakeMavisLO)
     science, ngs = _providers()
     result = engine.simulate(_request(frame_rate="250.0"), science, ngs)
 
@@ -555,7 +613,7 @@ def test_simulate_requires_ini_frame_rate() -> None:
 
 
 def test_validation_diagnostics_omit_pre_blur_psfs(
-    monkeypatch: pytest.MonkeyPatch,
+    stub_mastsel,
 ) -> None:
     class FakeMavisLO:
         error = False
@@ -567,7 +625,7 @@ def test_validation_diagnostics_omit_pre_blur_psfs(
         def computeTotalResidualMatrix(self, *_: object, **__: object) -> np.ndarray:
             return np.stack([400.0 * np.eye(2), 800.0 * np.eye(2)])
 
-    monkeypatch.setattr(_mastsel, "_load_mavis_lo", lambda: FakeMavisLO)
+    stub_mastsel(FakeMavisLO)
     science, ngs = _providers()
 
     result = engine.simulate(
@@ -580,7 +638,7 @@ def test_validation_diagnostics_omit_pre_blur_psfs(
 
 
 def test_none_diagnostics_omits_diagnostics(
-    monkeypatch: pytest.MonkeyPatch,
+    stub_mastsel,
 ) -> None:
     class FakeMavisLO:
         error = False
@@ -592,7 +650,7 @@ def test_none_diagnostics_omits_diagnostics(
         def computeTotalResidualMatrix(self, *_: object, **__: object) -> np.ndarray:
             return np.stack([400.0 * np.eye(2), 800.0 * np.eye(2)])
 
-    monkeypatch.setattr(_mastsel, "_load_mavis_lo", lambda: FakeMavisLO)
+    stub_mastsel(FakeMavisLO)
     science, ngs = _providers()
 
     result = engine.simulate(_request(diagnostics=DiagnosticsLevel.NONE), science, ngs)
@@ -601,7 +659,7 @@ def test_none_diagnostics_omits_diagnostics(
 
 
 def test_rotated_roundoff_ctot_remains_active_after_conditioning(
-    monkeypatch: pytest.MonkeyPatch,
+    stub_mastsel,
 ) -> None:
     angle = 0.01
     rotation = np.array(
@@ -622,7 +680,7 @@ def test_rotated_roundoff_ctot_remains_active_after_conditioning(
         def computeTotalResidualMatrix(self, *_: object, **__: object) -> np.ndarray:
             return np.stack([raw_ctot, raw_ctot])
 
-    monkeypatch.setattr(_mastsel, "_load_mavis_lo", lambda: FakeMavisLO)
+    stub_mastsel(FakeMavisLO)
     science, ngs = _providers()
 
     result = engine.simulate(

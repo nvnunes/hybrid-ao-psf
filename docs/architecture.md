@@ -24,11 +24,11 @@ the latter to WFS-effective rates using MASTSEL geometry and NGS Photometry.
 
 ## Dependencies
 
-The package depends directly on AO Stats for neutral PSF metadata and the
-measurements required by interpolation products, on NGS Photometry for
-magnitude-to-effective-rate conversion, and on a tested released MASTSEL range
-for low-order calculation. It has no dependency
-on an orchestration framework or instrument package.
+The package depends on AO Models for shared INI handling and AO Stats for
+PSF metadata and measurements. NGS Photometry provides magnitude-to-effective-
+rate conversion. The low-order engine supports a tested range of MASTSEL
+releases. It has no dependency on an orchestration framework or instrument
+package.
 
 ## Public API
 
@@ -91,6 +91,9 @@ first `sensor_LO.NumberLenslets` value, converts once before MASTSEL, and
 reports both the effective flux and the supplied magnitudes and zeropoint.
 The MASTSEL INI contains no instrument zeropoint; the standalone command
 supplies resolved flux through its `[hybrid]` section.
+Hybrid passes the effective configuration in memory on MASTSEL releases
+that accept it. Earlier supported releases read the same configuration
+through their file interface. The effective INI is saved in both cases.
 The E2E path receives a prepared `E2ECalibratedModel` with its own metrics,
 photometry and controller settings. It convolves the science PSFs with the full
 calibrated Gaussian mixture; it does not construct MASTSEL or accept its INI,

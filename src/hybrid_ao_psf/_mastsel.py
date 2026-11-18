@@ -1,10 +1,13 @@
 """Private MASTSEL lifetime, baseline capture and fixed-gain noise recovery."""
 
-from collections.abc import Iterator
-from contextlib import contextmanager
+from collections.abc import Callable, Iterator, Mapping
+from configparser import BasicInterpolation, ConfigParser
+from contextlib import ExitStack, contextmanager
 from dataclasses import dataclass, replace
+from inspect import Parameter, signature
 from numbers import Real
 from pathlib import Path
+from tempfile import TemporaryDirectory
 from typing import Any
 
 import numpy as np
@@ -41,33 +44,85 @@ def _load_mavis_lo() -> Any:
     return MavisLO
 
 
+def _load_mastsel_decoder() -> Callable[[str], object] | None:
+    from mastsel import mavisLO
+
+    return getattr(mavisLO, "parse_config_value", None)
+
+
+class _MastselIniSection(Mapping[str, object]):
+    """Decode options on access, as MASTSEL does for a file-backed INI."""
+
+    def __init__(
+        self, parser: ConfigParser, name: str, decode: Callable[[str], object]
+    ):
+        self._parser = parser
+        self._options = parser[name]
+        self._decode = decode
+
+    def __getitem__(self, key: str) -> object:
+        raw = self._options[key]
+        if "%" in raw:
+            raw = BasicInterpolation().before_get(
+                self._parser, self._options.name, key, raw, self._options
+            )
+        return self._decode(raw)
+
+    def __contains__(self, key: object) -> bool:
+        return key in self._options
+
+    def __iter__(self) -> Iterator[str]:
+        return iter(self._options)
+
+    def __len__(self) -> int:
+        return len(self._options)
+
+
+@contextmanager
 def _prepare_mastsel_context(
-    directory: str,
     request: HybridRequest,
     metrics: PsfMetricPrediction,
+    parser: ConfigParser,
     effective_ini: str,
     ngs_frame_rate: u.Quantity,
     ngs_flux: u.Quantity,
-) -> HybridCtotContext:
-    """Construct the one runtime inside the caller-owned temporary directory."""
-    ini_path = Path(directory) / "simulation.ini"
-    ini_path.write_text(effective_ini, encoding="utf-8")
-    mlo = _load_mavis_lo()(str(ini_path.parent), ini_path.stem, verbose=False)
-    if getattr(mlo, "error", False):
-        raise RuntimeError("MASTSEL failed to load the effective Hybrid configuration.")
-    mas2nm = getattr(mlo, "mas2nm", None)
-    if mas2nm is None:
-        raise ValueError("MASTSEL did not expose mas2nm conversion.")
-    return HybridCtotContext(
-        mastsel=mlo,
-        mastsel_statistics=None,
-        angle_to_wavefront_scale=float(mas2nm) * u.nm / u.mas,
-        request=request,
-        ngs_metrics=metrics,
-        ngs_flux=ngs_flux,
-        ngs_frame_rate=ngs_frame_rate,
-        effective_mastsel_ini=effective_ini,
+) -> Iterator[HybridCtotContext]:
+    """Own the native runtime and any compatibility file for one prediction."""
+    mavis_lo = _load_mavis_lo()
+    decode = _load_mastsel_decoder()
+    parameters = signature(mavis_lo).parameters
+    accepts_mapping = "config_dict" in parameters or any(
+        item.kind == Parameter.VAR_KEYWORD for item in parameters.values()
     )
+    with ExitStack() as resources:
+        if decode is None or not accepts_mapping:
+            # Older supported releases expose only a file-based constructor.
+            directory = resources.enter_context(
+                TemporaryDirectory(prefix="hybrid_ao_psf_")
+            )
+            path = Path(directory) / "simulation.ini"
+            path.write_text(effective_ini, encoding="utf-8")
+            mlo = mavis_lo(directory, path.stem, verbose=False)
+        else:
+            values = {
+                name: _MastselIniSection(parser, name, decode) for name in parser.sections()
+            }
+            mlo = mavis_lo(config_dict=values, verbose=False)
+        if getattr(mlo, "error", False):
+            raise RuntimeError("MASTSEL failed to load the effective Hybrid configuration.")
+        mas2nm = getattr(mlo, "mas2nm", None)
+        if mas2nm is None:
+            raise ValueError("MASTSEL did not expose mas2nm conversion.")
+        yield HybridCtotContext(
+            mastsel=mlo,
+            mastsel_statistics=None,
+            angle_to_wavefront_scale=float(mas2nm) * u.nm / u.mas,
+            request=request,
+            ngs_metrics=metrics,
+            ngs_flux=ngs_flux,
+            ngs_frame_rate=ngs_frame_rate,
+            effective_mastsel_ini=effective_ini,
+        )
 
 
 def _compute_mastsel_ctot(context: HybridCtotContext) -> u.Quantity:
