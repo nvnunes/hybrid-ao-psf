@@ -9,6 +9,7 @@ from pathlib import Path
 from types import MappingProxyType
 
 import numpy as np
+from ao_models import FixedGainIntegrator
 from astropy import units as u
 from numpy.typing import ArrayLike, DTypeLike, NDArray
 from scipy.interpolate import RegularGridInterpolator
@@ -16,12 +17,13 @@ from scipy.interpolate import RegularGridInterpolator
 from ._calibration_config import CovarianceCalibrationSettings
 from ._calibration_contracts import (
     CovarianceTelemetry,
-    FixedGainIntegrator,
     _angle,
+    _controller_at_precision,
     _count,
     _PhysicalRecord,
     _quantity,
 )
+from ._calibration_contracts import FixedGainIntegrator as _HybridFixedGainIntegrator
 from ._calibration_io import validate_calibration_data_precision
 from ._calibration_numerics import settling_cut
 from ._calibration_products import (
@@ -106,6 +108,9 @@ class CovarianceCalibrationMeasurements(_PhysicalRecord):
             self.settings, CovarianceCalibrationSettings
         ):
             raise TypeError("typed controller and covariance settings required")
+        object.__setattr__(
+            self, "controller", _controller_at_precision(self.controller, self.dtype)
+        )
         _count(self.frames, "frames", 3)
         _count(self.realizations, "realizations")
         _count(self.discard, "discard", 0)
@@ -543,7 +548,9 @@ class CovarianceFunctions:
         result = object.__new__(cls)
         object.__setattr__(result, "_grid_precision", grid_precision)
         object.__setattr__(result, "_interpolator", _CovarianceInterpolator(arrays, grid_precision))
-        object.__setattr__(result, "_controller", controller)
+        object.__setattr__(
+            result, "_controller", _controller_at_precision(controller, dtype)
+        )
         object.__setattr__(result, "_discard", discard)
         object.__setattr__(
             result,
@@ -1057,7 +1064,7 @@ def load_covariance_calibration(path: str | Path) -> CovarianceFunctions:
     dtype = validate_psf_dtype(header.get("precision", arrays["C_t_t"].dtype))
     if dtype != arrays["C_t_t"].dtype:
         raise ValueError("covariance array file precision disagrees with header")
-    controller = FixedGainIntegrator(
+    controller = _HybridFixedGainIntegrator(
         dtype=dtype,
         gain=header["controller"]["gain"],
         delay=header["controller"]["delay"],
@@ -1170,7 +1177,7 @@ def load_covariance_measurements(path: str | Path) -> CovarianceCalibrationMeasu
             dtype=dtype,
             zenith_angle=header["zenith_angle_deg"] * u.deg,
             positions=saved["positions_arcsec"] * u.arcsec,
-            controller=FixedGainIntegrator(
+            controller=_HybridFixedGainIntegrator(
                 dtype=dtype,
                 gain=controller["gain"],
                 delay=controller["delay"],

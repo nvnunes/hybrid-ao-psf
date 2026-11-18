@@ -11,3 +11,9 @@
   [load its HDF5 result](#hybrid_ao_psf.load_result).
 
 ::: hybrid_ao_psf
+    options:
+      preload_modules: [ao_models]
+      inherited_members:
+        - transition
+        - filter
+        - noise_covariance

@@ -7,6 +7,7 @@ from dataclasses import dataclass, field, replace
 from pathlib import Path
 
 import numpy as np
+from ao_models import solve_lo_reconstructor as _shared_solve_lo_reconstructor
 from astropy import units as u
 from numpy.typing import DTypeLike
 from scipy.interpolate import RegularGridInterpolator
@@ -745,19 +746,8 @@ def solve_lo_reconstructor(
         ValueError: If covariance inputs are invalid.
         numpy.linalg.LinAlgError: If the required multistar matrix is singular.
     """
-    from ._calibration_numerics import lo_reconstructor
-
-    dtype = validate_psf_dtype(dtype)
-    values = [
-        _quantity(value, u.mas**2, name, 2, dtype=dtype).value
-        for value, name in (
-            (ngs_covariance, "ngs_covariance"),
-            (centre_ngs_covariance, "centre_ngs_covariance"),
-            (measurement_noise, "measurement_noise"),
-        )
-    ]
-    return _quantity(
-        lo_reconstructor(*values, dtype=dtype) * u.one, u.one, "weights", 2, dtype=dtype
+    return _shared_solve_lo_reconstructor(
+        ngs_covariance, centre_ngs_covariance, measurement_noise, dtype=dtype
     )
 
 

@@ -7,14 +7,15 @@ from dataclasses import dataclass, field, replace
 from types import MappingProxyType
 
 import numpy as np
+from ao_models import FixedGainIntegrator
 from astropy import units as u
 from numpy.typing import ArrayLike, DTypeLike, NDArray
 from scipy.interpolate import RegularGridInterpolator
 
 from ._calibration_contracts import (
     CalibrationPhotometry,
-    FixedGainIntegrator,
     _angle,
+    _controller_at_precision,
     _count,
     _PhysicalRecord,
     _quantity,
@@ -199,7 +200,7 @@ class SensingResponseModel:
                 "_producer_dtype",
                 None if producer_dtype is None else validate_psf_dtype(producer_dtype),
             ),
-            ("_controller", controller),
+            ("_controller", _controller_at_precision(controller, dtype)),
             ("_photometry", photometry),
             ("_field_radius", radius),
             ("_intervals", _immutable_array(intervals)),

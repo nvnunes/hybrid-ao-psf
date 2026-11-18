@@ -7,10 +7,10 @@ from dataclasses import dataclass
 from pathlib import Path
 
 import numpy as np
+from ao_models import FixedGainIntegrator
 from astropy import units as u
 from numpy.typing import DTypeLike
 
-from ._calibration_contracts import FixedGainIntegrator
 from ._calibration_products import (
     controller_header,
     immutable_metadata,

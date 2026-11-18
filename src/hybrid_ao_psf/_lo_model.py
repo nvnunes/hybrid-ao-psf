@@ -6,10 +6,10 @@ from collections.abc import Callable
 from dataclasses import dataclass
 
 import numpy as np
+from ao_models import FixedGainIntegrator
 from astropy import units as u
 from numpy.typing import DTypeLike, NDArray
 
-from ._calibration_contracts import FixedGainIntegrator
 from ._calibration_numerics import lo_reconstructor
 
 

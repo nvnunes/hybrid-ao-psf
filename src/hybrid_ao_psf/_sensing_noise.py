@@ -8,13 +8,14 @@ from dataclasses import dataclass, field, replace
 from pathlib import Path
 
 import numpy as np
+from ao_models import FixedGainIntegrator
 from astropy import units as u
 from numpy.typing import DTypeLike
 
 from ._calibration_config import SensingCalibrationSettings
 from ._calibration_contracts import (
-    FixedGainIntegrator,
     _angle,
+    _controller_at_precision,
     _count,
     _PhysicalRecord,
     _quantity,
@@ -164,6 +165,9 @@ class SensingNoiseMeasurements(_PhysicalRecord):
             or not isinstance(self.settings, SensingCalibrationSettings)
         ):
             raise TypeError("typed measurement request/controller/settings required")
+        object.__setattr__(
+            self, "controller", _controller_at_precision(self.controller, self.dtype)
+        )
         n = len(self.request.positions)
         r = self.settings.noise_realizations
         f = self.settings.noise_frames

@@ -357,3 +357,38 @@ def test_empty_noise_asterism_is_rejected_before_loop_work():
             seed=7,
             dtype=np.float64,
         )
+
+
+@pytest.mark.parametrize("dtype", [np.float32, np.float64])
+def test_shared_controller_cadence_matches_saved_sensing_precision(tmp_path, dtype):
+    from ao_models import FixedGainIntegrator as SharedIntegrator
+
+    measured, _ = samples()
+    controller = SharedIntegrator(gain=0.3, delay=2, frame_rate=500.00001 * u.Hz)
+    point = SensingCalibrationMeasurements(
+        zenith_angle=20 * u.deg,
+        position=[12, -24] * u.arcsec,
+        magnitude=16 * u.mag,
+        samples=replace(measured, dtype=dtype),
+        displacement=10 * u.mas,
+        sampling=SensingWfsSampling(
+            zero_draws=128, gain_draws=64, block_draws=8, seed=77
+        ),
+        controller=controller,
+        photometry=CalibrationPhotometry(
+            magnitude_band="fixture",
+            photons_per_frame_zeropoint=1e8 * u.photon,
+            dtype=dtype,
+        ),
+        dtype=dtype,
+    )
+    path = tmp_path / "shared-controller.npz"
+    save_sensing_measurements(point, path)
+    restored = load_sensing_measurements(path)
+    assert restored.controller.dtype == point.controller.dtype == np.dtype(dtype)
+    assert (
+        restored.controller.frame_rate
+        == point.controller.frame_rate
+        == dtype(500.00001) * u.Hz
+    )
+    assert controller.frame_rate == 500.00001 * u.Hz

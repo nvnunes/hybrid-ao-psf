@@ -21,7 +21,7 @@ classifiers = [
     "Topic :: Scientific/Engineering :: Astronomy",
 ]
 dependencies = [
-    "ao-models>=0.1.1",
+    "ao-models>=0.2.0",
     "ao-stats>=0.1.0",
     "astropy>=7.0.0",
     "h5py>=3.11.0",

@@ -2,6 +2,7 @@
 
 import numpy as np
 import pytest
+from ao_models import FixedGainIntegrator as SharedFixedGainIntegrator
 from astropy import units as u
 
 from hybrid_ao_psf import (
@@ -101,6 +102,27 @@ def measured():
     return record, measure_covariance_calibration(
         record, controller, settings=settings, dtype=np.float64
     )
+
+
+def test_shared_controller_is_accepted_without_changing_hybrid_defaults(measured):
+    from hybrid_ao_psf._calibration_products import (
+        controller_header,
+        read_controller_header,
+    )
+
+    record, legacy = measured
+    settings = {"gain": 0.3, "delay": 2, "frame_rate": 500 * u.Hz}
+    assert FixedGainIntegrator(**settings).dtype == np.float32
+    shared = SharedFixedGainIntegrator(**settings)
+    assert shared.dtype == np.float64
+    result = measure_covariance_calibration(
+        record, shared, settings=legacy.settings, dtype=np.float64
+    )
+    for name in legacy.tables:
+        np.testing.assert_array_equal(result.tables[name], legacy.tables[name])
+    header = controller_header(result.controller)
+    assert header == controller_header(legacy.controller)
+    assert isinstance(read_controller_header(header), FixedGainIntegrator)
 
 
 def test_six_functions_match_independent_recurrence_and_pooled_mean(measured):

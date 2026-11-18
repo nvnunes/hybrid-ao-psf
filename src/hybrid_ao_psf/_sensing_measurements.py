@@ -7,15 +7,16 @@ from dataclasses import dataclass, field
 from pathlib import Path
 
 import numpy as np
+from ao_models import FixedGainIntegrator
 from astropy import units as u
 from numpy.typing import DTypeLike
 
 from ._calibration_contracts import (
     CalibrationPhotometry,
-    FixedGainIntegrator,
     SensingWfsMeasurements,
     SensingWfsSampling,
     _angle,
+    _controller_at_precision,
     _PhysicalRecord,
     _quantity,
 )
@@ -211,6 +212,9 @@ class SensingCalibrationMeasurements(_PhysicalRecord):
             raise TypeError(
                 "typed samples, sampling, controller and photometry required"
             )
+        object.__setattr__(
+            self, "controller", _controller_at_precision(self.controller, self.dtype)
+        )
         if self.samples.dtype != self.dtype:
             raise ValueError("samples precision must match measurement dtype")
         if self.samples.zero.shape != (

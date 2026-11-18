@@ -13,8 +13,8 @@ Hybrid AO PSF owns:
 - a downstream field-wide Ctot hook with transient runtime/statistics context;
 - finite-field Gaussian/mixture blur, jitter, and engine-level diagnostics;
 - standalone combined-INI and versioned HDF5 result contracts; and
-- common E2E calibration, fixed-integrator/reconstruction/noise-blur kernels and
-  immutable calibrated products.
+- common E2E calibration and noise-blur kernels, immutable calibrated
+  products and the Hybrid controller and reconstructor interfaces.
 
 Hybrid AO PSF does not own batch simulation orchestration, external dataset
 schemas, instrument calibration selection, instrument-specific policy, or
@@ -24,9 +24,10 @@ the latter to WFS-effective rates using MASTSEL geometry and NGS Photometry.
 
 ## Dependencies
 
-The package depends on AO Models for shared INI handling and AO Stats for
-PSF metadata and measurements. NGS Photometry provides magnitude-to-effective-
-rate conversion. The low-order engine supports a tested range of MASTSEL
+The package uses AO Models for shared INI handling, delayed-integrator
+arithmetic and reconstruction. Hybrid keeps its controller and reconstructor
+entry points and their float32 defaults. AO Stats provides PSF metadata and
+measurements. NGS Photometry converts magnitudes to effective rates. The low-order engine supports a tested range of MASTSEL
 releases. It has no dependency on an orchestration framework or instrument
 package.
 
