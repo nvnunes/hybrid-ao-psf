@@ -13,7 +13,6 @@ from hybrid_ao_psf import (
     HybridMastselStatistics,
     HybridRequest,
     HybridResult,
-    NonPsdPolicy,
     PsfMetricPrediction,
     PsfPrediction,
 )
@@ -105,76 +104,78 @@ def make_result(*, diagnostics: bool = True) -> HybridResult:
 
 
 def test_request_normalizes_units_and_owns_readonly_arrays() -> None:
-    science_x = np.array([0.0, 1.0])
+    science_positions = np.array([[0.0, 0.0], [1000.0, -1000.0]]) * u.mas
     request = HybridRequest(
-        science_x=science_x * u.arcsec,
-        science_y=np.array([0.0, -1.0]) * u.arcsec,
-        ngs_x=np.array([10.0]) * u.arcsec,
-        ngs_y=np.array([20.0]) * u.arcsec,
+        science_positions=science_positions,
+        ngs_positions=[[10.0, 20.0]] * u.arcsec,
         ngs_flux=np.array([1000.0]) * u.photon / u.s,
         wavelength=1.65 * u.um,
         zenith_angle=30.0 * u.deg,
-        mastsel_ini="[telescope]\nZenithAngle = 30\n",
-        non_psd_policy="clip",
         diagnostics_level="none",
     )
-    science_x[0] = 99.0
+    science_positions[0, 0] = 99.0 * u.mas
 
-    assert request.science_x.to_value(u.arcsec).tolist() == [0.0, 1.0]
-    assert not request.science_x.value.flags.writeable
-    assert request.non_psd_policy is NonPsdPolicy.CLIP
+    np.testing.assert_array_equal(request.science_positions.to_value(u.arcsec), [[0, 0], [1, -1]])
+    assert not request.science_positions.value.flags.writeable
     assert request.diagnostics_level is DiagnosticsLevel.NONE
     with pytest.raises(ValueError):
-        request.science_x.value[0] = 2.0
+        request.science_positions.value[0, 0] = 2.0
     with pytest.raises(FrozenInstanceError):
         request.wavelength = 2.2 * u.um
 
 
 def test_request_groups_ngs_inputs_after_coordinates() -> None:
     expected = [
-        "science_x",
-        "science_y",
-        "ngs_x",
-        "ngs_y",
+        "science_positions",
+        "ngs_positions",
         "ngs_flux",
         "ngs_magnitude",
-        "ngs_magnitude_zeropoint",
     ]
-    assert [item.name for item in fields(HybridRequest)[:7]] == expected
+    assert [item.name for item in fields(HybridRequest)[: len(expected)]] == expected
     parameters = signature(HybridRequest).parameters
-    assert list(parameters)[:7] == expected
+    assert list(parameters)[: len(expected)] == expected
     assert all(
         parameter.kind is Parameter.KEYWORD_ONLY for parameter in parameters.values()
     )
 
 
 def test_request_rejects_mismatched_ngs_vectors() -> None:
-    with pytest.raises(ValueError, match="identical shapes"):
+    with pytest.raises(ValueError, match="one NGS flux or magnitude per row"):
         HybridRequest(
-            science_x=np.array([0.0]) * u.arcsec,
-            science_y=np.array([0.0]) * u.arcsec,
-            ngs_x=np.array([1.0, 2.0]) * u.arcsec,
-            ngs_y=np.array([1.0]) * u.arcsec,
+            science_positions=[[0.0, 0.0]] * u.arcsec,
+            ngs_positions=[[1.0, 1.0], [2.0, 1.0]] * u.arcsec,
             ngs_flux=np.array([1000.0]) * u.photon / u.s,
             wavelength=1.65 * u.um,
             zenith_angle=30.0 * u.deg,
-            mastsel_ini="[telescope]\nZenithAngle = 30\n",
+        )
+
+
+@pytest.mark.parametrize("field", ["science_positions", "ngs_positions"])
+@pytest.mark.parametrize("shape", [(2,), (0, 2), (1, 3)])
+def test_request_rejects_invalid_position_shapes(field, shape) -> None:
+    positions = {
+        "science_positions": [[0.0, 0.0]] * u.arcsec,
+        "ngs_positions": [[1.0, 1.0]] * u.arcsec,
+    }
+    positions[field] = np.zeros(shape) * u.arcsec
+    with pytest.raises(ValueError, match=field):
+        HybridRequest(
+            **positions,
+            ngs_flux=[1000.0] * u.photon / u.s,
+            wavelength=1.65 * u.um,
+            zenith_angle=30.0 * u.deg,
         )
 
 
 def test_request_requires_one_complete_ngs_input_path() -> None:
     base = {
-        "science_x": np.array([0.0]) * u.arcsec,
-        "science_y": np.array([0.0]) * u.arcsec,
-        "ngs_x": np.array([1.0]) * u.arcsec,
-        "ngs_y": np.array([1.0]) * u.arcsec,
+        "science_positions": [[0.0, 0.0]] * u.arcsec,
+        "ngs_positions": [[1.0, 1.0]] * u.arcsec,
         "wavelength": 1.65 * u.um,
         "zenith_angle": 30.0 * u.deg,
-        "mastsel_ini": "[telescope]\nZenithAngle = 30\n",
     }
     flux = np.array([1000.0]) * u.photon / u.s
     magnitude = np.array([12.0]) * u.mag
-    zeropoint = 1.0 * u.photon / (u.m**2 * u.s)
     with pytest.raises(ValueError, match="exactly one"):
         HybridRequest(**base)
     with pytest.raises(ValueError, match="exactly one"):
@@ -182,29 +183,18 @@ def test_request_requires_one_complete_ngs_input_path() -> None:
             **base,
             ngs_flux=flux,
             ngs_magnitude=magnitude,
-            ngs_magnitude_zeropoint=zeropoint,
         )
-    with pytest.raises(ValueError, match="requires ngs_magnitude"):
-        HybridRequest(**base, ngs_flux=flux, ngs_magnitude_zeropoint=zeropoint)
-    with pytest.raises((TypeError, ValueError), match="ngs_magnitude_zeropoint"):
-        HybridRequest(**base, ngs_magnitude=magnitude)
-    with pytest.raises(ValueError, match="ngs_magnitude_zeropoint"):
-        HybridRequest(
-            **base, ngs_magnitude=magnitude, ngs_magnitude_zeropoint=0.0 * zeropoint
-        )
-    with pytest.raises(ValueError, match="identical shapes"):
+    assert HybridRequest(**base, ngs_magnitude=magnitude).ngs_magnitude == magnitude
+    with pytest.raises(ValueError, match="one NGS flux or magnitude per row"):
         HybridRequest(
             **base,
             ngs_magnitude=np.array([12.0, 13.0]) * u.mag,
-            ngs_magnitude_zeropoint=zeropoint,
         )
 
 
 def test_provider_prediction_owns_inputs() -> None:
     psfs = np.ones((1, 4, 4), dtype=np.float64)
-    prediction = PsfPrediction(
-        psfs=psfs, pixel_scale=8.8 * u.mas, metadata=_metadata()
-    )
+    prediction = PsfPrediction(psfs=psfs, pixel_scale=8.8 * u.mas, metadata=_metadata())
     psfs.fill(0.0)
 
     assert prediction.psfs.dtype == np.float32
@@ -290,14 +280,11 @@ def test_result_rejects_diagnostic_summary_inconsistent_with_ctot() -> None:
 
 def test_request_accepts_validation_diagnostics_level() -> None:
     request = HybridRequest(
-        science_x=np.array([0.0]) * u.arcsec,
-        science_y=np.array([0.0]) * u.arcsec,
-        ngs_x=np.array([1.0]) * u.arcsec,
-        ngs_y=np.array([1.0]) * u.arcsec,
+        science_positions=[[0.0, 0.0]] * u.arcsec,
+        ngs_positions=[[1.0, 1.0]] * u.arcsec,
         ngs_flux=np.array([1000.0]) * u.photon / u.s,
         wavelength=1.65 * u.um,
         zenith_angle=30.0 * u.deg,
-        mastsel_ini="[telescope]\nZenithAngle = 30\n",
         diagnostics_level="validation",
     )
 

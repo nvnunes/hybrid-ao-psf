@@ -15,7 +15,7 @@ from hybrid_ao_psf import (
     simulate,
 )
 
-from .test_engine import _providers, _request, hook_runtime  # noqa: F401
+from .test_engine import _model, _providers, _request, hook_runtime  # noqa: F401
 
 
 def read_samples(path: Path) -> PsfSamples:
@@ -64,15 +64,15 @@ def test_file_and_interpolator_agree_through_simulate(tmp_path, dtype):
     request = replace(
         _request(),
         dtype=dtype,
-        science_x=[1, 0] * u.arcsec,
-        science_y=[1, 0] * u.arcsec,
+        science_positions=[[1, 1], [0, 0]] * u.arcsec,
     )
-    file_result = simulate(request, science_psfs=saved, ngs_metrics=metrics)
-    interpolation_result = simulate(
-        request, science_psfs=interpolated, ngs_metrics=metrics
-    )
+    model = _model(metrics)
+    file_result = simulate(request, science_psfs=saved, lo_model=model)
+    interpolation_result = simulate(request, science_psfs=interpolated, lo_model=model)
     np.testing.assert_array_equal(file_result.psfs, interpolation_result.psfs)
-    np.testing.assert_array_equal(file_result.ctot_angle, interpolation_result.ctot_angle)
+    np.testing.assert_array_equal(
+        file_result.ctot_angle, interpolation_result.ctot_angle
+    )
     assert file_result.metadata.pixel_scale == interpolation_result.metadata.pixel_scale
     assert file_result.psfs.dtype == dtype
 

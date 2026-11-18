@@ -23,6 +23,32 @@ from .contracts import (
 RESULT_SCHEMA = "hybrid-ao-psf-result"
 RESULT_SCHEMA_VERSION = 4
 
+# Saved names in the version 3 and 4 E2E prediction group.
+_E2E_PREDICTION_SAVED_NAMES = {
+    "interpolation_feedback_eigenvalues": "strengths",
+    "interpolation_feedback_projectors": "projectors",
+    "used_symmetric_feedback_approximation": "symmetric_feedback_fallback",
+    "eigenbasis_condition_number": "eigenbasis_condition",
+    "coma_response_coefficients": "coma_response",
+    "noise_covariance_scales": "noise_scales",
+    "feedback_matrix": "feedback",
+    "interpolation_feedback_matrix": "effective_feedback",
+    "reconstructor_noise_covariance": "noise_prior",
+    "atmospheric_command_covariance": "atmospheric_command",
+    "ho_command_covariance": "ho_command",
+    "atmospheric_ho_command_covariance": "atmospheric_ho_command",
+    "science_atmospheric_command_covariance": "science_atmospheric_command",
+    "science_ho_command_covariance": "science_ho_command",
+    "sensing_gains": "gains",
+    "wfs_noise_variances": "noise_variances",
+    "science_tilt_covariance": "uncorrected",
+    "noiseless_covariance": "noiseless",
+    "atmospheric_residual_covariance": "atmospheric",
+    "ho_correction": "ho",
+    "noise_command_covariance": "noise",
+    "_total": "total",
+}
+
 
 def save_result(
     path: str | Path,
@@ -102,20 +128,28 @@ def _write_result(output: Path, result: HybridResult) -> None:
             if getattr(result, name) is not None:
                 _write_quantity(inputs, name, getattr(result, name))
         distribution = result_group.create_group("lo_distribution")
-        distribution.create_dataset("weights", data=result.lo_distribution.weights)
-        _write_quantity(distribution, "covariances", result.lo_distribution.covariances)
+        distribution.create_dataset("weights", data=result.distribution.weights)
+        _write_quantity(distribution, "covariances", result.distribution.covariances)
         if result.e2e_prediction is not None:
             prediction = result_group.create_group("e2e_prediction")
+            predicted_distribution = result.e2e_prediction.distribution
+            prediction.create_dataset(
+                "mixture_weights", data=predicted_distribution.weights
+            )
+            _write_quantity(
+                prediction, "mixture_covariances", predicted_distribution.covariances
+            )
             for item in fields(result.e2e_prediction):
-                if item.name in ("dtype", "metrics"):
+                if item.name in ("dtype", "ngs_metrics", "distribution"):
                     continue
                 value = getattr(result.e2e_prediction, item.name)
+                name = _E2E_PREDICTION_SAVED_NAMES.get(item.name, item.name)
                 if isinstance(value, u.Quantity):
-                    _write_quantity(prediction, item.name, value)
+                    _write_quantity(prediction, name, value)
                 elif isinstance(value, np.ndarray):
-                    prediction.create_dataset(item.name, data=value)
+                    prediction.create_dataset(name, data=value)
                 else:
-                    prediction.attrs[item.name] = value
+                    prediction.attrs[name] = value
         provenance = root.create_group("provenance")
         for name, value in result.provenance.items():
             provenance.attrs[name] = value
@@ -277,8 +311,29 @@ def load_result(path: str | Path) -> HybridResult:
             if values.keys() & group.attrs.keys():
                 raise ValueError("duplicate E2E prediction fields")
             values.update(dict(group.attrs))
+            if not {"mixture_weights", "mixture_covariances"} <= values.keys():
+                raise ValueError("missing E2E prediction distribution fields")
+            weights = values.pop("mixture_weights")
+            covariances = values.pop("mixture_covariances")
+            if np.asarray(weights).dtype.kind not in "fiu" or (
+                isinstance(covariances, u.Quantity)
+                and covariances.dtype.kind not in "fiu"
+            ):
+                raise ValueError("E2E prediction distribution fields must be real")
+            predicted_distribution = LowOrderDistribution(
+                weights=weights, covariances=covariances, dtype=dtype
+            )
+            for field_name, saved_name in _E2E_PREDICTION_SAVED_NAMES.items():
+                if saved_name not in values or field_name in values:
+                    raise ValueError(
+                        f"E2E prediction requires the {saved_name!r} field"
+                    )
+                values[field_name] = values.pop(saved_name)
             prediction = E2ELowOrderPrediction._create(
-                dtype, metrics=metric_values, **values
+                dtype,
+                ngs_metrics=metric_values,
+                distribution=predicted_distribution,
+                **values,
             )
         coordinates = {
             name: (
@@ -320,7 +375,7 @@ def load_result(path: str | Path) -> HybridResult:
             provenance=provenance,
             diagnostics=diagnostics,
             lo_model=lo_model,
-            lo_distribution=distribution,
+            distribution=distribution,
             e2e_prediction=prediction,
             **coordinates,
         )

@@ -15,7 +15,7 @@ from hybrid_ao_psf import (
 )
 
 from .test_contracts import make_result
-from .test_engine import _providers, _request, _ScienceProvider
+from .test_engine import _model, _providers, _request, _ScienceProvider
 
 
 @pytest.mark.parametrize("dtype", [np.float32, np.float64])
@@ -43,7 +43,7 @@ def test_complete_blur_statistics_and_result_keep_selected_values(
             source, old.prediction.pixel_scale, old.prediction.metadata, dtype=dtype
         )
     )
-    result = simulate(request, science, ngs)
+    result = simulate(request, science, lo_model=_model(ngs))
     # Independent NumPy double FFT reference, with explicitly rounded inputs
     # in float32 mode; no engine OTF or padding helpers are used here.
     cov = (

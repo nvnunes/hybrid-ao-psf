@@ -24,6 +24,7 @@ def test_package_root_exports_supported_contracts() -> None:
         "HybridRequest",
         "HybridResult",
         "LowOrderModel",
+        "MastselModel",
         "LowOrderDistribution",
         "NonPsdPolicy",
         "PsfMetricProvider",

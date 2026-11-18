@@ -1,9 +1,12 @@
-"""Private MASTSEL lifetime, baseline capture and fixed-gain noise recovery."""
+"""MASTSEL model configuration, runtime, and fixed-gain noise recovery."""
+
+from __future__ import annotations
 
 from collections.abc import Callable, Iterator, Mapping
 from configparser import BasicInterpolation, ConfigParser
 from contextlib import ExitStack, contextmanager
-from dataclasses import dataclass, replace
+from copy import deepcopy
+from dataclasses import dataclass, field, replace
 from inspect import Parameter, signature
 from numbers import Real
 from pathlib import Path
@@ -11,14 +14,73 @@ from tempfile import TemporaryDirectory
 from typing import Any
 
 import numpy as np
+from ao_models import parse_ini
 from astropy import units as u
 
+from ._units import _PhysicalRecord
 from .contracts import (
     HybridCtotContext,
+    HybridCtotCorrection,
     HybridMastselStatistics,
     HybridRequest,
+    NonPsdPolicy,
     PsfMetricPrediction,
+    PsfMetricProvider,
+    _positive_scalar,
 )
+
+
+@dataclass(frozen=True, kw_only=True)
+class MastselModel(_PhysicalRecord):
+    """MASTSEL inputs for reusable low-order prediction through ``simulate()``.
+
+    Attributes:
+        mastsel_ini: Complete MASTSEL INI text. Each simulation applies its
+            observation's field coordinates, science wavelength and zenith angle
+            to a separate copy of this configuration.
+        ngs_metrics: Provider of NGS high-order EE, FWHM and Strehl.
+        ngs_magnitude_zeropoint: Pre-aperture photon flux per area and second at
+            magnitude zero. Required when the request supplies magnitudes.
+        non_psd_policy: Handling of materially non-PSD MASTSEL covariance.
+        ctot_correction: Optional field-wide correction applied to baseline
+            MASTSEL covariance before conditioning and blur.
+
+    Construction validates the provider, options and INI syntax. It does not
+    start MASTSEL. The same model may be used for multiple observations.
+    """
+
+    mastsel_ini: str
+    ngs_metrics: PsfMetricProvider
+    ngs_magnitude_zeropoint: u.Quantity | None = None
+    non_psd_policy: NonPsdPolicy | str = NonPsdPolicy.ERROR
+    ctot_correction: HybridCtotCorrection | None = None
+    _parsed_ini: ConfigParser = field(init=False, repr=False, compare=False)
+
+    def __post_init__(self) -> None:
+        if not isinstance(self.mastsel_ini, str) or not self.mastsel_ini.strip():
+            raise ValueError("mastsel_ini must not be empty.")
+        if not isinstance(self.ngs_metrics, PsfMetricProvider):
+            raise TypeError("ngs_metrics must implement PsfMetricProvider.")
+        if self.ctot_correction is not None and not isinstance(
+            self.ctot_correction, HybridCtotCorrection
+        ):
+            raise TypeError("ctot_correction must be HybridCtotCorrection or None.")
+        zeropoint = self.ngs_magnitude_zeropoint
+        if zeropoint is not None:
+            unit = u.photon / (u.m**2 * u.s)
+            _positive_scalar(zeropoint, unit, "ngs_magnitude_zeropoint", dtype=None)
+            zeropoint = _positive_scalar(
+                zeropoint, zeropoint.unit, "ngs_magnitude_zeropoint", dtype=None
+            )
+        ini = self.mastsel_ini.strip() + "\n"
+        object.__setattr__(self, "mastsel_ini", ini)
+        object.__setattr__(self, "ngs_magnitude_zeropoint", zeropoint)
+        object.__setattr__(self, "non_psd_policy", NonPsdPolicy(self.non_psd_policy))
+        object.__setattr__(self, "_parsed_ini", parse_ini(ini))
+
+    def _copy_ini(self) -> ConfigParser:
+        """Supply an independent parser for observation-specific overrides."""
+        return deepcopy(self._parsed_ini)
 
 
 @dataclass
@@ -86,6 +148,7 @@ def _prepare_mastsel_context(
     effective_ini: str,
     ngs_frame_rate: u.Quantity,
     ngs_flux: u.Quantity,
+    ngs_magnitude_zeropoint: u.Quantity | None,
 ) -> Iterator[HybridCtotContext]:
     """Own the native runtime and any compatibility file for one prediction."""
     mavis_lo = _load_mavis_lo()
@@ -105,11 +168,14 @@ def _prepare_mastsel_context(
             mlo = mavis_lo(directory, path.stem, verbose=False)
         else:
             values = {
-                name: _MastselIniSection(parser, name, decode) for name in parser.sections()
+                name: _MastselIniSection(parser, name, decode)
+                for name in parser.sections()
             }
             mlo = mavis_lo(config_dict=values, verbose=False)
         if getattr(mlo, "error", False):
-            raise RuntimeError("MASTSEL failed to load the effective Hybrid configuration.")
+            raise RuntimeError(
+                "MASTSEL failed to load the effective Hybrid configuration."
+            )
         mas2nm = getattr(mlo, "mas2nm", None)
         if mas2nm is None:
             raise ValueError("MASTSEL did not expose mas2nm conversion.")
@@ -120,6 +186,7 @@ def _prepare_mastsel_context(
             request=request,
             ngs_metrics=metrics,
             ngs_flux=ngs_flux,
+            ngs_magnitude_zeropoint=ngs_magnitude_zeropoint,
             ngs_frame_rate=ngs_frame_rate,
             effective_mastsel_ini=effective_ini,
         )
@@ -128,12 +195,9 @@ def _prepare_mastsel_context(
 def _compute_mastsel_ctot(context: HybridCtotContext) -> u.Quantity:
     """Evaluate baseline Ctot once with the prepared runtime and resolved inputs."""
     request, metrics = context.request, context.ngs_metrics
-    science = np.column_stack(
-        (request.science_x.to_value(u.arcsec), request.science_y.to_value(u.arcsec))
-    )
-    ngs = np.column_stack(
-        (request.ngs_x.to_value(u.arcsec), request.ngs_y.to_value(u.arcsec))
-    )
+    # Keep native work arrays independent of the read-only request.
+    science = request.science_positions.to_value(u.arcsec).copy()
+    ngs = request.ngs_positions.to_value(u.arcsec).copy()
     return (
         np.asarray(
             context.mastsel.computeTotalResidualMatrix(
@@ -202,7 +266,7 @@ def _measurement_noise(context: HybridCtotContext) -> u.Quantity | None:
     gain = model.LoopGain_LO
     if not isinstance(gain, Real):
         return None
-    count = context.request.ngs_x.size
+    count = len(context.request.ngs_positions)
     if model.noNoise:
         return np.zeros((2 * count, 2 * count)) * u.nm**2
     values = []
@@ -240,20 +304,17 @@ def _complete_mastsel_context(
             "MASTSEL baseline did not expose covariance and reconstructor returns."
         )
     request = context.request
-    count, size = request.ngs_x.size, request.science_x.size
+    count, size = len(request.ngs_positions), len(request.science_positions)
     _, cas, css = captured.covariance
     cas = cas.reshape(size, 2, 2 * count)
     center_indices = np.flatnonzero(
-        (request.science_x.to_value(u.arcsec) == 0)
-        & (request.science_y.to_value(u.arcsec) == 0)
+        np.all(request.science_positions.to_value(u.arcsec) == 0, axis=1)
     )
     centre = None
     if center_indices.size:
         centre = cas[center_indices[0]]
     elif count > 1:
-        ngs = np.column_stack(
-            (request.ngs_x.to_value(u.arcsec), request.ngs_y.to_value(u.arcsec))
-        )
+        ngs = request.ngs_positions.to_value(u.arcsec).copy()
         _, centre, _ = context.mastsel.computeCovMatrices(np.zeros((1, 2)), ngs)
         centre = _cpu_array(centre)
     statistics = HybridMastselStatistics(

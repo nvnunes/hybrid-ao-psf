@@ -18,6 +18,7 @@ from hybrid_ao_psf import (
     CovarianceTelemetry,
     E2ECalibratedModel,
     FixedGainIntegrator,
+    LowOrderDistribution,
     NoiseBlurModel,
     PsfMetricSamples,
     ReconstructorNoiseModel,
@@ -218,13 +219,13 @@ def test_reconstructor_uses_one_evaluated_prior(
     monkeypatch.setattr(CovarianceFunctions, "C_t_t", tilt_covariance)
     prediction = model.predict(
         ngs_positions=record.positions[indices],
-        magnitudes=np.full(len(indices), 9) * u.mag,
+        ngs_magnitude=np.full(len(indices), 9) * u.mag,
         science_positions=record.positions,
         zenith_angle=record.zenith_angle,
     )
 
     assert len(priors) == 1
-    np.testing.assert_array_equal(prediction.noise_prior, priors[0])
+    np.testing.assert_array_equal(prediction.reconstructor_noise_covariance, priors[0])
     assert len(tilt_queries) == expected_tilt_queries
     if len(indices) == 1:
         np.testing.assert_array_equal(prediction.reconstructor, np.eye(2))
@@ -252,7 +253,7 @@ def test_complete_covariances_match_independent_loop_simulation(synthetic, indic
     model, record = synthetic
     prediction = model.predict(
         ngs_positions=record.positions[indices],
-        magnitudes=np.full(len(indices), 9) * u.mag,
+        ngs_magnitude=np.full(len(indices), 9) * u.mag,
         science_positions=record.positions,
         zenith_angle=record.zenith_angle,
     )
@@ -260,35 +261,35 @@ def test_complete_covariances_match_independent_loop_simulation(synthetic, indic
     atm_input = sum(
         record.tilt.value[:, :, idx]
         @ weights[:, 2 * g : 2 * g + 2].T
-        * prediction.gains.value[g]
+        * prediction.sensing_gains.value[g]
         for g, idx in enumerate(indices)
     )
     ho_input = sum(
         record.coma.value[:, :, idx]
         @ weights[:, 2 * g : 2 * g + 2].T
-        * prediction.coma_response.value[g]
+        * prediction.coma_response_coefficients.value[g]
         for g, idx in enumerate(indices)
     )
     controller = model.covariance.controller
     atm = simulate_matrix_loop(
-        atm_input, prediction.feedback, controller.gain, controller.delay
+        atm_input, prediction.feedback_matrix, controller.gain, controller.delay
     )[:, model.covariance.discard :]
     ho = simulate_matrix_loop(
-        ho_input, prediction.feedback, controller.gain, controller.delay
+        ho_input, prediction.feedback_matrix, controller.gain, controller.delay
     )[:, model.covariance.discard :]
     science = record.tilt.value[:, model.covariance.discard :]
     for name, left, right in (
-        ("atmospheric_command", atm, atm),
-        ("ho_command", ho, ho),
-        ("atmospheric_ho_command", atm, ho),
+        ("atmospheric_command_covariance", atm, atm),
+        ("ho_command_covariance", ho, ho),
+        ("atmospheric_ho_command_covariance", atm, ho),
     ):
         np.testing.assert_allclose(
             getattr(prediction, name).value, pooled(left, right), rtol=1e-10, atol=1e-10
         )
     for j in range(len(record.positions)):
         for name, right in (
-            ("science_atmospheric_command", atm),
-            ("science_ho_command", ho),
+            ("science_atmospheric_command_covariance", atm),
+            ("science_ho_command_covariance", ho),
         ):
             np.testing.assert_allclose(
                 getattr(prediction, name).value[j],
@@ -296,34 +297,53 @@ def test_complete_covariances_match_independent_loop_simulation(synthetic, indic
                 rtol=1e-10,
                 atol=1e-10,
             )
-        residual = science[:, :, j] - atm - ho
+        science_tilt = science[:, :, j]
         np.testing.assert_allclose(
-            prediction.noiseless.value[j],
-            pooled(residual, residual),
+            prediction.science_tilt_covariance.value[j],
+            pooled(science_tilt, science_tilt),
+            rtol=1e-10,
+            atol=1e-10,
+        )
+        atmospheric_residual = science_tilt - atm
+        atmospheric_covariance = pooled(atmospheric_residual, atmospheric_residual)
+        residual = atmospheric_residual - ho
+        noiseless_covariance = pooled(residual, residual)
+        np.testing.assert_allclose(
+            prediction.atmospheric_residual_covariance.value[j],
+            atmospheric_covariance,
+            rtol=1e-10,
+            atol=1e-10,
+        )
+        np.testing.assert_allclose(
+            prediction.ho_correction.value[j],
+            noiseless_covariance - atmospheric_covariance,
+            rtol=1e-10,
+            atol=1e-10,
+        )
+        np.testing.assert_allclose(
+            prediction.noiseless_covariance.value[j],
+            noiseless_covariance,
             rtol=1e-10,
             atol=1e-10,
         )
     if len(indices) == 1:
         np.testing.assert_array_equal(weights, np.eye(2))
     else:
-        assert np.ptp(prediction.gains.value) > 0.05
+        assert np.ptp(prediction.sensing_gains.value) > 0.05
         # This fixture must exercise matrix ordering, not commuting scalar weights.
         assert any(
             np.linalg.norm(p @ weights[:, :2] - weights[:, :2] @ p) > 0.01
-            for p in prediction.projectors
+            for p in prediction.interpolation_feedback_projectors
         )
+    assert isinstance(prediction.distribution, LowOrderDistribution)
     np.testing.assert_allclose(
-        np.einsum(
-            "c,scab->sab",
-            prediction.mixture_weights,
-            prediction.mixture_covariances.value,
-        ),
-        prediction.total.value,
+        prediction.distribution.covariance.value,
+        (prediction.noiseless_covariance + prediction.noise_command_covariance).value,
         rtol=1e-13,
         atol=1e-13,
     )
     np.testing.assert_allclose(
-        prediction.noise,
+        prediction.noise_command_covariance,
         model.sensing.noise_covariance(
             positions=record.positions[indices],
             magnitudes=np.full(len(indices), 9) * u.mag,
@@ -342,46 +362,90 @@ def test_precision_immutability_and_input_rejection(synthetic, dtype, indices):
     model = model.prepare(dtype=dtype)
     args = {
         "ngs_positions": record.positions[indices],
-        "magnitudes": np.full(len(indices), 9) * u.mag,
+        "ngs_magnitude": np.full(len(indices), 9) * u.mag,
         "science_positions": record.positions,
         "zenith_angle": record.zenith_angle,
     }
     result = model.predict(**args)
+    with pytest.raises(TypeError, match="unexpected keyword argument.*magnitudes"):
+        model.predict(**(args | {"magnitudes": args["ngs_magnitude"]}))
+    for old_name in (
+        "strengths",
+        "projectors",
+        "symmetric_feedback_fallback",
+        "eigenbasis_condition",
+        "coma_response",
+        "noise_scales",
+        "feedback",
+        "effective_feedback",
+        "metrics",
+        "noise_prior",
+        "atmospheric_ho_command",
+        "science_atmospheric_command",
+        "science_ho_command",
+        "atmospheric_command",
+        "ho_command",
+        "gains",
+        "noise_variances",
+        "uncorrected",
+        "atmospheric",
+        "ho",
+        "noiseless",
+        "noise",
+        "total",
+    ):
+        assert not hasattr(result, old_name)
+    assert result.distribution.covariance.dtype == dtype
     for value in (
-        result.total,
-        result.noise,
-        result.mixture_covariances,
-        result.gains,
+        result.science_tilt_covariance,
+        result.noiseless_covariance,
+        result.atmospheric_residual_covariance,
+        result.ho_correction,
+        result.noise_command_covariance,
+        result.distribution.weights,
+        result.distribution.covariances,
+        result.sensing_gains,
+        result.wfs_noise_variances,
         result.reconstructor,
-        result.projectors,
+        result.interpolation_feedback_projectors,
         result.photons_per_frame,
-        result.metrics.ee,
-        result.metrics.fwhm,
-        result.metrics.sr,
+        result.ngs_metrics.ee,
+        result.ngs_metrics.fwhm,
+        result.ngs_metrics.sr,
     ):
         assert value.dtype == dtype
         with pytest.raises(ValueError):
             (
                 value.value if isinstance(value, u.Quantity) else value
             ).flags.writeable = True
-    for name in ("total", "noise", "mixture_covariances", "gains", "photons_per_frame"):
-        expected = getattr(result, name).copy()
-        backing = getattr(result, name)
+    for owner, name in (
+        (result, "science_tilt_covariance"),
+        (result, "noiseless_covariance"),
+        (result, "atmospheric_residual_covariance"),
+        (result, "ho_correction"),
+        (result, "noise_command_covariance"),
+        (result.distribution, "covariances"),
+        (result, "sensing_gains"),
+        (result, "wfs_noise_variances"),
+        (result, "photons_per_frame"),
+    ):
+        expected = getattr(owner, name).copy()
+        backing = getattr(owner, name)
         while isinstance(backing, np.ndarray):
             if isinstance(backing, u.Quantity):
                 backing *= u.s
-                assert getattr(result, name).unit == expected.unit
+                assert getattr(owner, name).unit == expected.unit
             backing = backing.base
-        np.testing.assert_array_equal(getattr(result, name), expected)
+        np.testing.assert_array_equal(getattr(owner, name), expected)
     with pytest.raises(ValueError, match="range|outside"):
-        model.predict(**(args | {"magnitudes": np.full(len(indices), 12) * u.mag}))
+        model.predict(**(args | {"ngs_magnitude": np.full(len(indices), 12) * u.mag}))
     with pytest.raises(ValueError, match="distinct"):
         model.predict(
             **(
                 args
                 | {
                     "ngs_positions": record.positions[[0, 0]],
-                    "magnitudes": [9, 9] * u.mag,
+                    "ngs_magnitude": [9, 9] * u.mag,
                 }
             )
         )
@@ -483,12 +547,13 @@ def test_configured_native_free_loading_and_conflicts(synthetic, tmp_path, monke
     assert not hasattr(loaded, "product_identities")
     args = {
         "ngs_positions": record.positions[[0, 8]],
-        "magnitudes": [9, 9] * u.mag,
+        "ngs_magnitude": [9, 9] * u.mag,
         "science_positions": record.positions,
         "zenith_angle": 20 * u.deg,
     }
     np.testing.assert_array_equal(
-        loaded.predict(**args).total, model.predict(**args).total
+        loaded.predict(**args).distribution.covariance,
+        model.predict(**args).distribution.covariance,
     )
     with pytest.raises(TypeError):
         loaded.model_files["other"] = None
@@ -502,8 +567,8 @@ def test_configured_native_free_loading_and_conflicts(synthetic, tmp_path, monke
                     "zenith_angle": args["zenith_angle"].to(u.rad),
                 }
             )
-        ).total,
-        loaded.predict(**args).total,
+        ).distribution.covariance,
+        loaded.predict(**args).distribution.covariance,
         rtol=1e-12,
         atol=1e-12,
     )
@@ -520,8 +585,8 @@ from hybrid_ao_psf import load_e2e_calibrated_model
 import sys
 model = load_e2e_calibrated_model(sys.argv[1])
 result = model.predict(ngs_positions=[[-1,-1],[1,1]]*u.arcsec,
-    magnitudes=[9,9]*u.mag, science_positions=[[0,0]]*u.arcsec, zenith_angle=20*u.deg)
-assert result.total.shape == (1,2,2)
+    ngs_magnitude=[9,9]*u.mag, science_positions=[[0,0]]*u.arcsec, zenith_angle=20*u.deg)
+assert result.distribution.covariance.shape == (1,2,2)
 """
     subprocess.run(
         [sys.executable, "-c", code, str(ini)],
@@ -553,7 +618,7 @@ def test_noise_covariance_matches_independent_impulse_sum(synthetic, indices):
     model, record = synthetic
     result = model.predict(
         ngs_positions=record.positions[indices],
-        magnitudes=np.full(len(indices), 9) * u.mag,
+        ngs_magnitude=np.full(len(indices), 9) * u.mag,
         science_positions=record.positions[[4]],
         zenith_angle=20 * u.deg,
     )
@@ -562,24 +627,24 @@ def test_noise_covariance_matches_independent_impulse_sum(synthetic, indices):
     for k in range(1, len(impulse)):
         impulse[k] = impulse[k - 1]
         if k >= delay:
-            impulse[k] -= gain * result.feedback @ impulse[k - delay]
+            impulse[k] -= gain * result.feedback_matrix @ impulse[k - delay]
         if k == delay:
             impulse[k] += gain * np.eye(2)
     innovation = sum(
         v
         * result.reconstructor[:, 2 * g : 2 * g + 2]
         @ result.reconstructor[:, 2 * g : 2 * g + 2].T
-        for g, v in enumerate(result.noise_variances.value)
+        for g, v in enumerate(result.wfs_noise_variances.value)
     )
     expected = sum(a @ innovation @ a.T for a in impulse)
-    np.testing.assert_allclose(result.noise.value, expected, rtol=1e-12, atol=1e-12)
+    np.testing.assert_allclose(result.noise_command_covariance.value, expected, rtol=1e-12, atol=1e-12)
 
 
 def test_unsupported_spatial_and_zenith_queries_are_rejected(synthetic):
     model, record = synthetic
     args = {
         "ngs_positions": record.positions[[0]],
-        "magnitudes": [9] * u.mag,
+        "ngs_magnitude": [9] * u.mag,
         "science_positions": record.positions[[4]],
         "zenith_angle": 20 * u.deg,
     }
@@ -613,12 +678,14 @@ def test_complex_feedback_interpolation_uses_symmetric_part_but_noise_uses_actua
     )
     result = model.predict(
         ngs_positions=record.positions[indices],
-        magnitudes=[9, 9] * u.mag,
+        ngs_magnitude=[9, 9] * u.mag,
         science_positions=record.positions,
         zenith_angle=20 * u.deg,
     )
-    assert result.symmetric_feedback_fallback
-    np.testing.assert_allclose(result.effective_feedback, b * np.eye(2), atol=1e-15)
+    assert result.used_symmetric_feedback_approximation
+    np.testing.assert_allclose(
+        result.interpolation_feedback_matrix, b * np.eye(2), atol=1e-15
+    )
     atm = sum(
         record.tilt.value[:, :, idx] @ weights[:, 2 * g : 2 * g + 2].T * gains[g]
         for g, idx in enumerate(indices)
@@ -626,23 +693,23 @@ def test_complex_feedback_interpolation_uses_symmetric_part_but_noise_uses_actua
     ho = sum(
         record.coma.value[:, :, idx]
         @ weights[:, 2 * g : 2 * g + 2].T
-        * result.coma_response.value[g]
+        * result.coma_response_coefficients.value[g]
         for g, idx in enumerate(indices)
     )
-    effective = simulate_matrix_loop(atm + ho, result.effective_feedback, 0.3, 2)[
-        :, model.covariance.discard :
-    ]
+    effective = simulate_matrix_loop(
+        atm + ho, result.interpolation_feedback_matrix, 0.3, 2
+    )[:, model.covariance.discard :]
     for j in range(len(record.positions)):
         residual = record.tilt.value[:, model.covariance.discard :, j] - effective
         np.testing.assert_allclose(
-            result.noiseless.value[j],
+            result.noiseless_covariance.value[j],
             pooled(residual, residual),
             rtol=1e-11,
             atol=1e-11,
         )
     innovation = sum(
         v * weights[:, 2 * g : 2 * g + 2] @ weights[:, 2 * g : 2 * g + 2].T
-        for g, v in enumerate(result.noise_variances.value)
+        for g, v in enumerate(result.wfs_noise_variances.value)
     )
     impulse = np.zeros((2048, 2, 2))
     for k in range(1, len(impulse)):
@@ -652,9 +719,9 @@ def test_complex_feedback_interpolation_uses_symmetric_part_but_noise_uses_actua
         if k == 2:
             impulse[k] += 0.3 * np.eye(2)
     expected = sum(a @ innovation @ a.T for a in impulse)
-    np.testing.assert_allclose(result.noise.value, expected, rtol=1e-12, atol=1e-12)
+    np.testing.assert_allclose(result.noise_command_covariance.value, expected, rtol=1e-12, atol=1e-12)
     approximate = model.sensing.controller.noise_covariance(
-        result.effective_feedback, innovation * u.mas**2
+        result.interpolation_feedback_matrix, innovation * u.mas**2
     )
     assert np.linalg.norm(expected - approximate.value) > 0.001
 
@@ -686,7 +753,7 @@ def test_model_rejects_unsupported_feedback(synthetic, monkeypatch, feedback, er
     with pytest.raises(ValueError, match=error):
         model.predict(
             ngs_positions=positions,
-            magnitudes=magnitudes,
+            ngs_magnitude=magnitudes,
             science_positions=record.positions[[4]],
             zenith_angle=20 * u.deg,
         )

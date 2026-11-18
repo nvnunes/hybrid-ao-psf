@@ -18,6 +18,7 @@ from hybrid_ao_psf import (
     DiagnosticsLevel,
     HybridCtotCorrection,
     HybridRequest,
+    MastselModel,
     NonPsdPolicy,
     PsfMetricPrediction,
     PsfPrediction,
@@ -46,18 +47,22 @@ class _NgsProvider:
 
 def _request(
     *,
-    policy: NonPsdPolicy = NonPsdPolicy.ERROR,
     diagnostics: DiagnosticsLevel = DiagnosticsLevel.DEBUG,
-    frame_rate: str = "500.0",
 ) -> HybridRequest:
     return HybridRequest(
-        science_x=np.array([0.0, 1.0]) * u.arcsec,
-        science_y=np.array([0.0, 0.0]) * u.arcsec,
-        ngs_x=np.array([10.0, -5.0]) * u.arcsec,
-        ngs_y=np.array([0.0, 5.0 * np.sqrt(3.0)]) * u.arcsec,
+        science_positions=[[0.0, 0.0], [1.0, 0.0]] * u.arcsec,
+        ngs_positions=[[10.0, 0.0], [-5.0, 5.0 * np.sqrt(3.0)]] * u.arcsec,
         ngs_flux=np.array([1000.0, 2000.0]) * u.photon / u.s,
         wavelength=1.65 * u.um,
         zenith_angle=30.0 * u.deg,
+        diagnostics_level=diagnostics,
+    )
+
+
+def _model(ngs_metrics, *, frame_rate="500.0", **model_options) -> MastselModel:
+    return MastselModel(
+        ngs_metrics=ngs_metrics,
+        **model_options,
         mastsel_ini=f"""[telescope]
 ZenithAngle = 0.0
 
@@ -77,8 +82,6 @@ NumberLenslets = [1]
 [RTC]
 SensorFrameRate_LO = {frame_rate}
 """,
-        non_psd_policy=policy,
-        diagnostics_level=diagnostics,
     )
 
 
@@ -158,7 +161,7 @@ def hook_runtime(stub_mastsel):
 def test_noop_preserves_complete_result_and_runtime_lifetime(hook_runtime):
     _, instances = hook_runtime
     science, ngs = _providers()
-    baseline = engine.simulate(_request(), science, ngs)
+    baseline = engine.simulate(_request(), science, lo_model=_model(ngs))
     calls = []
 
     def noop(ctot, context):
@@ -180,8 +183,9 @@ def test_noop_preserves_complete_result_and_runtime_lifetime(hook_runtime):
     actual = engine.simulate(
         _request(),
         science,
-        ngs,
-        ctot_correction=HybridCtotCorrection(noop, {"fit": "fit.json"}),
+        lo_model=_model(
+            ngs, ctot_correction=HybridCtotCorrection(noop, {"fit": "fit.json"})
+        ),
     )
     assert len(calls) == 1 and len(instances) == 2
     for name in ("psfs", "ctot_wavefront", "ctot_angle", "jitter", "psd_clipped"):
@@ -213,11 +217,12 @@ def test_legacy_mastsel_keeps_ini_during_correction_and_cleans_up(
             raise RuntimeError("legacy correction failed")
 
     expected = pytest.raises(RuntimeError, match="legacy correction failed")
+    science, ngs = _providers()
     with expected if fail else nullcontext():
         engine.simulate(
             _request(),
-            *_providers(),
-            ctot_correction=HybridCtotCorrection(correct),
+            science,
+            lo_model=_model(ngs, ctot_correction=HybridCtotCorrection(correct)),
         )
 
     assert observed_paths == [instances[0].ini_path]
@@ -227,13 +232,17 @@ def test_legacy_mastsel_keeps_ini_during_correction_and_cleans_up(
 def test_doubling_uses_one_effective_covariance_for_blur_and_diagnostics(hook_runtime):
     _, instances = hook_runtime
     science, ngs = _providers()
-    baseline = engine.simulate(replace(_request(), dtype=np.float64), science, ngs)
+    baseline = engine.simulate(
+        replace(_request(), dtype=np.float64), science, lo_model=_model(ngs)
+    )
     actual = engine.simulate(
         replace(_request(), dtype=np.float64),
         science,
-        ngs,
-        ctot_correction=HybridCtotCorrection(
-            lambda ctot, context: (2 * ctot).to(u.um**2)
+        lo_model=_model(
+            ngs,
+            ctot_correction=HybridCtotCorrection(
+                lambda ctot, context: (2 * ctot).to(u.um**2)
+            ),
         ),
     )
     np.testing.assert_allclose(actual.ctot_wavefront, 2 * baseline.ctot_wavefront)
@@ -264,11 +273,15 @@ def test_doubling_uses_one_effective_covariance_for_blur_and_diagnostics(hook_ru
 )
 def test_invalid_correction_rejects_and_cleans_up(hook_runtime, replacement, error):
     _, instances = hook_runtime
+    science, ngs = _providers()
     with pytest.raises(error):
         engine.simulate(
             _request(),
-            *_providers(),
-            ctot_correction=HybridCtotCorrection(lambda ctot, context: replacement),
+            science,
+            lo_model=_model(
+                ngs,
+                ctot_correction=HybridCtotCorrection(lambda ctot, context: replacement),
+            ),
         )
     assert "computeCovMatrices" not in instances[-1].__dict__
 
@@ -276,12 +289,17 @@ def test_invalid_correction_rejects_and_cleans_up(hook_runtime, replacement, err
 @pytest.mark.parametrize("policy", [NonPsdPolicy.ERROR, NonPsdPolicy.CLIP])
 def test_corrected_covariance_obeys_existing_psd_policy(hook_runtime, policy):
     corrected = np.array([[[-1, 0], [0, 100]]] * 2) * u.nm**2
-    kwargs = {"ctot_correction": HybridCtotCorrection(lambda ctot, context: corrected)}
+    science, ngs = _providers()
+    model = _model(
+        ngs,
+        non_psd_policy=policy,
+        ctot_correction=HybridCtotCorrection(lambda ctot, context: corrected),
+    )
     if policy is NonPsdPolicy.ERROR:
         with pytest.raises(ValueError, match="materially"):
-            engine.simulate(_request(policy=policy), *_providers(), **kwargs)
+            engine.simulate(_request(), science, lo_model=model)
     else:
-        result = engine.simulate(_request(policy=policy), *_providers(), **kwargs)
+        result = engine.simulate(_request(), science, lo_model=model)
         np.testing.assert_array_equal(result.psd_clipped, [True, True])
         np.testing.assert_array_equal(result.ctot_wavefront.value[:, 0, 0], [0, 0])
 
@@ -303,9 +321,12 @@ def test_failures_restore_instance_bindings_and_configuration(hook_runtime, stag
 
     if stage == "baseline":
         runtime.computeTotalResidualMatrix = fail
+    science, ngs = _providers()
     with pytest.raises(RuntimeError, match="intentional"):
         engine.simulate(
-            _request(), *_providers(), ctot_correction=HybridCtotCorrection(fail)
+            _request(),
+            science,
+            lo_model=_model(ngs, ctot_correction=HybridCtotCorrection(fail)),
         )
     model = instances[-1]
     assert model.computeCovMatrices is model.original_covariance
@@ -315,12 +336,12 @@ def test_failures_restore_instance_bindings_and_configuration(hook_runtime, stag
 @pytest.mark.parametrize("count", [1, 2])
 def test_centre_missing_adds_only_required_covariance(hook_runtime, count):
     _, instances = hook_runtime
+    base_request = _request()
     request = replace(
-        _request(),
-        science_x=np.array([3, 4]) * u.arcsec,
-        ngs_x=_request().ngs_x[:count],
-        ngs_y=_request().ngs_y[:count],
-        ngs_flux=_request().ngs_flux[:count],
+        base_request,
+        science_positions=[[3, 0], [4, 0]] * u.arcsec,
+        ngs_positions=base_request.ngs_positions[:count],
+        ngs_flux=base_request.ngs_flux[:count],
     )
     science, ngs = _providers()
     ngs = _NgsProvider(
@@ -336,7 +357,11 @@ def test_centre_missing_adds_only_required_covariance(hook_runtime, count):
             count == 1
         )
 
-    engine.simulate(request, science, ngs, ctot_correction=HybridCtotCorrection(noop))
+    engine.simulate(
+        request,
+        science,
+        lo_model=_model(ngs, ctot_correction=HybridCtotCorrection(noop)),
+    )
     assert instances[-1].calls == {"total": 1, "covariance": count, "reconstructor": 1}
 
 
@@ -348,26 +373,31 @@ def test_nonfixed_gain_does_not_disable_generic_hook(hook_runtime):
         assert context.mastsel_statistics.measurement_noise is None
         return 2 * ctot
 
+    science, ngs = _providers()
     result = engine.simulate(
-        _request(), *_providers(), ctot_correction=HybridCtotCorrection(double)
+        _request(),
+        science,
+        lo_model=_model(ngs, ctot_correction=HybridCtotCorrection(double)),
     )
     np.testing.assert_array_equal(result.ctot_wavefront.value[:, 0, 0], [200, 400])
 
 
 def test_provenance_collision_and_invalid_hook_fail_before_runtime(hook_runtime):
     _, instances = hook_runtime
+    science, ngs = _providers()
     with pytest.raises(ValueError, match="collides"):
         engine.simulate(
             _request(),
-            *_providers(),
-            ctot_correction=HybridCtotCorrection(
-                lambda ctot, context: None, {"science_psfs": "other"}
+            science,
+            lo_model=_model(
+                ngs,
+                ctot_correction=HybridCtotCorrection(
+                    lambda ctot, context: None, {"science_psfs": "other"}
+                ),
             ),
         )
     with pytest.raises(TypeError, match="ctot_correction"):
-        engine.simulate(
-            _request(), *_providers(), ctot_correction=lambda ctot, context: None
-        )
+        _model(ngs, ctot_correction=lambda ctot, context: None)
     assert not instances
 
 
@@ -399,9 +429,10 @@ def test_simulate_builds_owned_result_and_passes_resolved_mastsel_inputs(
     stub_mastsel(FakeMavisLO, decoder=decode)
     science, ngs = _providers()
     request = _request()
-    request = replace(
-        request,
-        mastsel_ini=request.mastsel_ini
+    model = _model(ngs)
+    model = replace(
+        model,
+        mastsel_ini=model.mastsel_ini
         + """
 [atmosphere]
 Reference = 1e-9
@@ -411,7 +442,7 @@ Wavelength = 500 * %(Reference)s
 Label = 50% transmission
 """,
     )
-    result = engine.simulate(request, science, ngs)
+    result = engine.simulate(request, science, lo_model=model)
 
     config = calls["constructor"]
     assert config["atmosphere"]["Wavelength"] == pytest.approx(500e-9)
@@ -489,21 +520,24 @@ def test_magnitude_request_resolves_the_same_flux_and_psf_as_direct_flux(
     )
     expected_flux = magnitudes_to_effective_photons_per_second(magnitudes, photometry)
     base = replace(_request(), dtype=np.float64)
-    ini = base.mastsel_ini.replace(
+    science, ngs = _providers()
+    model = _model(ngs)
+    ini = model.mastsel_ini.replace(
         "ZenithAngle = 0.0", "ZenithAngle = 0.0\nTelescopeDiameter = 8.0"
     )
     magnitude_request = replace(
         base,
-        mastsel_ini=ini,
-        dtype=np.float64,
         ngs_flux=None,
         ngs_magnitude=magnitudes,
-        ngs_magnitude_zeropoint=zeropoint,
     )
-    science, ngs = _providers()
-    magnitude_result = engine.simulate(magnitude_request, science, ngs)
+    model = replace(model, mastsel_ini=ini)
+    magnitude_result = engine.simulate(
+        magnitude_request,
+        science,
+        lo_model=replace(model, ngs_magnitude_zeropoint=zeropoint),
+    )
     direct_result = engine.simulate(
-        replace(base, mastsel_ini=ini, ngs_flux=expected_flux), science, ngs
+        replace(base, ngs_flux=expected_flux), science, lo_model=model
     )
     np.testing.assert_allclose(calls[0], expected_flux.to_value(u.photon / u.s))
     np.testing.assert_array_equal(calls[0], calls[1])
@@ -547,10 +581,8 @@ def test_directional_field_pairs_and_covariance_axes_reach_mastsel(
     stub_mastsel(FakeMavisLO)
     request = replace(
         _request(),
-        science_x=np.array([12.0, -4.0]) * u.arcsec,
-        science_y=np.array([-3.0, 8.0]) * u.arcsec,
-        ngs_x=np.array([9.0, -7.0]) * u.arcsec,
-        ngs_y=np.array([2.0, -6.0]) * u.arcsec,
+        science_positions=[[12.0, -3.0], [-4.0, 8.0]] * u.arcsec,
+        ngs_positions=[[9.0, 2.0], [-7.0, -6.0]] * u.arcsec,
     )
     science, ngs = _providers()
     directional_psfs = np.zeros((2, 33, 33), dtype=np.float32)
@@ -558,7 +590,7 @@ def test_directional_field_pairs_and_covariance_axes_reach_mastsel(
     directional_psfs[:, 21, 12] = 0.2
     science = _ScienceProvider(replace(science.prediction, psfs=directional_psfs))
 
-    result = engine.simulate(request, science, ngs)
+    result = engine.simulate(request, science, lo_model=_model(ngs))
 
     np.testing.assert_array_equal(calls["science"], [[12.0, -3.0], [-4.0, 8.0]])
     np.testing.assert_array_equal(calls["ngs"], [[9.0, 2.0], [-7.0, -6.0]])
@@ -588,7 +620,9 @@ def test_simulate_uses_frame_rate_from_ini(stub_mastsel) -> None:
 
     stub_mastsel(FakeMavisLO)
     science, ngs = _providers()
-    result = engine.simulate(_request(frame_rate="250.0"), science, ngs)
+    result = engine.simulate(
+        _request(), science, lo_model=_model(ngs, frame_rate="250.0")
+    )
 
     np.testing.assert_allclose(calls["frame_rate"], [250.0, 250.0])
     np.testing.assert_allclose(result.ngs_frame_rate.to_value(u.Hz), [250.0, 250.0])
@@ -598,18 +632,20 @@ def test_simulate_uses_frame_rate_from_ini(stub_mastsel) -> None:
 def test_simulate_rejects_invalid_ini_frame_rate(frame_rate: str) -> None:
     science, ngs = _providers()
     with pytest.raises(ValueError, match="RTC.SensorFrameRate_LO"):
-        engine.simulate(_request(frame_rate=frame_rate), science, ngs)
+        engine.simulate(
+            _request(), science, lo_model=_model(ngs, frame_rate=frame_rate)
+        )
 
 
 def test_simulate_requires_ini_frame_rate() -> None:
-    request = _request()
-    request = replace(
-        request,
-        mastsel_ini=request.mastsel_ini.replace("SensorFrameRate_LO = 500.0\n", ""),
-    )
     science, ngs = _providers()
+    model = _model(ngs)
+    model = replace(
+        model,
+        mastsel_ini=model.mastsel_ini.replace("SensorFrameRate_LO = 500.0\n", ""),
+    )
     with pytest.raises(ValueError, match="RTC.SensorFrameRate_LO"):
-        engine.simulate(request, science, ngs)
+        engine.simulate(_request(), science, lo_model=model)
 
 
 def test_validation_diagnostics_omit_pre_blur_psfs(
@@ -629,7 +665,7 @@ def test_validation_diagnostics_omit_pre_blur_psfs(
     science, ngs = _providers()
 
     result = engine.simulate(
-        _request(diagnostics=DiagnosticsLevel.VALIDATION), science, ngs
+        _request(diagnostics=DiagnosticsLevel.VALIDATION), science, lo_model=_model(ngs)
     )
 
     assert result.diagnostics is not None
@@ -653,7 +689,9 @@ def test_none_diagnostics_omits_diagnostics(
     stub_mastsel(FakeMavisLO)
     science, ngs = _providers()
 
-    result = engine.simulate(_request(diagnostics=DiagnosticsLevel.NONE), science, ngs)
+    result = engine.simulate(
+        _request(diagnostics=DiagnosticsLevel.NONE), science, lo_model=_model(ngs)
+    )
 
     assert result.diagnostics is None
 
@@ -686,7 +724,7 @@ def test_rotated_roundoff_ctot_remains_active_after_conditioning(
     result = engine.simulate(
         replace(_request(diagnostics=DiagnosticsLevel.VALIDATION), dtype=np.float64),
         science,
-        ngs,
+        lo_model=_model(ngs),
     )
 
     np.testing.assert_array_equal(result.psd_clipped, [True, True])

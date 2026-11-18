@@ -2,6 +2,8 @@
 
 Hybrid AO PSF uses one INI file for one simulation. `[hybrid] lo_model` selects
 `mastsel` (the default) or `e2e-calibrated`. Paths resolve relative to that file.
+The loader assembles each model's INI coordinates into Cartesian `(x, y)` rows
+for `HybridRequest.science_positions` and `HybridRequest.ngs_positions`.
 
 ## MASTSEL Configuration
 

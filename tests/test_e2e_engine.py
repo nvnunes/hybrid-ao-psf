@@ -15,6 +15,7 @@ from hybrid_ao_psf import (
     HybridRequest,
     LowOrderDistribution,
     LowOrderModel,
+    MastselModel,
     PsfPrediction,
     PsfSamples,
     build_psf_interpolator,
@@ -62,14 +63,11 @@ class Science:
 
 def request(record, indices, dtype=np.float64, diagnostics="debug"):
     return HybridRequest(
-        science_x=record.positions[[4, 5], 0],
-        science_y=record.positions[[4, 5], 1],
-        ngs_x=record.positions[indices, 0],
-        ngs_y=record.positions[indices, 1],
+        science_positions=record.positions[[4, 5]],
+        ngs_positions=record.positions[indices],
         ngs_magnitude=np.full(len(indices), 9) * u.mag,
         wavelength=1.65 * u.um,
         zenith_angle=20 * u.deg,
-        lo_model="e2e-calibrated",
         dtype=dtype,
         diagnostics_level=diagnostics,
     )
@@ -114,11 +112,13 @@ def test_calibrated_engine_matches_independent_mixture_and_roundtrip(
         raise AssertionError("MASTSEL forbidden")
 
     monkeypatch.setattr("hybrid_ao_psf.engine._prepare_mastsel_context", forbidden)
-    result = simulate(request(record, indices, dtype), source, e2e_model=model)
+    result = simulate(request(record, indices, dtype), source, lo_model=model)
+    assert result.distribution is result.e2e_prediction.distribution
+    assert not hasattr(result, "lo_distribution")
     expected = independent_blur(
         result.diagnostics.pre_blur_psfs,
-        result.lo_distribution.weights,
-        result.lo_distribution.covariances.value,
+        result.distribution.weights,
+        result.distribution.covariances.value,
         1.0,
     )
     np.testing.assert_allclose(
@@ -146,14 +146,91 @@ def test_calibrated_engine_matches_independent_mixture_and_roundtrip(
         assert root.attrs["lo_model"] == "e2e-calibrated"
         assert "effective_mastsel_ini" not in root["configuration"]
         assert "wavefront" not in root["result/ctot"]
+        stored_prediction = root["result/e2e_prediction"]
+        prediction = result.e2e_prediction
+        total = prediction.noiseless_covariance + prediction.noise_command_covariance
+        for name, expected in (
+            ("coma_response", prediction.coma_response_coefficients),
+            ("noise_prior", prediction.reconstructor_noise_covariance),
+            ("gains", prediction.sensing_gains),
+            ("noise_variances", prediction.wfs_noise_variances),
+            ("atmospheric_command", prediction.atmospheric_command_covariance),
+            ("ho_command", prediction.ho_command_covariance),
+            ("atmospheric_ho_command", prediction.atmospheric_ho_command_covariance),
+            (
+                "science_atmospheric_command",
+                prediction.science_atmospheric_command_covariance,
+            ),
+            ("science_ho_command", prediction.science_ho_command_covariance),
+            ("uncorrected", prediction.science_tilt_covariance),
+            ("noiseless", prediction.noiseless_covariance),
+            ("atmospheric", prediction.atmospheric_residual_covariance),
+            ("ho", prediction.ho_correction),
+            ("noise", prediction.noise_command_covariance),
+            ("total", total),
+        ):
+            assert stored_prediction[name].attrs["unit"] == expected.unit.to_string()
+            np.testing.assert_array_equal(stored_prediction[name][...], expected.value)
+        for name, expected in (
+            ("feedback", prediction.feedback_matrix),
+            ("effective_feedback", prediction.interpolation_feedback_matrix),
+            ("strengths", prediction.interpolation_feedback_eigenvalues),
+            ("projectors", prediction.interpolation_feedback_projectors),
+            ("noise_scales", prediction.noise_covariance_scales),
+        ):
+            np.testing.assert_array_equal(stored_prediction[name][...], expected)
+        assert stored_prediction.attrs["symmetric_feedback_fallback"] == (
+            prediction.used_symmetric_feedback_approximation
+        )
+        assert stored_prediction.attrs["eigenbasis_condition"] == (
+            prediction.eigenbasis_condition_number
+        )
+        assert "used_symmetric_feedback_approximation" not in stored_prediction.attrs
+        assert "eigenbasis_condition_number" not in stored_prediction.attrs
+        assert not {
+            "interpolation_feedback_eigenvalues",
+            "interpolation_feedback_projectors",
+            "noise_covariance_scales",
+            "coma_response_coefficients",
+            "feedback_matrix",
+            "interpolation_feedback_matrix",
+            "reconstructor_noise_covariance",
+            "ngs_metrics",
+            "atmospheric_ho_command_covariance",
+            "science_atmospheric_command_covariance",
+            "science_ho_command_covariance",
+            "atmospheric_command_covariance",
+            "ho_command_covariance",
+            "sensing_gains",
+            "wfs_noise_variances",
+            "science_tilt_covariance",
+            "noiseless_covariance",
+            "atmospheric_residual_covariance",
+            "ho_correction",
+            "noise_command_covariance",
+            "_total",
+        } & stored_prediction.keys()
         assert "flux" not in root["result/ngs"]
     loaded = load_result(path)
     np.testing.assert_array_equal(loaded.psfs, result.psfs)
     np.testing.assert_array_equal(
-        loaded.lo_distribution.covariances, result.lo_distribution.covariances
+        loaded.distribution.covariances, result.distribution.covariances
+    )
+    for name in ("ee", "fwhm", "sr"):
+        np.testing.assert_array_equal(
+            getattr(loaded.e2e_prediction.ngs_metrics, name),
+            getattr(result.e2e_prediction.ngs_metrics, name),
+        )
+    loaded_distribution = loaded.e2e_prediction.distribution
+    predicted_distribution = result.e2e_prediction.distribution
+    np.testing.assert_array_equal(
+        loaded_distribution.weights, predicted_distribution.weights
+    )
+    np.testing.assert_array_equal(
+        loaded_distribution.covariances, predicted_distribution.covariances
     )
     for field in fields(result.e2e_prediction):
-        if field.name in ("metrics",):
+        if field.name in ("ngs_metrics", "distribution"):
             continue
         np.testing.assert_equal(
             getattr(loaded.e2e_prediction, field.name),
@@ -171,45 +248,24 @@ def test_calibrated_engine_matches_independent_mixture_and_roundtrip(
     assert np.linalg.norm(result.psfs - gaussian) / np.linalg.norm(result.psfs) > 1e-6
 
 
-@pytest.mark.parametrize(
-    "changes,error",
-    [
-        ({"mastsel_ini": "[telescope]"}, "mastsel_ini"),
-        ({"ngs_magnitude_zeropoint": 1 * u.photon / (u.m**2 * u.s)}, "photometry"),
-        (
-            {"ngs_magnitude": None, "ngs_flux": [1] * u.photon / u.s},
-            "require ngs_magnitude",
-        ),
-        ({"non_psd_policy": "clip"}, "non_psd_policy"),
-    ],
-)
-def test_request_rejects_cross_model_inputs(synthetic, changes, error):
-    _, record = synthetic
-    with pytest.raises(ValueError, match=error):
-        replace(request(record, [0]), **changes)
-
-
 def test_model_selection_is_explicit(synthetic):
     model, record = synthetic
     source = Science(np.float64)
     req = request(record, [0])
-    with pytest.raises(TypeError, match="requires e2e_model"):
+    mastsel = MastselModel(mastsel_ini="[telescope]", ngs_metrics=model.ngs_metrics)
+
+    with pytest.raises(TypeError, match="lo_model"):
         simulate(req, source)
-    with pytest.raises(ValueError, match="NGS metrics"):
-        simulate(req, source, model.ngs_metrics, e2e_model=model)
-    with pytest.raises(ValueError, match="MASTSEL execution"):
+    with pytest.raises(TypeError, match="lo_model"):
+        simulate(req, source, lo_model=LowOrderModel.E2E_CALIBRATED)
+    with pytest.raises(ValueError, match="requires ngs_magnitude"):
         simulate(
-            replace(
-                req,
-                lo_model="mastsel",
-                ngs_magnitude=None,
-                ngs_flux=[1] * u.photon / u.s,
-                mastsel_ini="[telescope]",
-            ),
+            replace(req, ngs_magnitude=None, ngs_flux=[1] * u.photon / u.s),
             source,
-            model.ngs_metrics,
-            e2e_model=model,
+            lo_model=model,
         )
+    with pytest.raises(ValueError, match="require ngs_magnitude_zeropoint"):
+        simulate(req, source, lo_model=mastsel)
 
 
 @pytest.mark.parametrize(
@@ -217,7 +273,7 @@ def test_model_selection_is_explicit(synthetic):
 )
 def test_result_rejects_corrupted_calibrated_state(synthetic, tmp_path, corrupt):
     model, record = synthetic
-    result = simulate(request(record, [0]), Science(np.float64), e2e_model=model)
+    result = simulate(request(record, [0]), Science(np.float64), lo_model=model)
     path = save_result(tmp_path / "result.h5", result)
     with h5py.File(path, "r+") as root:
         if corrupt == "weights":
@@ -240,21 +296,28 @@ def test_result_rejects_corrupted_calibrated_state(synthetic, tmp_path, corrupt)
 @pytest.mark.parametrize(
     "corrupt,error",
     [
-        ("feedback", "feedback must equal"),
+        ("feedback", "feedback_matrix must equal"),
         ("effective_feedback", "effective feedback"),
         ("projectors", "scalar decomposition"),
         ("strengths", "scalar decomposition"),
-        ("noise_prior_negative", "noise_prior must be symmetric positive semidefinite"),
+        ("total", "total covariance must equal noiseless plus noise"),
+        (
+            "noise_prior_negative",
+            "reconstructor_noise_covariance must be symmetric positive semidefinite",
+        ),
         (
             "atmospheric_command_negative",
-            "atmospheric_command must be symmetric positive semidefinite",
+            "atmospheric_command_covariance must be symmetric positive semidefinite",
         ),
-        ("ho_command_negative", "ho_command must be symmetric positive semidefinite"),
+        (
+            "ho_command_negative",
+            "ho_command_covariance must be symmetric positive semidefinite",
+        ),
         ("science_atmospheric_command", "atmospheric residual covariance disagrees"),
         ("science_ho_command", "HO covariance contribution disagrees"),
         (
             "noise_prior_asymmetric",
-            "noise_prior must be symmetric positive semidefinite",
+            "reconstructor_noise_covariance must be symmetric positive semidefinite",
         ),
     ],
 )
@@ -262,13 +325,13 @@ def test_result_rejects_inconsistent_scientific_diagnostics(
     synthetic, tmp_path, dtype, corrupt, error
 ):
     model, record = synthetic
-    result = simulate(request(record, [0, 8], dtype), Science(dtype), e2e_model=model)
+    result = simulate(request(record, [0, 8], dtype), Science(dtype), lo_model=model)
     path = save_result(tmp_path / "diagnostics.h5", result)
     with h5py.File(path, "r+") as root:
         state = root["result/e2e_prediction"]
         if corrupt in ("feedback", "projectors"):
             state[corrupt][...] = 0
-        elif corrupt in ("effective_feedback", "strengths"):
+        elif corrupt in ("effective_feedback", "strengths", "total"):
             state[corrupt][...] *= 2
         elif corrupt == "noise_prior_negative":
             state["noise_prior"][...] = -0.1 * np.eye(4)
@@ -285,11 +348,9 @@ def test_result_rejects_inconsistent_scientific_diagnostics(
 @pytest.mark.parametrize("dtype", [np.float32, np.float64])
 def test_result_rejects_nonprojectors_at_repeated_strengths(synthetic, tmp_path, dtype):
     model, record = synthetic
-    result = simulate(request(record, [0], dtype), Science(dtype), e2e_model=model)
-    np.testing.assert_array_equal(
-        result.e2e_prediction.strengths,
-        np.repeat(result.e2e_prediction.strengths[0], 2),
-    )
+    result = simulate(request(record, [0], dtype), Science(dtype), lo_model=model)
+    eigenvalues = result.e2e_prediction.interpolation_feedback_eigenvalues
+    np.testing.assert_array_equal(eigenvalues, np.repeat(eigenvalues[0], 2))
     path = save_result(tmp_path / "nonprojectors.h5", result)
     with h5py.File(path, "r+") as root:
         root["result/e2e_prediction/projectors"][...] = [2 * np.eye(2), -np.eye(2)]
@@ -344,7 +405,13 @@ def test_standalone_and_cli_are_native_free_and_analysis_is_self_contained(
     configured, tmp_path
 ):
     config = load_configuration(configured)
-    assert config.request.dtype == np.float64 and config.request.mastsel_ini is None
+    assert config.request.dtype == np.float64 and config.mastsel_ini is None
+    np.testing.assert_array_equal(
+        config.request.science_positions.to_value(u.arcsec), [[0, 0], [0, 1]]
+    )
+    np.testing.assert_array_equal(
+        config.request.ngs_positions.to_value(u.arcsec), [[-1, -1], [1, 1]]
+    )
     assert load_configuration(configured, dtype=np.float32).request.dtype == np.float32
     direct = run_configuration(configured)
     model_files = json.loads(direct.provenance["e2e_model_inputs"])
@@ -377,8 +444,8 @@ main([sys.argv[1],'--output',sys.argv[2]])
     (tmp_path / "science.pkl").unlink()
     (tmp_path / "metrics.pkl").unlink()
     np.testing.assert_array_equal(
-        load_result(tmp_path / "cli.h5").lo_distribution.covariances,
-        loaded.lo_distribution.covariances,
+        load_result(tmp_path / "cli.h5").distribution.covariances,
+        loaded.distribution.covariances,
     )
 
 
@@ -416,7 +483,7 @@ def test_legacy_mastsel_loads_without_model_or_distribution(version, tmp_path):
     np.testing.assert_array_equal(loaded.psfs, expected.psfs)
     np.testing.assert_array_equal(loaded.ctot_wavefront, expected.ctot_wavefront)
     np.testing.assert_array_equal(
-        loaded.lo_distribution.covariance, expected.ctot_angle
+        loaded.distribution.covariance, expected.ctot_angle
     )
 
 
@@ -432,7 +499,7 @@ def test_e2e_configuration_rejects_foreign_hybrid_fields(configured, field):
 
 def test_engine_result_owned_backing_and_unit_metadata(synthetic):
     model, record = synthetic
-    result = simulate(request(record, [0]), Science(np.float64), e2e_model=model)
+    result = simulate(request(record, [0]), Science(np.float64), lo_model=model)
     for owner, name in (
         (result, "psfs"),
         (result, "ctot_angle"),

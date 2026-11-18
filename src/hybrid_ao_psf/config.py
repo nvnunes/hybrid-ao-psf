@@ -7,6 +7,7 @@ from dataclasses import dataclass
 from io import StringIO
 from pathlib import Path
 
+import numpy as np
 from ao_models import (
     parse_ini,
     polar_to_cartesian,
@@ -31,7 +32,10 @@ class HybridConfiguration:
     """Resolved standalone configuration and its external file paths.
 
     Attributes:
-        request: Validated engine request derived from the combined INI file.
+        request: Validated observation derived from the combined INI file.
+        lo_model: Model selected by the INI for standalone execution.
+        mastsel_ini: MASTSEL configuration text for MASTSEL runs.
+        non_psd_policy: Covariance conditioning policy for MASTSEL.
         science_psf_file: Science high-order PSF provider file.
         ngs_metric_file: External MASTSEL metric provider path; None for E2E,
             whose metrics belong to the loaded calibrated model.
@@ -46,7 +50,10 @@ class HybridConfiguration:
     ngs_metric_file: Path | None
     output: Path
     source: Path
+    lo_model: LowOrderModel
     e2e_configuration: Path | None = None
+    mastsel_ini: str | None = None
+    non_psd_policy: NonPsdPolicy = NonPsdPolicy.ERROR
 
 
 def load_configuration(
@@ -140,24 +147,23 @@ def load_configuration(
     _mastsel_parser(mastsel_sections).write(stream)
     request = HybridRequest(
         dtype=hybrid.get("precision", "float32") if dtype is None else dtype,
-        science_x=science_x * u.arcsec,
-        science_y=science_y * u.arcsec,
-        ngs_x=ngs_x * u.arcsec,
-        ngs_y=ngs_y * u.arcsec,
+        science_positions=np.column_stack((science_x, science_y)) * u.arcsec,
+        ngs_positions=np.column_stack((ngs_x, ngs_y)) * u.arcsec,
         ngs_flux=ngs_flux * (u.photon / u.s),
         wavelength=float(wavelength_values[0]) * u.m,
         zenith_angle=read_ini_scalar(
             parser["telescope"], "ZenithAngle", label="telescope.ZenithAngle"
         )
         * u.deg,
-        mastsel_ini=stream.getvalue(),
-        non_psd_policy=hybrid.get("non_psd_policy", NonPsdPolicy.ERROR.value),
         diagnostics_level=hybrid.get("diagnostics_level", DiagnosticsLevel.NONE.value),
     )
-    # Keep the immutable options outside the public dataclass fields.
-    object.__setattr__(request, "_mastsel_sections", mastsel_sections)
     return HybridConfiguration(
         request=request,
+        lo_model=LowOrderModel.MASTSEL,
+        mastsel_ini=stream.getvalue(),
+        non_psd_policy=NonPsdPolicy(
+            hybrid.get("non_psd_policy", NonPsdPolicy.ERROR.value)
+        ),
         science_psf_file=_resolved_path(
             hybrid,
             "science_psf_file",
@@ -195,21 +201,15 @@ def _load_calibrated_configuration(parser, source, dtype):
             f"unsupported E2E [hybrid] keys: {sorted(unknown)}; precision belongs in [e2e]"
         )
     calibrated = _read_e2e_calibration_configuration(parser, source)
+    policy = NonPsdPolicy(hybrid.get("non_psd_policy", NonPsdPolicy.ERROR.value))
+    if policy is not NonPsdPolicy.ERROR:
+        raise ValueError(
+            "E2E-calibrated configuration requires non_psd_policy = error."
+        )
     request = HybridRequest(
-        lo_model=LowOrderModel.E2E_CALIBRATED,
         dtype=calibrated.dtype if dtype is None else dtype,
-        science_x=read_ini_array(
-            hybrid, "science_x_arcsec", label="hybrid.science_x_arcsec"
-        )
-        * u.arcsec,
-        science_y=read_ini_array(
-            hybrid, "science_y_arcsec", label="hybrid.science_y_arcsec"
-        )
-        * u.arcsec,
-        ngs_x=read_ini_array(hybrid, "ngs_x_arcsec", label="hybrid.ngs_x_arcsec")
-        * u.arcsec,
-        ngs_y=read_ini_array(hybrid, "ngs_y_arcsec", label="hybrid.ngs_y_arcsec")
-        * u.arcsec,
+        science_positions=_read_cartesian_positions(hybrid, "science"),
+        ngs_positions=_read_cartesian_positions(hybrid, "ngs"),
         ngs_magnitude=read_ini_array(
             hybrid, "ngs_magnitude", label="hybrid.ngs_magnitude"
         )
@@ -223,18 +223,28 @@ def _load_calibrated_configuration(parser, source, dtype):
         )
         * u.deg,
         diagnostics_level=hybrid.get("diagnostics_level", DiagnosticsLevel.NONE.value),
-        non_psd_policy=hybrid.get("non_psd_policy", NonPsdPolicy.ERROR.value),
     )
     if not calibrated.science_psf.is_file():
         raise FileNotFoundError(f"science PSF file not found: {calibrated.science_psf}")
     return HybridConfiguration(
         request=request,
+        lo_model=LowOrderModel.E2E_CALIBRATED,
         science_psf_file=calibrated.science_psf,
         ngs_metric_file=None,
         output=_resolved_path(hybrid, "output", source=source, must_exist=False),
         source=source,
         e2e_configuration=source,
     )
+
+
+def _read_cartesian_positions(section, field: str) -> u.Quantity:
+    """Read the INI's x and y vectors as a single array of angular pairs."""
+    x_key, y_key = f"{field}_x_arcsec", f"{field}_y_arcsec"
+    x = read_ini_array(section, x_key, label=f"hybrid.{x_key}")
+    y = read_ini_array(section, y_key, label=f"hybrid.{y_key}")
+    if x.shape != y.shape:
+        raise ValueError(f"hybrid.{x_key} and hybrid.{y_key} must have the same length.")
+    return np.column_stack((x, y)) * u.arcsec
 
 
 def _resolved_path(section, option, *, source, must_exist=True) -> Path:

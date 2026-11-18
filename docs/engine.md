@@ -1,10 +1,8 @@
 # Engine
 
 `simulate()` accepts one `HybridRequest`, `science_psfs` implementing
-`PsfProvider`, and either `ngs_metrics` implementing `PsfMetricProvider`
-for MASTSEL or an
-`E2ECalibratedModel` for E2E. `request.lo_model` selects the path explicitly;
-MASTSEL remains the default. It returns one
+`PsfProvider`, and an explicit `lo_model`. Pass a `MastselModel` with its
+NGS metric provider or a loaded `E2ECalibratedModel`. It returns one
 immutable `HybridResult` and retains no mutable run state. Loading and provider
 reuse remain the caller's responsibility, so fitted products can be reused
 efficiently across repeated simulations.
@@ -36,7 +34,7 @@ Both paths use the provider-owned pixel scale, physical x/y axes and the same
 finite-field FFT/crop on a private selected-precision PSF copy. The crop is not renormalized. Energy blurred beyond the retained
 PSF support remains absent from the result.
 
-The optional `ctot_correction` receives baseline Ctot and a transient context
+The optional `MastselModel.ctot_correction` receives baseline Ctot and a transient context
 with the same live MASTSEL instance. The engine owns the temporary configuration
 through calculation and correction, with unconditional cleanup. Its private
 MASTSEL adapter captures covariance/reconstructor returns during the baseline

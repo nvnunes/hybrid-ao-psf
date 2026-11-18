@@ -61,6 +61,7 @@ from ._covariance_calibration import (
 )
 from ._e2e_model import E2ECalibratedModel, load_e2e_calibrated_model
 from ._e2e_prediction import E2ELowOrderPrediction
+from ._mastsel import MastselModel
 from ._noise_blur import NoiseBlurModel
 from ._reconstructor_calibration import (
     ReconstructorCalibrationMeasurements,
@@ -156,6 +157,7 @@ __all__ = [  # noqa: RUF022
     # Simulation requests, execution and results
     "HybridRequest",
     "LowOrderModel",
+    "MastselModel",
     "NonPsdPolicy",
     "DiagnosticsLevel",
     "HybridConfiguration",

@@ -4,32 +4,26 @@ This guide defines the supported public Python surface of Hybrid AO PSF.
 
 ## Requests And Providers
 
-`HybridRequest` is the single simulation input. Its constructor is keyword-only,
-with the NGS flux, magnitude, and zeropoint fields grouped after `ngs_y`.
-Cartesian science and NGS coordinates, physical scalars, and NGS inputs are
-Astropy quantities.
-Array-valued inputs are copied and exposed read-only. `lo_model` accepts
-`LowOrderModel.MASTSEL` (the default) or `LowOrderModel.E2E_CALIBRATED`, also
-available as `"mastsel"` and `"e2e-calibrated"`.
+`HybridRequest` describes the observation and requested diagnostics. Its
+keyword-only inputs use Astropy quantities. Supply `science_positions` and
+`ngs_positions` as angular arrays of shape `(N, 2)`, with an `(x, y)` pair per
+row. Supply either effective `ngs_flux` in `photon / s` or one `ngs_magnitude`
+in `mag` per NGS row, in the same order. Array inputs are read-only copies.
 
-MASTSEL requests require INI text plus the selected non-PSD and diagnostics
-policies. The engine reads `RTC.SensorFrameRate_LO` from that INI for every active NGS.
-Supply exactly one of `ngs_flux` (effective `photon / s`) or
-`ngs_magnitude` (one `mag` value per active NGS). Magnitudes require a
-positive, scalar `ngs_magnitude_zeropoint` in `photon / (m2 s)` supplied by
-the caller, not stored in the MASTSEL INI. The engine uses
+Pass a `MastselModel` or `E2ECalibratedModel` as `lo_model` to `simulate()`.
+`MastselModel` holds the INI text, NGS metric provider, non-PSD policy and
+optional covariance correction. For magnitudes, set the model's positive scalar
+`ngs_magnitude_zeropoint` in `photon / (m2 s)`. The engine uses
 `telescope.TelescopeDiameter`, the first `sensor_LO.NumberLenslets` value,
 and `RTC.SensorFrameRate_LO` with NGS Photometry to resolve effective flux
 once before MASTSEL.
 
-E2E requests require magnitudes and use the calibrated model's photometry.
-They reject MASTSEL INI text, flux, an external magnitude zeropoint and the
-`clip` policy. Product selection remains the caller's responsibility.
+E2E-Calibrated takes magnitudes and supplies its own NGS metrics and photometry.
 Coordinates, Ctot axes, and PSF image orientation follow the
 [coordinate contract](architecture.md#coordinate-and-image-orientation).
 
-`simulate()` accepts `science_psfs` implementing `PsfProvider` and,
-for MASTSEL, `ngs_metrics` implementing `PsfMetricProvider`. These contracts
+`simulate()` accepts `science_psfs` implementing `PsfProvider`. A `MastselModel`
+accepts `ngs_metrics` implementing `PsfMetricProvider`. These contracts
 define the requested coordinates and the returned images or metrics.
 The source of the data belongs to the implementation. Both contracts expose
 `evaluate()` for requested coordinates. Build or load an interpolator, then
@@ -57,8 +51,8 @@ stages, physical conventions, configuration and product contracts.
 `E2ECalibratedModel` owns prepared calibrated prediction independently of
 `E2ECalibration`. `load_e2e_calibrated_model()` loads its complete shared INI
 inputs; `model.predict()` returns an immutable `E2ELowOrderPrediction` containing
-component covariances, feedback diagnostics and displacement-mixture parameters.
-This operation calculates LO motion only. See [Calibrated LO prediction](e2e-model.md)
+component covariances, feedback diagnostics and a `LowOrderDistribution` at
+`prediction.distribution`. This operation calculates LO motion only. See [Calibrated LO prediction](e2e-model.md)
 for loading, support, units and the boundary with complete PSF simulation.
 
 ## Results
@@ -66,9 +60,10 @@ for loading, support, units and the boundary with complete PSF simulation.
 `HybridResult` is the immutable standard result. It carries the final
 selected-precision PSF cube, neutral `ao_stats.PsfMetadata`, NGS
 metrics, angular Ctot, frame rates, jitter, PSD-clipping mask, provenance, model
-identity and the applied `LowOrderDistribution`. Its weights and covariances
-have shapes `(component,)` and `(science, component, 2, 2)`; their weighted
-covariance equals angular Ctot. Execution records field/NGS positions and ZA.
+identity and the applied `LowOrderDistribution` at `result.distribution`. Its
+weights and covariances have shapes `(component,)` and
+`(science, component, 2, 2)`. Their weighted covariance equals angular Ctot.
+Execution records field/NGS positions and ZA.
 MASTSEL additionally retains wavefront Ctot, angular conversion, effective flux
 and INI, and optional supplied magnitudes/zeropoint. Those MASTSEL-only fields
 are `None` for E2E, which instead retains magnitudes and a complete
@@ -84,10 +79,8 @@ contract described in [Result files](results.md).
 
 ## Simulation
 
-`simulate(request, science_psfs, ngs_metrics=None, *, ctot_correction=None,
-e2e_model=None)` is the one stateless scientific operation. MASTSEL requires
-`ngs_metrics`; E2E requires `e2e_model` and rejects an external NGS provider or
-correction callback. The engine evaluates the selected LO prediction, applies
+`simulate(request, science_psfs, lo_model=model)` runs one observation.
+The engine evaluates the selected LO prediction, applies
 the corresponding Gaussian or full mixture blur, derives jitter and returns
 `HybridResult`. Providers are borrowed and
 may be reused across calls. See [Engine](engine.md) for the Ctot and diagnostic
@@ -95,16 +88,17 @@ policies.
 
 ### Covariance Corrections
 
-On the MASTSEL path, supply a `HybridCtotCorrection` to replace the field-wide baseline covariance
-before conditioning and the existing single Gaussian blur. The callable receives
+Set `MastselModel.ctot_correction` to a `HybridCtotCorrection` to replace the
+field-wide baseline covariance before conditioning and Gaussian blur. The callable receives
 `(Nscience, 2, 2)` unconditioned Ctot in `nm2` and a `HybridCtotContext`.
 Return a new Quantity convertible to `nm2` with the same shape/order, or `None`
 for no change. Do not mutate inputs. Exceptions propagate; the engine still owns
 PSD conditioning, convolution and all result diagnostics.
 
 The context borrows the live MASTSEL runtime until the callback returns. It
-contains the resolved request, interpolated NGS metrics, effective flux and
-frame rates, effective INI, and angular-to-wavefront scale. Its
+contains the observation request, interpolated NGS metrics, effective flux and
+frame rates, the zeropoint used for magnitude inputs, the effective INI and
+the angular-to-wavefront scale. Its
 `HybridMastselStatistics` contains read-only Css, Cas, centre Cas, exact
 science-position reconstructor blocks and filtered NGS measurement-noise
 covariance. Covariances are in `nm2`, axes are interleaved NGS `(x, y)`, and
@@ -122,6 +116,7 @@ First build the sample products from the project root:
 ```python
 from hybrid_ao_psf import (
     HybridCtotCorrection,
+    MastselModel,
     load_configuration,
     load_psf_metric_interpolator,
     load_psf_interpolator,
@@ -133,12 +128,14 @@ correction = HybridCtotCorrection(
     apply=lambda ctot, context: 2 * ctot,
     provenance={"ctot_scale": "2"},
 )
-result = simulate(
-    configuration.request,
-    load_psf_interpolator(configuration.science_psf_file),
-    load_psf_metric_interpolator(configuration.ngs_metric_file),
+model = MastselModel(
+    mastsel_ini=configuration.mastsel_ini,
+    ngs_metrics=load_psf_metric_interpolator(configuration.ngs_metric_file),
+    non_psd_policy=configuration.non_psd_policy,
     ctot_correction=correction,
 )
+science = load_psf_interpolator(configuration.science_psf_file)
+result = simulate(configuration.request, science, lo_model=model)
 ```
 
 The definition copies/freezes its string-to-string provenance. The engine

@@ -44,9 +44,9 @@ package-root OTF helpers are the supported numerical primitives for external
 finite-field blur comparisons; other numerical helpers remain private.
 
 Physical values use Astropy quantities. Public requests and results are
-immutable typed objects. One simulation call accepts one request and
-PSF and metric providers and returns one result; orchestration and
-provider reuse belong to the caller.
+immutable typed objects. A simulation call accepts an observation request,
+a science PSF provider and a low-order model. Orchestration and provider reuse
+belong to the caller.
 
 The science provider owns its PSF pixel scale and metadata. The engine uses
 that scale for blur and preserves it in the result; it does not relabel or
@@ -55,9 +55,9 @@ state behind read-only interfaces so reuse cannot be altered through exposed
 SciPy objects or writable arrays.
 
 The public contract names are `HybridRequest`, `PsfProvider`,
-`PsfMetricProvider`, `HybridResult`, and `HybridDiagnostics`. `LowOrderModel`
-selects the LO peer; `LowOrderDistribution` records the applied centred Gaussian
-mixture in angular x/y coordinates. Provider
+`PsfMetricProvider`, `HybridResult`, and `HybridDiagnostics`. The `LowOrderModel`
+enum identifies the model in configuration and results. `LowOrderDistribution`
+records the applied centred Gaussian mixture in angular x/y coordinates. Provider
 predictions use `PsfPrediction` and `PsfMetricPrediction`. The
 read-only concrete provider types are
 `PsfInterpolator` and `PsfMetricInterpolator`. `PsfFileProvider` reads
@@ -80,10 +80,10 @@ models and calibration selection stay with the caller. The engine invokes the
 callback before conditioning and its single Gaussian blur; it persists only the
 supplied static provenance. See the [API guide](api.md#covariance-corrections).
 
-`simulate()` is the sole complete scientific simulation path. It is stateless,
-borrows its immutable providers, dispatches the explicitly selected LO model, and
-returns a new result. `simulate_configuration()`, `run_configuration()`, and the
-CLI call this operation rather than defining separate scientific behavior.
+`simulate()` borrows its immutable providers, dispatches the supplied
+`MastselModel` or `E2ECalibratedModel` and returns a new result.
+`simulate_configuration()` constructs the model selected by the INI and calls
+the same operation for Python and CLI execution.
 The MASTSEL path reads the active NGS frame rate from `RTC.SensorFrameRate_LO` in the
 effective MASTSEL configuration and reports the applied rates in the result.
 For magnitude requests it also reads `telescope.TelescopeDiameter` and the
@@ -133,8 +133,9 @@ with a science provider. See
 
 ## Coordinate And Image Orientation
 
-Request and field coordinates are Cartesian `(x, y)` pairs in arcseconds.
-Hybrid passes science and NGS pairs to MASTSEL in that order. Each Ctot matrix
+`HybridRequest.science_positions` and `HybridRequest.ngs_positions` are
+Cartesian angular arrays with one `(x, y)` pair per row. Hybrid stores the
+pairs in arcseconds and passes them to MASTSEL in that order. Each Ctot matrix
 uses `(x, y)` on both axes: element `[0, 0]` is x variance, `[1, 1]` is
 y variance, and `[0, 1]` is x/y covariance. PSF cubes have shape
 `(N, y, x)`. Increasing column index points toward `+x`; increasing row

@@ -8,6 +8,7 @@ from pathlib import Path
 from numpy.typing import DTypeLike
 
 from ._e2e_model import load_e2e_calibrated_model
+from ._mastsel import MastselModel
 from .config import HybridConfiguration, load_configuration
 from .contracts import HybridResult, LowOrderModel
 from .engine import simulate
@@ -37,18 +38,21 @@ def simulate_configuration(configuration: HybridConfiguration) -> HybridResult:
     if not isinstance(configuration, HybridConfiguration):
         raise TypeError("configuration must be a HybridConfiguration.")
     science_psfs = load_psf_interpolator(configuration.science_psf_file)
-    if configuration.request.lo_model is LowOrderModel.E2E_CALIBRATED:
+    if configuration.lo_model is LowOrderModel.E2E_CALIBRATED:
         if configuration.e2e_configuration is None:
             raise ValueError("E2E configuration requires its shared model INI")
         model = load_e2e_calibrated_model(
             configuration.e2e_configuration, dtype=configuration.request.dtype
         )
-        result = simulate(configuration.request, science_psfs, e2e_model=model)
     else:
-        if configuration.ngs_metric_file is None:
-            raise ValueError("MASTSEL configuration requires NGS metrics")
-        ngs_metrics = load_psf_metric_interpolator(configuration.ngs_metric_file)
-        result = simulate(configuration.request, science_psfs, ngs_metrics)
+        if configuration.ngs_metric_file is None or configuration.mastsel_ini is None:
+            raise ValueError("MASTSEL configuration requires its INI and NGS metrics")
+        model = MastselModel(
+            mastsel_ini=configuration.mastsel_ini,
+            ngs_metrics=load_psf_metric_interpolator(configuration.ngs_metric_file),
+            non_psd_policy=configuration.non_psd_policy,
+        )
+    result = simulate(configuration.request, science_psfs, lo_model=model)
     return replace(
         result,
         provenance={

@@ -13,7 +13,6 @@ from dataclasses import replace
 from io import StringIO
 
 import numpy as np
-from ao_models import parse_ini
 from astropy import units as u
 from ngs_photometry import (
     WFSPhotometryConfig,
@@ -24,6 +23,7 @@ from scipy.fft import fft2, ifft2
 
 from ._e2e_model import E2ECalibratedModel
 from ._mastsel import (
+    MastselModel,
     _capture_mastsel,
     _complete_mastsel_context,
     _compute_mastsel_ctot,
@@ -31,7 +31,6 @@ from ._mastsel import (
 )
 from ._units import quantity_value
 from ._validation import validate_psf_dtype
-from .config import _mastsel_parser
 from .contracts import (
     CTOT_PSD_TOLERANCE_NM2,
     DiagnosticsLevel,
@@ -48,6 +47,7 @@ from .contracts import (
     PsfProvider,
     _ctot_angle_summaries,
     _jitter_from_ctot,
+    _positive_scalar,
     _psd_valid_mask,
 )
 from .interpolation import PsfInterpolator, PsfMetricInterpolator
@@ -59,31 +59,24 @@ from .psf_files import PsfFileProvider
 def _validate_simulation_inputs(
     request: HybridRequest,
     science_psfs: PsfProvider,
-    ngs_metrics: PsfMetricProvider | None,
-    ctot_correction: HybridCtotCorrection | None,
-    e2e_model: E2ECalibratedModel | None,
+    lo_model: MastselModel | E2ECalibratedModel,
 ) -> None:
-    """Check that the request and providers agree on the low-order model."""
+    """Check the observation against the selected model before evaluation."""
     if not isinstance(request, HybridRequest):
         raise TypeError("request must be a HybridRequest.")
     if not isinstance(science_psfs, PsfProvider):
         raise TypeError("science_psfs must implement PsfProvider.")
-    if request.lo_model is LowOrderModel.MASTSEL:
-        if not isinstance(ngs_metrics, PsfMetricProvider):
-            raise TypeError("ngs_metrics must implement PsfMetricProvider.")
-        if e2e_model is not None:
-            raise ValueError("MASTSEL execution does not accept e2e_model")
+    if isinstance(lo_model, MastselModel):
+        if (
+            request.ngs_magnitude is not None
+            and lo_model.ngs_magnitude_zeropoint is None
+        ):
+            raise ValueError("MASTSEL magnitudes require ngs_magnitude_zeropoint.")
+    elif isinstance(lo_model, E2ECalibratedModel):
+        if request.ngs_magnitude is None:
+            raise ValueError("E2E-calibrated prediction requires ngs_magnitude.")
     else:
-        if not isinstance(e2e_model, E2ECalibratedModel):
-            raise TypeError("E2E-calibrated execution requires e2e_model")
-        if ngs_metrics is not None or ctot_correction is not None:
-            raise ValueError(
-                "E2E-calibrated execution owns its NGS metrics and does not accept a Ctot correction"
-            )
-    if ctot_correction is not None and not isinstance(
-        ctot_correction, HybridCtotCorrection
-    ):
-        raise TypeError("ctot_correction must be HybridCtotCorrection or None.")
+        raise TypeError("lo_model must be a MastselModel or E2ECalibratedModel.")
 
 
 def _simulation_provenance(
@@ -125,10 +118,10 @@ def _evaluate_science_psfs(
     science = science_psfs.evaluate(
         zenith_angle=request.zenith_angle,
         wavelength=request.wavelength,
-        x=request.science_x,
-        y=request.science_y,
+        x=request.science_positions[:, 0],
+        y=request.science_positions[:, 1],
     )
-    if science.psfs.shape[0] != request.science_x.size:
+    if science.psfs.shape[0] != len(request.science_positions):
         raise ValueError("Science provider output length does not match the request.")
     return science
 
@@ -139,22 +132,24 @@ def _evaluate_science_psfs(
 def _simulate_mastsel(
     request: HybridRequest,
     science: PsfPrediction,
-    ngs_metrics: PsfMetricProvider,
-    ctot_correction: HybridCtotCorrection | None,
+    model: MastselModel,
     provenance: dict[str, str],
 ) -> HybridResult:
     """Evaluate the MASTSEL covariance and apply its conditioned Gaussian blur."""
+    ngs_metrics = _provider_at_precision(model.ngs_metrics, request.dtype)
     metrics = ngs_metrics.evaluate(
         zenith_angle=request.zenith_angle,
-        x=request.ngs_x,
-        y=request.ngs_y,
+        x=request.ngs_positions[:, 0],
+        y=request.ngs_positions[:, 1],
     )
-    if metrics.ee.size != request.ngs_x.size:
+    if metrics.ee.size != len(request.ngs_positions):
         raise ValueError("NGS provider output length does not match the request.")
 
     science = replace(science, dtype=request.dtype)
     metrics = replace(metrics, dtype=request.dtype)
-    parser, ngs_frame_rate, ngs_flux = _resolve_effective_mastsel(request)
+    parser, ngs_frame_rate, ngs_flux, zeropoint = _resolve_effective_mastsel(
+        request, model
+    )
     stream = StringIO()
     parser.write(stream)
     effective_ini = stream.getvalue()
@@ -165,11 +160,12 @@ def _simulate_mastsel(
         effective_ini,
         ngs_frame_rate,
         ngs_flux,
-        ctot_correction,
+        zeropoint,
+        model.ctot_correction,
     )
     ctot_wavefront, psd_clipped = condition_ctot(
         ctot_raw,
-        policy=request.non_psd_policy,
+        policy=model.non_psd_policy,
         dtype=request.dtype,
     )
     angle_to_wavefront_scale = u.Quantity(angle_to_wavefront_scale, dtype=request.dtype)
@@ -203,19 +199,15 @@ def _simulate_mastsel(
         angle_to_wavefront_scale=angle_to_wavefront_scale,
         ngs_flux=ngs_flux,
         ngs_magnitude=request.ngs_magnitude,
-        ngs_magnitude_zeropoint=request.ngs_magnitude_zeropoint,
+        ngs_magnitude_zeropoint=zeropoint,
         ngs_frame_rate=ngs_frame_rate,
         jitter=_jitter_from_ctot(ctot_angle),
         effective_mastsel_ini=effective_ini,
         psd_clipped=psd_clipped,
         provenance=provenance,
         diagnostics=diagnostics,
-        science_positions=np.column_stack(
-            (request.science_x.value, request.science_y.value)
-        )
-        * u.arcsec,
-        ngs_positions=np.column_stack((request.ngs_x.value, request.ngs_y.value))
-        * u.arcsec,
+        science_positions=request.science_positions,
+        ngs_positions=request.ngs_positions,
         zenith_angle=request.zenith_angle,
     )
 
@@ -227,11 +219,18 @@ def _predict_mastsel_ctot(
     effective_ini: str,
     ngs_frame_rate: u.Quantity,
     ngs_flux: u.Quantity,
+    ngs_magnitude_zeropoint: u.Quantity | None,
     ctot_correction: HybridCtotCorrection | None,
 ) -> tuple[u.Quantity, u.Quantity]:
     """Use the live runtime for covariance prediction and the optional callback."""
     with _prepare_mastsel_context(
-        request, metrics, parser, effective_ini, ngs_frame_rate, ngs_flux
+        request,
+        metrics,
+        parser,
+        effective_ini,
+        ngs_frame_rate,
+        ngs_flux,
+        ngs_magnitude_zeropoint,
     ) as context:
         if ctot_correction is None:
             ctot_raw = _compute_mastsel_ctot(context)
@@ -240,7 +239,7 @@ def _predict_mastsel_ctot(
                 ctot_raw = _compute_mastsel_ctot(context)
             context = _complete_mastsel_context(context, captured)
         validate_ctot_shape(
-            ctot_raw, expected_size=request.science_x.size, label="MASTSEL Ctot"
+            ctot_raw, expected_size=len(request.science_positions), label="MASTSEL Ctot"
         )
         angle_to_wavefront_scale = context.angle_to_wavefront_scale
         ctot_raw = u.Quantity(ctot_raw, dtype=request.dtype)
@@ -250,7 +249,7 @@ def _predict_mastsel_ctot(
             if corrected is not None:
                 validate_ctot_shape(
                     corrected,
-                    expected_size=request.science_x.size,
+                    expected_size=len(request.science_positions),
                     label="Corrected Ctot",
                 )
                 ctot_raw = corrected.to(u.nm**2)
@@ -269,21 +268,13 @@ def _simulate_calibrated(
     """Apply the validated calibrated distribution without extra conditioning."""
     model = model.prepare(dtype=request.dtype)
     science = replace(science, dtype=request.dtype)
-    positions = np.column_stack((request.ngs_x.value, request.ngs_y.value)) * u.arcsec
-    field = (
-        np.column_stack((request.science_x.value, request.science_y.value)) * u.arcsec
-    )
     prediction = model.predict(
-        ngs_positions=positions,
-        magnitudes=request.ngs_magnitude,
-        science_positions=field,
+        ngs_positions=request.ngs_positions,
+        ngs_magnitude=request.ngs_magnitude,
+        science_positions=request.science_positions,
         zenith_angle=request.zenith_angle,
     )
-    distribution = LowOrderDistribution(
-        weights=prediction.mixture_weights,
-        covariances=prediction.mixture_covariances,
-        dtype=request.dtype,
-    )
+    distribution = prediction.distribution
     pre_blur = science.psfs.copy()
     psfs = pre_blur.copy()
     _apply_displacement_mixture(psfs, distribution, science.pixel_scale, request.dtype)
@@ -300,7 +291,7 @@ def _simulate_calibrated(
     provenance = _calibrated_provenance(model, provenance)
     rate = (
         np.full(
-            len(positions),
+            len(request.ngs_positions),
             model.covariance.controller.frame_rate.to_value(u.Hz),
             dtype=request.dtype,
         )
@@ -310,7 +301,7 @@ def _simulate_calibrated(
         dtype=request.dtype,
         psfs=psfs,
         metadata=science.metadata,
-        ngs_metrics=prediction.metrics,
+        ngs_metrics=prediction.ngs_metrics,
         ctot_wavefront=None,
         ctot_angle=total,
         angle_to_wavefront_scale=None,
@@ -318,15 +309,15 @@ def _simulate_calibrated(
         ngs_frame_rate=rate,
         jitter=_jitter_from_ctot(total),
         effective_mastsel_ini=None,
-        psd_clipped=np.zeros(len(field), dtype=bool),
+        psd_clipped=np.zeros(len(request.science_positions), dtype=bool),
         provenance=provenance,
         diagnostics=diagnostics,
         ngs_magnitude=request.ngs_magnitude,
-        lo_model=request.lo_model,
-        lo_distribution=distribution,
+        lo_model=LowOrderModel.E2E_CALIBRATED,
+        distribution=distribution,
         e2e_prediction=prediction,
-        science_positions=field,
-        ngs_positions=positions,
+        science_positions=request.science_positions,
+        ngs_positions=request.ngs_positions,
         zenith_angle=request.zenith_angle,
     )
 
@@ -453,12 +444,10 @@ def condition_ctot(
 
 def _resolve_effective_mastsel(
     request: HybridRequest,
-) -> tuple[ConfigParser, u.Quantity, u.Quantity]:
-    """Resolve the effective MASTSEL options, frame rates, and effective flux."""
-    sections = getattr(request, "_mastsel_sections", None)
-    parser = (
-        parse_ini(request.mastsel_ini) if sections is None else _mastsel_parser(sections)
-    )
+    model: MastselModel,
+) -> tuple[ConfigParser, u.Quantity, u.Quantity, u.Quantity | None]:
+    """Resolve MASTSEL options, frame rates, effective flux and its zeropoint."""
+    parser = model._copy_ini()
     for section in ("telescope", "sources_LO"):
         if not parser.has_section(section):
             raise ValueError(f"MASTSEL configuration requires [{section}].")
@@ -477,8 +466,8 @@ def _resolve_effective_mastsel(
     parser["telescope"]["ZenithAngle"] = _format_scalar(
         request.zenith_angle.to_value(u.deg)
     )
-    science_r, science_theta = _cartesian_to_polar(request.science_x, request.science_y)
-    ngs_r, ngs_theta = _cartesian_to_polar(request.ngs_x, request.ngs_y)
+    science_r, science_theta = _cartesian_to_polar(request.science_positions)
+    ngs_r, ngs_theta = _cartesian_to_polar(request.ngs_positions)
     parser["sources_science"]["Wavelength"] = _format_array(
         np.asarray([request.wavelength.to_value(u.m)])
     )
@@ -491,9 +480,10 @@ def _resolve_effective_mastsel(
         if lenslets.size == 0:
             raise ValueError("sensor_LO.NumberLenslets must not be empty.")
         parser["sensor_LO"]["NumberLenslets"] = _format_array(
-            np.full(request.ngs_x.size, lenslets[0], dtype=float)
+            np.full(len(request.ngs_positions), lenslets[0], dtype=float)
         )
-    ngs_frame_rate = np.full(request.ngs_x.size, frame_rate, dtype=float) * u.Hz
+    ngs_frame_rate = np.full(len(request.ngs_positions), frame_rate, dtype=float) * u.Hz
+    zeropoint = None
     if request.ngs_flux is not None:
         ngs_flux = request.ngs_flux
     else:
@@ -515,23 +505,28 @@ def _resolve_effective_mastsel(
         lenslets = _parse_numeric_array(parser["sensor_LO"]["NumberLenslets"])
         if lenslets.size == 0:
             raise ValueError("sensor_LO.NumberLenslets must not be empty.")
+        zeropoint = _positive_scalar(
+            model.ngs_magnitude_zeropoint,
+            u.photon / (u.m**2 * u.s),
+            "ngs_magnitude_zeropoint",
+            dtype=request.dtype,
+        )
         photometry = WFSPhotometryConfig(
             telescope_diameter=diameter * u.m,
             n_channels=float(lenslets[0]),
             frame_rate=frame_rate * u.Hz,
-            zeropoint=request.ngs_magnitude_zeropoint,
+            zeropoint=zeropoint,
         )
         ngs_flux = magnitudes_to_effective_photons_per_second(
             request.ngs_magnitude, photometry
         )
         if np.any(ngs_flux.to_value(u.photon / u.s) <= 0.0):
             raise ValueError("ngs_magnitude resolves to non-positive ngs_flux.")
-    return parser, ngs_frame_rate, ngs_flux
+    return parser, ngs_frame_rate, ngs_flux, zeropoint
 
 
-def _cartesian_to_polar(x: u.Quantity, y: u.Quantity) -> tuple[u.Quantity, u.Quantity]:
-    x_value = x.to_value(u.arcsec)
-    y_value = y.to_value(u.arcsec)
+def _cartesian_to_polar(positions: u.Quantity) -> tuple[u.Quantity, u.Quantity]:
+    x_value, y_value = positions.to_value(u.arcsec).T
     radius = np.hypot(x_value, y_value)
     theta = np.mod(np.rad2deg(np.arctan2(y_value, x_value)), 360.0)
     theta[radius == 0.0] = 0.0
@@ -853,10 +848,8 @@ def blur_psfs_with_ctot(
 def simulate(
     request: HybridRequest,
     science_psfs: PsfProvider,
-    ngs_metrics: PsfMetricProvider | None = None,
     *,
-    ctot_correction: HybridCtotCorrection | None = None,
-    e2e_model: E2ECalibratedModel | None = None,
+    lo_model: MastselModel | E2ECalibratedModel,
 ) -> HybridResult:
     """Run the selected low-order model and blur one field of science PSFs.
 
@@ -867,19 +860,13 @@ def simulate(
     independent result arrays.
 
     Args:
-        request: Science coordinates, asterism and selected low-order model.
-            MASTSEL requires its INI with effective flux or magnitudes and
-            their zeropoint. E2E-Calibrated requires calibrated-convention
-            magnitudes.
+        request: Science field and asterism for one observation. Supply
+            effective photon rates or magnitudes for MASTSEL, and magnitudes
+            in the calibrated convention for E2E-Calibrated.
         science_psfs: Image provider evaluated at the science coordinates,
             zenith angle and wavelength of the request.
-        ngs_metrics: Metric provider required for MASTSEL. Pass ``None`` for
-            E2E-Calibrated, which supplies its own NGS metrics.
-        ctot_correction: Optional MASTSEL callback. It receives unconditioned
-            wavefront covariance and a transient runtime context. It may
-            return replacement covariance or ``None`` to use the original.
-            The result retains the callback's declared provenance.
-        e2e_model: Prepared E2E-Calibrated model. Pass ``None`` for MASTSEL.
+        lo_model: Configured MASTSEL or E2E-Calibrated model, including its NGS
+            provider and photometry settings.
 
     Returns:
         Blurred PSFs, the applied low-order distribution and any requested
@@ -890,20 +877,18 @@ def simulate(
         ValueError: If inputs conflict with the selected model, are outside
             provider support or produce invalid scientific results.
     """
-    _validate_simulation_inputs(
-        request, science_psfs, ngs_metrics, ctot_correction, e2e_model
+    _validate_simulation_inputs(request, science_psfs, lo_model)
+    mastsel = isinstance(lo_model, MastselModel)
+    provenance = _simulation_provenance(
+        science_psfs,
+        lo_model.ngs_metrics if mastsel else None,
+        lo_model.ctot_correction if mastsel else None,
     )
-    provenance = _simulation_provenance(science_psfs, ngs_metrics, ctot_correction)
-
     science_psfs = _provider_at_precision(science_psfs, request.dtype)
-    ngs_metrics = _provider_at_precision(ngs_metrics, request.dtype)
     science = _evaluate_science_psfs(request, science_psfs)
-
-    if request.lo_model is LowOrderModel.E2E_CALIBRATED:
-        return _simulate_calibrated(request, science, e2e_model, provenance)
-    return _simulate_mastsel(
-        request, science, ngs_metrics, ctot_correction, provenance
-    )
+    if mastsel:
+        return _simulate_mastsel(request, science, lo_model, provenance)
+    return _simulate_calibrated(request, science, lo_model, provenance)
 
 
 __all__ = [

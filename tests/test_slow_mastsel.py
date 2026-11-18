@@ -15,6 +15,7 @@ from ngs_photometry import WFSPhotometryConfig, photons_per_frame_to_magnitudes
 from hybrid_ao_psf import (
     HybridCtotCorrection,
     HybridRequest,
+    MastselModel,
     PsfMetricPrediction,
     PsfMetricSamples,
     PsfSamples,
@@ -145,15 +146,21 @@ def test_real_mastsel_engine_matches_retained_hybrid_golden(tmp_path: Path) -> N
     magnitudes = photons_per_frame_to_magnitudes(
         configuration.request.ngs_flux / (500.0 * u.Hz), photometry
     )
+    science = load_psf_interpolator(science_path)
+    model = MastselModel(
+        mastsel_ini=configuration.mastsel_ini,
+        ngs_metrics=load_psf_metric_interpolator(ngs_path),
+        non_psd_policy=configuration.non_psd_policy,
+        ngs_magnitude_zeropoint=zeropoint,
+    )
     magnitude_result = simulate(
         replace(
             configuration.request,
             ngs_flux=None,
             ngs_magnitude=magnitudes,
-            ngs_magnitude_zeropoint=zeropoint,
         ),
-        load_psf_interpolator(science_path),
-        load_psf_metric_interpolator(ngs_path),
+        science,
+        lo_model=model,
     )
     np.testing.assert_allclose(
         magnitude_result.ngs_flux.value, result.ngs_flux.value, rtol=1e-14
@@ -170,9 +177,8 @@ def test_real_mastsel_engine_matches_retained_hybrid_golden(tmp_path: Path) -> N
 
     no_op = simulate(
         configuration.request,
-        load_psf_interpolator(science_path),
-        load_psf_metric_interpolator(ngs_path),
-        ctot_correction=HybridCtotCorrection(noop),
+        science,
+        lo_model=replace(model, ctot_correction=HybridCtotCorrection(noop)),
     )
     np.testing.assert_array_equal(no_op.ctot_wavefront, result.ctot_wavefront)
     np.testing.assert_array_equal(no_op.psfs, result.psfs)
@@ -188,27 +194,26 @@ def test_capture_noise_matches_native_fixed_gain_expression(count):
     rates = np.array([500, 450, 400])[:count] * u.Hz
     flux = np.array([25000, 16000, 10000])[:count] * u.photon / u.s
     request = HybridRequest(
-        science_x=np.array([0, 30, 0]) * u.arcsec,
-        science_y=np.array([0, 0, 30]) * u.arcsec,
-        ngs_x=ngs_x[:count] * u.arcsec,
-        ngs_y=ngs_y[:count] * u.arcsec,
+        science_positions=[[0, 0], [30, 0], [0, 30]] * u.arcsec,
+        ngs_positions=np.column_stack((ngs_x[:count], ngs_y[:count])) * u.arcsec,
         ngs_flux=flux,
         wavelength=WAVELENGTH_UM * u.um,
         zenith_angle=20 * u.deg,
-        mastsel_ini=_reference_ini(),
     )
     metrics = PsfMetricPrediction(
         np.array([0.42, 0.40, 0.38])[:count] * u.one,
         np.array([76, 80, 84])[:count] * u.mas,
         np.full(count, 0.24) * u.one,
     )
+    ini = _reference_ini()
     with _mastsel._prepare_mastsel_context(
         request,
         metrics,
-        parse_ini(request.mastsel_ini),
-        request.mastsel_ini,
+        parse_ini(ini),
+        ini,
         rates,
         flux,
+        None,
     ) as context:
         model = context.mastsel
         native = model.computeNoiseResidual
@@ -221,7 +226,9 @@ def test_capture_noise_matches_native_fixed_gain_expression(count):
             expected.extend(
                 (
                     float(abs(np.sum(model.fTipS_lambda1(gain, f, np.zeros(samples))))),
-                    float(abs(np.sum(model.fTiltS_lambda1(gain, f, np.zeros(samples))))),
+                    float(
+                        abs(np.sum(model.fTiltS_lambda1(gain, f, np.zeros(samples))))
+                    ),
                 )
             )
             return result

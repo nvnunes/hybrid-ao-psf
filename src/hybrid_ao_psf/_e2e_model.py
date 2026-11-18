@@ -40,6 +40,7 @@ from ._reconstructor_calibration import (
 )
 from ._sensing_calibration import SensingModel, load_sensing_calibration
 from ._validation import validate_psf_dtype
+from .contracts import LowOrderDistribution
 from .interpolation import PsfMetricInterpolator, load_psf_metric_interpolator
 
 
@@ -145,14 +146,14 @@ class E2ECalibratedModel(_LowOrderModel):
         self,
         *,
         ngs_positions: u.Quantity,
-        magnitudes: u.Quantity,
+        ngs_magnitude: u.Quantity,
         science_positions: u.Quantity,
         zenith_angle: u.Quantity,
     ) -> E2ELowOrderPrediction:
         """Compose atmospheric, HO and noise covariances at physical field points.
 
         NGS and science positions have shape (N,2) and (S,2), in angular units;
-        magnitudes is a length-N vector in the saved photometry convention.
+        ngs_magnitude is a length-N vector in the saved photometry convention.
         zenith_angle is scalar. Empty/duplicate NGS, nonphysical inputs,
         unsupported interpolation, unstable/defective feedback and non-PSD
         noiseless results raise. No spatial, magnitude, ZA or feedback
@@ -160,7 +161,7 @@ class E2ECalibratedModel(_LowOrderModel):
 
         Args:
             ngs_positions: Cartesian angular NGS coordinates of shape ``(NGS, 2)``.
-            magnitudes: One magnitude per NGS in the calibrated convention.
+            ngs_magnitude: One magnitude per NGS in the calibrated convention.
             science_positions: Cartesian angular query coordinates of shape
                 ``(science, 2)``.
             zenith_angle: Common scalar observing angle.
@@ -181,10 +182,12 @@ class E2ECalibratedModel(_LowOrderModel):
         science_positions = _quantity(
             science_positions, u.arcsec, "science_positions", 2, dtype=dtype
         )
-        magnitudes = _quantity(magnitudes, u.mag, "magnitudes", 1, dtype=dtype)
+        ngs_magnitude = _quantity(
+            ngs_magnitude, u.mag, "ngs_magnitude", 1, dtype=dtype
+        )
         zenith_angle = _angle(zenith_angle, dtype=dtype)
         if (
-            ngs_positions.shape != (len(magnitudes), 2)
+            ngs_positions.shape != (len(ngs_magnitude), 2)
             or not len(ngs_positions)
             or len(np.unique(ngs_positions.value, axis=0)) != len(ngs_positions)
         ):
@@ -194,15 +197,17 @@ class E2ECalibratedModel(_LowOrderModel):
 
         # Evaluate the fitted inputs for sensing, coma, and reconstruction.
         sensing = self.sensing.predict(
-            positions=ngs_positions, magnitudes=magnitudes, zenith_angle=zenith_angle
+            positions=ngs_positions,
+            magnitudes=ngs_magnitude,
+            zenith_angle=zenith_angle,
         )
         coma_responses = self.coma.predict(
-            magnitude=magnitudes, zenith_angle=zenith_angle
+            magnitude=ngs_magnitude, zenith_angle=zenith_angle
         )
         metrics = self.ngs_metrics.evaluate(
             zenith_angle=zenith_angle, x=ngs_positions[:, 0], y=ngs_positions[:, 1]
         )
-        photons_per_frame = self.coma.photometry.photons_per_frame(magnitudes)
+        photons_per_frame = self.coma.photometry.photons_per_frame(ngs_magnitude)
         reconstructor_noise_prior = self.reconstructor.measurement_noise(
             photons_per_frame=photons_per_frame, ee=metrics.ee, fwhm=metrics.fwhm
         )
@@ -248,36 +253,42 @@ class E2ECalibratedModel(_LowOrderModel):
             prediction.noiseless_covariance.value[:, None]
             + scales[None, :, None, None] * prediction.noise_command_covariance.value
         )
+        distribution = LowOrderDistribution(
+            weights=np.array([weight, 1 - weight], dtype=dtype),
+            covariances=mixture * u.mas**2,
+            dtype=dtype,
+        )
         return E2ELowOrderPrediction._create(
             dtype,
             photons_per_frame=photons_per_frame,
-            metrics=metrics,
-            coma_response=coma_responses,
-            gains=sensing.gain,
-            noise_variances=sensing.variance,
-            noise_prior=reconstructor_noise_prior,
+            ngs_metrics=metrics,
+            coma_response_coefficients=coma_responses,
+            sensing_gains=sensing.gain,
+            wfs_noise_variances=sensing.variance,
+            reconstructor_noise_covariance=reconstructor_noise_prior,
             reconstructor=control.reconstructor,
-            feedback=control.feedback,
-            effective_feedback=scalar_feedback.effective_feedback,
-            strengths=scalar_feedback.strengths,
-            projectors=scalar_feedback.projectors,
-            symmetric_feedback_fallback=scalar_feedback.symmetric_fallback,
+            feedback_matrix=control.feedback,
+            interpolation_feedback_matrix=scalar_feedback.effective_feedback,
+            interpolation_feedback_eigenvalues=scalar_feedback.strengths,
+            interpolation_feedback_projectors=scalar_feedback.projectors,
+            used_symmetric_feedback_approximation=scalar_feedback.symmetric_fallback,
             feedback_approximation_relative_error=scalar_feedback.approximation_relative_error,
-            eigenbasis_condition=scalar_feedback.eigenbasis_condition,
-            atmospheric_command=terms.atmospheric_command * u.mas**2,
-            ho_command=terms.ho_command * u.mas**2,
-            atmospheric_ho_command=terms.atmospheric_ho_command * u.mas**2,
-            science_atmospheric_command=terms.science_atmospheric_command * u.mas**2,
-            science_ho_command=terms.science_ho_command * u.mas**2,
-            uncorrected=terms.science_tilt * u.mas**2,
-            atmospheric=prediction.atmospheric_residual_covariance,
-            ho=prediction.ho_covariance_contribution,
-            noiseless=prediction.noiseless_covariance,
-            noise=prediction.noise_command_covariance,
-            total=prediction.total_covariance,
-            mixture_weights=np.array([weight, 1 - weight], dtype=dtype),
-            noise_scales=scales,
-            mixture_covariances=mixture * u.mas**2,
+            eigenbasis_condition_number=scalar_feedback.eigenbasis_condition,
+            atmospheric_command_covariance=terms.atmospheric_command * u.mas**2,
+            ho_command_covariance=terms.ho_command * u.mas**2,
+            atmospheric_ho_command_covariance=terms.atmospheric_ho_command * u.mas**2,
+            science_atmospheric_command_covariance=(
+                terms.science_atmospheric_command * u.mas**2
+            ),
+            science_ho_command_covariance=terms.science_ho_command * u.mas**2,
+            science_tilt_covariance=terms.science_tilt * u.mas**2,
+            atmospheric_residual_covariance=prediction.atmospheric_residual_covariance,
+            ho_correction=prediction.ho_covariance_contribution,
+            noiseless_covariance=prediction.noiseless_covariance,
+            noise_command_covariance=prediction.noise_command_covariance,
+            noise_covariance_scales=scales,
+            distribution=distribution,
+            _total=prediction.total_covariance,
         )
 
 

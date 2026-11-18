@@ -1,11 +1,19 @@
-from dataclasses import asdict, replace
+from dataclasses import replace
 from pathlib import Path
+from types import SimpleNamespace
 
 import numpy as np
 import pytest
 from astropy import units as u
 
-from hybrid_ao_psf import DiagnosticsLevel, NonPsdPolicy, engine, load_configuration
+from hybrid_ao_psf import (
+    DiagnosticsLevel,
+    MastselModel,
+    NonPsdPolicy,
+    _mastsel,
+    engine,
+    load_configuration,
+)
 
 
 def _write_config(
@@ -61,20 +69,21 @@ def test_load_configuration_resolves_paths_and_cartesian_coordinates(
     assert configuration.ngs_metric_file == (path.parent / "ngs.pkl").resolve()
     assert configuration.output == (path.parent / "results/result.h5").resolve()
     np.testing.assert_allclose(
-        configuration.request.science_x.to_value(u.arcsec), [0.0, 0.0], atol=1e-14
+        configuration.request.science_positions.to_value(u.arcsec),
+        [[0.0, 0.0], [0.0, 2.0]],
+        atol=1e-14,
     )
     np.testing.assert_allclose(
-        configuration.request.science_y.to_value(u.arcsec), [0.0, 2.0], atol=1e-14
-    )
-    np.testing.assert_allclose(
-        configuration.request.ngs_x.to_value(u.arcsec), [10.0, -20.0], atol=1e-14
+        configuration.request.ngs_positions.to_value(u.arcsec),
+        [[10.0, 0.0], [-20.0, 0.0]],
+        atol=1e-14,
     )
     assert configuration.request.wavelength.to_value(u.um) == pytest.approx(1.65)
-    assert configuration.request.non_psd_policy is NonPsdPolicy.CLIP
+    assert configuration.non_psd_policy is NonPsdPolicy.CLIP
     assert configuration.request.diagnostics_level is DiagnosticsLevel.DEBUG
-    assert "[hybrid]" not in configuration.request.mastsel_ini.lower()
-    assert "[telescope]" in configuration.request.mastsel_ini
-    assert "SensorFrameRate_LO = 500.0" in configuration.request.mastsel_ini
+    assert "[hybrid]" not in configuration.mastsel_ini.lower()
+    assert "[telescope]" in configuration.mastsel_ini
+    assert "SensorFrameRate_LO = 500.0" in configuration.mastsel_ini
     assert not hasattr(configuration.request, "ngs_frame_rate")
 
 
@@ -111,30 +120,35 @@ def test_conflicting_previous_interpolator_path_is_rejected(tmp_path: Path) -> N
         load_configuration(path)
 
 
-def test_loaded_request_reuses_ini_and_isolates_each_run(tmp_path, monkeypatch):
+def test_mastsel_model_parses_once_and_isolates_each_run(tmp_path, monkeypatch):
     path = tmp_path / "simulation.ini"
     _write_config(path)
     configuration = load_configuration(path)
-    assert all(not key.startswith("_") for key in asdict(configuration.request))
-    parse = engine.parse_ini
+    parse = _mastsel.parse_ini
     parsed = []
 
     def record_parse(text):
         parsed.append(text)
         return parse(text)
 
-    monkeypatch.setattr(engine, "parse_ini", record_parse)
-    first, _, _ = engine._resolve_effective_mastsel(configuration.request)
+    monkeypatch.setattr(_mastsel, "parse_ini", record_parse)
+    model = MastselModel(
+        mastsel_ini=configuration.mastsel_ini,
+        ngs_metrics=SimpleNamespace(evaluate=lambda **kwargs: None),
+    )
+    first, _, _, _ = engine._resolve_effective_mastsel(configuration.request, model)
     first["RTC"]["SensorFrameRate_LO"] = "100"
-    second, rates, _ = engine._resolve_effective_mastsel(configuration.request)
-    assert not parsed
+    second, rates, _, _ = engine._resolve_effective_mastsel(
+        configuration.request, model
+    )
+    assert parsed == [model.mastsel_ini]
     assert second["RTC"]["SensorFrameRate_LO"] == "500.0"
     np.testing.assert_array_equal(rates.to_value(u.Hz), [500, 500])
 
-    override = configuration.request.mastsel_ini.replace(
+    override = configuration.mastsel_ini.replace(
         "SensorFrameRate_LO = 500.0", "SensorFrameRate_LO = 200"
     )
-    edited = replace(configuration.request, mastsel_ini=override)
-    _, rates, _ = engine._resolve_effective_mastsel(edited)
+    edited = replace(model, mastsel_ini=override)
+    _, rates, _, _ = engine._resolve_effective_mastsel(configuration.request, edited)
     np.testing.assert_array_equal(rates.to_value(u.Hz), [200, 200])
-    assert parsed == [override]
+    assert parsed == [model.mastsel_ini, edited.mastsel_ini]

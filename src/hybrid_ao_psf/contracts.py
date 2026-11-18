@@ -27,7 +27,7 @@ CTOT_PSD_TOLERANCE_NM2 = 1.0e-9
 
 
 class LowOrderModel(StrEnum):
-    """Explicit peer model used for low-order image motion."""
+    """Low-order model identifier used in configuration and results."""
 
     MASTSEL = "mastsel"
     E2E_CALIBRATED = "e2e-calibrated"
@@ -207,45 +207,29 @@ class PsfMetricProvider(Protocol):
 
 @dataclass(frozen=True, kw_only=True)
 class HybridRequest(_PhysicalRecord):
-    """Inputs for one stateless Hybrid AO PSF simulation.
+    """Observation and output settings for one Hybrid AO PSF simulation.
 
     Attributes:
         dtype: Real calculation/state precision, float32 by default or float64.
-        science_x: Science field x-coordinates in arcseconds.
-        science_y: Science field y-coordinates in arcseconds.
-        ngs_x: Natural-guide-star x-coordinates in arcseconds.
-        ngs_y: Natural-guide-star y-coordinates in arcseconds. Each x/y pair
-            is passed to MASTSEL in that order.
+        science_positions: Angular science coordinates of shape ``(science, 2)``,
+            one Cartesian (x, y) pair per row.
+        ngs_positions: Angular NGS coordinates of shape ``(NGS, 2)`` in the
+            same frame, ordered to match the NGS fluxes or magnitudes.
         ngs_flux: Effective photon rate for each active guide star, as an
-            alternative to ``ngs_magnitude`` and its zeropoint.
+            alternative to ``ngs_magnitude`` for models accepting flux.
         ngs_magnitude: Magnitude of each active guide star, when supplying
             magnitudes instead of effective flux.
-        ngs_magnitude_zeropoint: Caller-supplied pre-aperture zero-magnitude
-            photon flux; required for MASTSEL magnitudes, absent for E2E.
         wavelength: Science wavelength.
         zenith_angle: Observation zenith angle.
-        mastsel_ini: Complete MASTSEL configuration text; required for MASTSEL
-            and absent for E2E-Calibrated.
-        lo_model: Explicit LowOrderModel; MASTSEL is the default. E2E-Calibrated
-            requires magnitudes in its saved convention and no supplied flux,
-            magnitude zeropoint or MASTSEL INI.
-        non_psd_policy: MASTSEL covariance policy. E2E-Calibrated accepts only
-            error and uses its model's fixed numerical covariance validation.
         diagnostics_level: Amount of optional intermediate data to retain.
     """
 
-    science_x: u.Quantity
-    science_y: u.Quantity
-    ngs_x: u.Quantity
-    ngs_y: u.Quantity
+    science_positions: u.Quantity
+    ngs_positions: u.Quantity
     ngs_flux: u.Quantity | None = None
     ngs_magnitude: u.Quantity | None = None
-    ngs_magnitude_zeropoint: u.Quantity | None = None
     wavelength: u.Quantity
     zenith_angle: u.Quantity
-    mastsel_ini: str | None = None
-    lo_model: LowOrderModel | str = LowOrderModel.MASTSEL
-    non_psd_policy: NonPsdPolicy | str = NonPsdPolicy.ERROR
     diagnostics_level: DiagnosticsLevel | str = DiagnosticsLevel.NONE
 
     dtype: DTypeLike = field(default=np.float32, kw_only=True)
@@ -253,24 +237,18 @@ class HybridRequest(_PhysicalRecord):
     def __post_init__(self) -> None:
         dtype = validate_psf_dtype(self.dtype)
         object.__setattr__(self, "dtype", dtype)
-        lo_model = LowOrderModel(self.lo_model)
-        object.__setattr__(self, "lo_model", lo_model)
-        science_x = _readonly_quantity(
-            self.science_x, u.arcsec, "science_x", ndim=1, dtype=dtype
-        )
-        science_y = _readonly_quantity(
-            self.science_y, u.arcsec, "science_y", ndim=1, dtype=dtype
-        )
-        ngs_x = _readonly_quantity(self.ngs_x, u.arcsec, "ngs_x", ndim=1, dtype=dtype)
-        ngs_y = _readonly_quantity(self.ngs_y, u.arcsec, "ngs_y", ndim=1, dtype=dtype)
+        for name in ("science_positions", "ngs_positions"):
+            positions = _readonly_quantity(
+                getattr(self, name), u.arcsec, name, ndim=2, dtype=dtype
+            )
+            if positions.shape[1] != 2:
+                raise ValueError(f"{name} must have shape (N, 2) in (x, y) order.")
+            object.__setattr__(self, name, positions)
         if (self.ngs_flux is None) == (self.ngs_magnitude is None):
             raise ValueError("Supply exactly one of ngs_flux or ngs_magnitude.")
         ngs_flux = None
         ngs_magnitude = None
-        zeropoint = None
         if self.ngs_flux is not None:
-            if self.ngs_magnitude_zeropoint is not None:
-                raise ValueError("ngs_magnitude_zeropoint requires ngs_magnitude.")
             ngs_flux = _readonly_quantity(
                 self.ngs_flux, u.photon / u.s, "ngs_flux", ndim=1, dtype=dtype
             )
@@ -280,69 +258,23 @@ class HybridRequest(_PhysicalRecord):
             ngs_magnitude = _readonly_quantity(
                 self.ngs_magnitude, u.mag, "ngs_magnitude", ndim=1, dtype=dtype
             )
-            if lo_model is LowOrderModel.MASTSEL:
-                zeropoint = _positive_scalar(
-                    self.ngs_magnitude_zeropoint,
-                    u.photon / (u.m**2 * u.s),
-                    "ngs_magnitude_zeropoint",
-                    dtype=dtype,
-                )
-            elif self.ngs_magnitude_zeropoint is not None:
-                raise ValueError(
-                    "E2E-calibrated photometry comes from its saved model."
-                )
-        if lo_model is LowOrderModel.E2E_CALIBRATED and ngs_magnitude is None:
-            raise ValueError("E2E-calibrated requests require ngs_magnitude.")
-        if science_x.size == 0:
-            raise ValueError("At least one science coordinate is required.")
-        if ngs_x.size == 0:
-            raise ValueError("At least one active NGS is required.")
-        if science_x.shape != science_y.shape:
-            raise ValueError("science_x and science_y must have identical shapes.")
         ngs_input = ngs_flux if ngs_flux is not None else ngs_magnitude
-        if not (ngs_x.shape == ngs_y.shape == ngs_input.shape):
-            raise ValueError(
-                "NGS coordinates and flux or magnitude vectors must have identical shapes."
-            )
+        if len(self.ngs_positions) != len(ngs_input):
+            raise ValueError("Supply one NGS flux or magnitude per row of ngs_positions.")
         wavelength = _positive_scalar(self.wavelength, u.um, "wavelength", dtype=dtype)
         zenith_angle = _scalar(self.zenith_angle, u.deg, "zenith_angle", dtype=dtype)
         if not 0.0 <= zenith_angle.to_value(u.deg) < 90.0:
             raise ValueError("zenith_angle must be in [0, 90) deg.")
-        mastsel_ini = self.mastsel_ini
-        if lo_model is LowOrderModel.MASTSEL:
-            if not isinstance(mastsel_ini, str) or not mastsel_ini.strip():
-                raise ValueError("mastsel_ini must not be empty.")
-            mastsel_ini = mastsel_ini.strip() + "\n"
-        elif mastsel_ini is not None:
-            raise ValueError("E2E-calibrated requests do not accept mastsel_ini.")
-        try:
-            non_psd_policy = NonPsdPolicy(self.non_psd_policy)
-        except ValueError as exc:
-            raise ValueError("non_psd_policy must be 'error' or 'clip'.") from exc
         try:
             diagnostics_level = DiagnosticsLevel(self.diagnostics_level)
         except ValueError as exc:
             raise ValueError(
                 "diagnostics_level must be 'none', 'validation', or 'debug'."
             ) from exc
-        object.__setattr__(self, "science_x", science_x)
-        object.__setattr__(self, "science_y", science_y)
-        object.__setattr__(self, "ngs_x", ngs_x)
-        object.__setattr__(self, "ngs_y", ngs_y)
         object.__setattr__(self, "ngs_flux", ngs_flux)
         object.__setattr__(self, "ngs_magnitude", ngs_magnitude)
-        object.__setattr__(self, "ngs_magnitude_zeropoint", zeropoint)
         object.__setattr__(self, "wavelength", wavelength)
         object.__setattr__(self, "zenith_angle", zenith_angle)
-        object.__setattr__(self, "mastsel_ini", mastsel_ini)
-        if (
-            lo_model is LowOrderModel.E2E_CALIBRATED
-            and non_psd_policy is not NonPsdPolicy.ERROR
-        ):
-            raise ValueError(
-                "E2E-calibrated requests use model covariance validation; non_psd_policy must be error"
-            )
-        object.__setattr__(self, "non_psd_policy", non_psd_policy)
         object.__setattr__(self, "diagnostics_level", diagnostics_level)
 
 
@@ -417,6 +349,8 @@ class HybridCtotContext:
         ngs_metrics: The interpolated metrics supplied to baseline MASTSEL.
         ngs_flux: Effective per-NGS photon rates, in photon/s.
         ngs_frame_rate: Resolved per-NGS frame rates, in Hz.
+        ngs_magnitude_zeropoint: Pre-aperture photon flux used to convert magnitudes,
+            or None when effective photon rates were supplied.
         effective_mastsel_ini: Complete configuration used by the live runtime.
     """
 
@@ -428,13 +362,14 @@ class HybridCtotContext:
     ngs_flux: u.Quantity
     ngs_frame_rate: u.Quantity
     effective_mastsel_ini: str
+    ngs_magnitude_zeropoint: u.Quantity | None = None
 
     def __post_init__(self) -> None:
         if not isinstance(self.request, HybridRequest):
             raise TypeError("request must be a HybridRequest.")
         if not isinstance(self.ngs_metrics, PsfMetricPrediction):
             raise TypeError("ngs_metrics must be a PsfMetricPrediction.")
-        size = self.request.ngs_x.size
+        size = len(self.request.ngs_positions)
         if self.ngs_metrics.ee.size != size:
             raise ValueError("NGS metrics must match the request's active NGS.")
         object.__setattr__(
@@ -466,7 +401,7 @@ class HybridCtotContext:
                     "mastsel_statistics must be HybridMastselStatistics or None."
                 )
             if statistics.science_ngs_covariance.shape != (
-                self.request.science_x.size,
+                len(self.request.science_positions),
                 2,
                 2 * size,
             ):
@@ -682,11 +617,11 @@ class HybridResult(_PhysicalRecord):
         diagnostics: Optional common validation summaries and debug HO PSFs.
         lo_model: Explicit low-order model identity, default MASTSEL for legacy
             construction. Both models share the same result type.
-        lo_distribution: Applied centred Gaussian mixture. MASTSEL supplies one
+        distribution: Applied centred Gaussian mixture. MASTSEL supplies one
             component; E2E supplies its calibrated two-component distribution.
-        e2e_prediction: Self-contained fitted LO evaluation, including gains,
-            reconstruction, feedback and component covariances. Required only
-            for E2E; loading does not consult model files.
+        e2e_prediction: Self-contained fitted LO evaluation with the applied
+            distribution, gains, reconstruction, feedback and component
+            covariances. Required for E2E. Loading needs only the result file.
         science_positions: Cartesian (science,2) angular coordinates, required
             for E2E and supplied by both engine paths; None for legacy results.
         ngs_positions: Cartesian (NGS,2) coordinates, with the same lifecycle.
@@ -710,7 +645,7 @@ class HybridResult(_PhysicalRecord):
     ngs_magnitude_zeropoint: u.Quantity | None = None
 
     lo_model: LowOrderModel | str = LowOrderModel.MASTSEL
-    lo_distribution: LowOrderDistribution | None = None
+    distribution: LowOrderDistribution | None = None
     e2e_prediction: E2ELowOrderPrediction | None = None
     science_positions: u.Quantity | None = None
     ngs_positions: u.Quantity | None = None
@@ -883,8 +818,8 @@ class HybridResult(_PhysicalRecord):
         ):
             raise ValueError("E2E results require matching prediction state/precision")
         if (
-            self.e2e_prediction.total.shape != (num_science, 2, 2)
-            or len(self.e2e_prediction.gains) != num_ngs
+            self.e2e_prediction.distribution.covariances.shape[0] != num_science
+            or len(self.e2e_prediction.sensing_gains) != num_ngs
         ):
             raise ValueError("E2E prediction dimensions must match the result")
         ngs_magnitude = _vector_with_length(
@@ -902,7 +837,7 @@ class HybridResult(_PhysicalRecord):
         lo_model = self.lo_model
         dtype = self.dtype
         ctot_angle = self.ctot_angle
-        distribution = self.lo_distribution
+        distribution = self.distribution
         if distribution is None:
             if lo_model is LowOrderModel.E2E_CALIBRATED:
                 raise ValueError("E2E results require the applied LO distribution")
@@ -912,7 +847,7 @@ class HybridResult(_PhysicalRecord):
                 dtype=ctot_angle.dtype,
             )
         if not isinstance(distribution, LowOrderDistribution):
-            raise TypeError("lo_distribution must be LowOrderDistribution")
+            raise TypeError("distribution must be LowOrderDistribution")
         if dtype is not None and distribution.dtype != dtype:
             distribution = replace(distribution, dtype=dtype)
         if distribution.covariance.shape != ctot_angle.shape or not np.allclose(
@@ -930,17 +865,19 @@ class HybridResult(_PhysicalRecord):
         else:
             prediction = self.e2e_prediction
             tolerance = max(1e-10, 32 * np.finfo(dtype).eps)
-            if (
-                distribution.covariances.shape != prediction.mixture_covariances.shape
+            predicted_distribution = prediction.distribution
+            if distribution is not predicted_distribution and (
+                distribution.covariances.shape
+                != predicted_distribution.covariances.shape
                 or not np.allclose(
                     distribution.weights,
-                    prediction.mixture_weights,
+                    predicted_distribution.weights,
                     rtol=tolerance,
                     atol=0,
                 )
                 or not np.allclose(
                     distribution.covariances.value,
-                    prediction.mixture_covariances.value,
+                    predicted_distribution.covariances.value,
                     rtol=tolerance,
                     atol=1e-8,
                 )
@@ -951,10 +888,10 @@ class HybridResult(_PhysicalRecord):
             for name in ("ee", "fwhm", "sr"):
                 if not np.array_equal(
                     getattr(self.ngs_metrics, name).value,
-                    getattr(prediction.metrics, name).value,
+                    getattr(prediction.ngs_metrics, name).value,
                 ):
                     raise ValueError("E2E prediction metrics must match result metrics")
-        object.__setattr__(self, "lo_distribution", distribution)
+        object.__setattr__(self, "distribution", distribution)
 
     def _prepare_coordinates(self, num_science: int, num_ngs: int) -> None:
         """Validate geometry shared by both models and required for E2E results."""
