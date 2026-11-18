@@ -1,4 +1,4 @@
-"""Physical input and observation contracts for native calibration hooks."""
+"""Physical calibration input and measurement contracts for native calibration hooks."""
 
 from __future__ import annotations
 
@@ -346,7 +346,7 @@ class ComaWfsSampling(_PhysicalRecord):
 
     Attributes:
         dtype: Real calculation/state precision, float32 by default or float64.
-        magnitudes: Strictly increasing magnitude grid with at least two nodes.
+        magnitudes: Strictly increasing magnitude grid with at least two values.
         noise_draws: Draws per wavefront/magnitude, a positive multiple of four.
         seed: Nonnegative uint32 seed for deterministic native draw scheduling.
     """
@@ -361,7 +361,7 @@ class ComaWfsSampling(_PhysicalRecord):
         object.__setattr__(self, "dtype", validate_psf_dtype(self.dtype))
         values = _quantity(self.magnitudes, u.mag, "magnitudes", 1, dtype=self.dtype)
         if len(values) < 2 or np.any(np.diff(values.value) <= 0):
-            raise ValueError("magnitudes must be strictly increasing, with >=2 nodes")
+            raise ValueError("magnitudes must be strictly increasing, with >=2 values")
         _count(self.noise_draws, "noise_draws", 4)
         _count(self.seed, "seed", 0)
         if self.noise_draws % 4 or self.seed >= 2**32:
@@ -373,7 +373,7 @@ class ComaWfsSampling(_PhysicalRecord):
 
 @dataclass(frozen=True, kw_only=True, eq=False)
 class ComaWfsMeasurements(_PhysicalRecord):
-    """Uncentred angular WFS observations paired with supplied wavefronts.
+    """Uncentred angular WFS measurements paired with supplied wavefronts.
 
     Attributes:
         dtype: Real calculation/state precision, float32 by default or float64.
@@ -524,7 +524,7 @@ class SensingWfsMeasurements(_PhysicalRecord):
 
 @dataclass(frozen=True, kw_only=True, eq=False)
 class ReconstructorNoiseInputs(_PhysicalRecord):
-    """Ordered pre-filter noise-query samples, without controller settings.
+    """Ordered pre-filter noise-query points, without controller settings.
 
     Attributes:
         dtype: Real calculation/state precision, float32 by default or float64.
@@ -564,7 +564,7 @@ class ReconstructorNoiseMeasurements(_PhysicalRecord):
 
     Attributes:
         dtype: Real calculation/state precision, float32 by default or float64.
-        covariance: Ordered (samples,2,2) symmetric PSD angular covariances.
+        covariance: Ordered (points,2,2) symmetric PSD angular covariances.
     """
 
     covariance: u.Quantity
@@ -587,7 +587,7 @@ class ReconstructorNoiseMeasurements(_PhysicalRecord):
 
 @dataclass(frozen=True, kw_only=True, eq=False)
 class ComaResponseMeasurements(_PhysicalRecord):
-    """Sufficient paired observations for offline response and joint-law fitting.
+    """Sufficient paired measurements for offline response and joint-law fitting.
 
     Attributes:
         dtype: Real calculation/state precision, float32 by default or float64.
@@ -634,7 +634,7 @@ class ComaResponseMeasurements(_PhysicalRecord):
             or self.tilt_batches.shape[-1] != 2
             or self.tilt_batches.shape[2] < 2
         ):
-            raise ValueError("invalid paired response observation shapes")
+            raise ValueError("invalid paired response measurement shapes")
         tolerance = 64 * np.spacing(max(1.0, np.max(np.abs(self.tilt_mean.value))))
         if (
             np.max(np.abs(self.tilt_batches.value.mean(axis=2) - self.tilt_mean.value))

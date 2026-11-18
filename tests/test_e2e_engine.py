@@ -1,5 +1,6 @@
 """Peer-model execution, independent mixture convolution and offline results."""
 
+import json
 import subprocess
 import sys
 from dataclasses import fields, replace
@@ -346,6 +347,13 @@ def test_standalone_and_cli_are_native_free_and_analysis_is_self_contained(
     assert config.request.dtype == np.float64 and config.request.mastsel_ini is None
     assert load_configuration(configured, dtype=np.float32).request.dtype == np.float32
     direct = run_configuration(configured)
+    model_files = json.loads(direct.provenance["e2e_model_inputs"])
+    for name in ("reconstructor", "covariance", "sensing"):
+        assert len(model_files[name]["array_files"]) == 1
+        assert model_files[name]["manifest"].endswith("/model.json")
+        assert "entrypoint" not in model_files[name]
+        assert "payloads" not in model_files[name]
+    assert model_files["coma"]["array_files"] == []
     code = """
 import builtins,sys
 original=builtins.__import__

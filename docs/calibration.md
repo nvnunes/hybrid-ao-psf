@@ -2,7 +2,7 @@
 
 Hybrid AO PSF owns the common measurement, filtering, fitting and persistence
 operations for reconstructor, covariance, coma and sensing calibration. A
-configured downstream `E2ECalibration` subclass supplies native observations;
+configured downstream `E2ECalibration` subclass supplies native calibration data;
 the standalone builders and loaded products require no native E2E software.
 Calibration is separate from scientific simulation and never starts implicitly
 when a prediction loads its products. The separate concrete
@@ -15,12 +15,12 @@ uses the reconstructor prior, and sensing simulation uses both products.
 
 | Calibration | Native input and retained measurements | Offline build and output |
 | --- | --- | --- |
-| Reconstructor | Measure pre-filter centroid noise on a grid of photon counts and spot metrics. Retain the ordered grid and holdouts. | `build_reconstructor_calibration()` fits a `ReconstructorNoiseModel`. |
-| Covariance | Read aligned tilt and coma histories. `measure_covariance_calibration()` filters and measures each zenith plane. | `build_covariance_calibration()` combines the measured planes into `CovarianceFunctions`. `validate_covariance_reconstructor()` compares the assembled covariance with direct loop simulation. |
+| Reconstructor | Measure pre-filter centroid noise on a grid of photon counts and spot metrics. Retain measurements for the grid and interpolation checks. | `build_reconstructor_calibration()` fits a `ReconstructorNoiseModel`. |
+| Covariance | Read aligned tilt and coma histories. `measure_covariance_calibration()` filters and measures each zenith plane. | `build_covariance_calibration()` combines the measured planes into `CovarianceFunctions`. The configured build can also check the result against direct loop simulation. |
 | Coma | Read paired wavefronts and measure their WFS response. Retain the batch means at each magnitude and zenith plane. | `build_coma_calibration()` fits a joint `ComaResponseModel`. |
-| Sensing | Measure zero and signed shifts of fixed WFS spots. Retain the paired draws. | `build_sensing_response()` fits the response and retains noise banks. Simulate command histories with `simulate_sensing_noise()`, then fit the displacement shape with `build_sensing_calibration()` to obtain `SensingCalibration`. |
+| Sensing | Measure zero and signed shifts of fixed WFS spots. Retain the paired draws. | `build_sensing_response()` fits the response and retains noise samples. Simulate command histories with `simulate_sensing_noise()`, then fit the displacement shape with `build_sensing_calibration()` to obtain `SensingModel`. |
 
-Configuration specifies where to publish each fitted model. Keep the
+Configuration specifies where to save each fitted model. Keep the
 measurements for offline rebuilding.
 
 ## Native Hooks
@@ -59,10 +59,14 @@ ngs_metrics = inputs/ngs-metrics.pkl
 
 [calibration.covariance]
 feedback = [0.2, 0.5, 1.0, 1.5, 2.0]
-bootstrap_draws = 200
 
 [calibration.sensing]
 displacement = 10 mas
+
+[calibration.reconstructor]
+signal_point_count = 129
+fwhm_point_count = 97
+ee_point_count = 17
 ```
 
 Paths are relative to the INI, and the four model destinations must be distinct.
@@ -78,13 +82,13 @@ Controls resolve from built-in defaults, then INI values, then explicit values
 passed to `configuration.with_overrides()`. CLI callers must omit absent options
 from those mappings. Building a new configuration does not mutate the old one.
 
-## Reusable Observations
+## Reusable Calibration Data
 
-`save_calibration_samples(samples, path)` atomically saves a supported physical
-record as numeric NPZ with a versioned JSON header. `load_calibration_samples()`
+`save_calibration_data(data, path)` atomically saves typed calibration inputs or
+measurements as numeric NPZ with a versioned JSON header. `load_calibration_data()`
 validates kind, fields, units and axes before reconstructing its immutable type.
 No native files or software are required. Coma response records retain independent
-detector-batch means for offline fitting. Use the generic sample writer for
+detector-batch means for offline fitting. Use the generic data writer for
 native-facing records such as telemetry or raw WFS draws. Use
 `save_<family>_measurements()` for the measurement bundles passed to fitters
 and `save_<family>_calibration()` for the fitted models used at prediction time.
@@ -92,12 +96,12 @@ and `save_<family>_calibration()` for the fitted models used at prediction time.
 ## Measurement And Building
 
 The instance methods `measure_reconstructor()`, `measure_covariance()`,
-`measure_coma()` and `measure_sensing()` return reusable physical observations.
+`measure_coma()` and `measure_sensing()` return reusable physical measurements.
 Covariance yields one ZA plane at a time. Coma retains paired coma/mean WFS
 responses, four detector-batch means and noiseless comparisons. Sensing retains
-uncentred zero/signed displacement samples. `measure_sensing_point()` accepts
-an explicitly prepared `SensingSpot`; `measure_sensing()` loads the configured
-NGS HO PSF interpolator once and measures aligned position/magnitude rows.
+uncentred zero/signed displacement samples. `measure_sensing()` loads the
+configured NGS HO PSF interpolator once and measures aligned position and
+magnitude rows.
 That source file must contain fractions per incident photon: native
 normalization and image orientation must be resolved before building it.
 The common operation preserves cropped flux and applies no recentering or
@@ -108,13 +112,25 @@ Each family has `save_<family>_measurements()` and
 `load_<family>_measurements()` operations. Rebuilding requires these numerical
 records, not native sources, setup files or subclass hooks. The standalone
 `build_<family>_calibration()` operations return an immutable model and separate
-numerical diagnostics; they publish nothing implicitly.
+numerical diagnostics; they save nothing implicitly.
 
-Configured instance `build_reconstructor()`, `build_covariance()`, `build_coma()`
-and `build_sensing()` call these builders and publish to the INI destinations.
-They save `diagnostics.json` separately, identifying the corresponding model
-manifest by SHA-256. An interrupted diagnostic write can therefore be detected
-without making a complete model unusable. Numerical records remain untouched.
+Configured `build_reconstructor()`, `build_covariance()`, `build_coma()` and
+`build_sensing()` apply the INI settings and return the model and diagnostics
+without writing files. Call the matching `save_reconstructor()`,
+`save_covariance()`, `save_coma()` or `save_sensing()` explicitly to save that
+result to its configured destination:
+
+```python
+result = calibration.build_reconstructor(measurements)
+calibration.save_reconstructor(result)
+```
+
+These save methods return the absolute `model.json` path and save
+`diagnostics.json` beside it, identifying the model manifest by SHA-256.
+An interrupted save restores both metadata files. Retained numerical
+measurements remain untouched. The standalone `save_<family>_calibration()`
+functions accept a fitted model and an explicit destination, rather than the
+configured build result.
 
 ```python
 from hybrid_ao_psf import (
@@ -123,8 +139,8 @@ from hybrid_ao_psf import (
     save_reconstructor_calibration,
 )
 
-observations = load_reconstructor_measurements("measurements.npz")
-result = build_reconstructor_calibration(observations)
+measurements = load_reconstructor_measurements("measurements.npz")
+result = build_reconstructor_calibration(measurements)
 save_reconstructor_calibration(result.model, "products/reconstructor/model.json")
 ```
 
@@ -132,16 +148,20 @@ Covariance filters each realization independently, retains the common settled
 window, and uses one pooled realization/time mean with population divisors and
 equal realization weighting. It preserves rectangular corner mapping, one
 feedback factor per filtered input, airmass interpolation, transpose checks,
-whole-realization bootstrap and withheld-position/feedback diagnostics. Different
+whole-realization bootstrap and withheld-position/feedback diagnostics. Hybrid
+uses a fixed bootstrap count and seed for the sampling uncertainty report. Different
 realization counts across ZA are allowed; directions, frame counts, controller
-and settled windows must agree. `validate_covariance_reconstructor()` checks
-calibrated reconstruction against independent direct matrix simulation at feedback
-nodes. Configured covariance building can accept `validation_telemetry` to run
-this check for every plane before publication, using the configured prior.
+and settled windows must agree. Pass `validation_telemetry` to
+`build_covariance()` to check the calibrated reconstruction for each plane
+against direct matrix-loop simulation at the feedback grid points. This
+comparison uses the configured reconstructor prior.
 
-The reconstructor prior supports either P×EE/FWHM or separate P/EE/FWHM axes.
-It validates isotropy, cross-axis response and the product reduction against
-retained native observations. This prior chooses weights; it is distinct from
+The reconstructor prior uses either P×EE and FWHM or separate P, EE and FWHM
+axes. The point counts specify the length of each axis. The EE count applies
+when EE has its own axis. Hybrid selects the interpolation check points
+using a fixed seed.
+The build checks isotropy, cross-axis response and the product reduction
+against retained native measurements. This prior chooses weights; it is distinct from
 measured WFS noise variance. `build_lo_reconstructor()` assembles absolute
 field-centre weights from loaded covariance/prior products, with I for one NGS.
 `solve_lo_reconstructor()` exposes the same solver for supplied physical
@@ -150,21 +170,22 @@ covariance matrices. Neither operation conditions matrices or normalizes blocks.
 Coma building estimates scalar/matrix response, bootstrap and batch diagnostics,
 then fits the magnitude/airmass law. At least three distinct ZA planes are
 required; fitting one new plane alone does not replace the joint model. The
-model enforces actual measured magnitude and viewing-angle support. Standalone
-building uses recorded bootstrap seeds unless explicitly overridden; configured
-building uses the INI/explicit seed without reacquiring WFS samples.
+model enforces the measured magnitude and viewing-angle ranges. New measurements
+record Hybrid’s fixed bootstrap seed. Both build methods use each plane’s recorded
+seed for the acceptance checks. When the data include 30° and at least three
+other zenith angles, Hybrid checks the 30° plane against a fit to the others.
 
 ## Sensing Noise Simulation And Shape Fitting
 
-`estimate_sensing_statistics()` calculates the local gain matrix and conditional
-noise covariance from zero and paired signed draws. `build_sensing_response()`
-streams retained point observations into gain/log-variance interpolators and
-paired white-noise banks. Deliberate nonuniform magnitude intervals can be
-supplied explicitly; unsupported vertices, gaps and extrapolation are rejected.
+Call `statistics()` on a saved sensing measurement after loading it to inspect
+its local gain matrix and conditional noise covariance. `build_sensing_response()`
+streams retained point measurements into gain/log-variance interpolators and
+paired white-noise samples. Deliberate nonuniform magnitude intervals can be
+supplied explicitly; unmeasured grid points, gaps and extrapolation are rejected.
 This intermediate response is not a complete runtime sensing model.
 
 `simulate_sensing_noise()` accepts the prepared response, physical
-`SensingNoiseRequest` cases, the loaded covariance bank and calibrated prior.
+`SensingNoiseRequest` cases, the loaded covariance interpolators and calibrated prior.
 The configured `simulate_sensing_noise()` method loads those two prerequisites from the
 INI. Missing products raise without launching another calibration. Simulation uses
 the actual reconstructed feedback matrix and the fixed-gain delayed integrator,
@@ -179,7 +200,7 @@ equal the analytical stationary width.
 `build_sensing_calibration()` fits the covariance-preserving two-Gaussian shape
 from all supplied case histories, balancing single- and multiple-NGS families.
 It requires simulation coverage at every measured response ZA. Only the completed
-response-plus-shape product is publishable. Runtime width uses the analytical
+response-plus-shape product is ready to save. Runtime width uses the analytical
 Lyapunov covariance; the fitted mixture changes shape while preserving it.
 `FixedGainIntegrator` owns filtering, state transitions and stationary
 noise-command covariance. `NoiseBlurModel.otf()` requires an angular-squared
@@ -187,34 +208,37 @@ covariance and angular pixel scale as quantities.
 
 ## Product Persistence
 
-Each family publishes an explicit `model.json`, using
+A saved model consists of its manifest (`model.json`) and, when needed, a
+separate array file (`.npz`). Coma coefficients fit entirely in the manifest.
+Each family saves its model using
 `save_<family>_calibration()` / `load_<family>_calibration()`. Models have strict
 versioned scientific schemas, canonical units, numerical settings and measured
-support. Coma is JSON only. The numerical table products use
+ranges. The numerical table products use
 `covariance-interpolators.npz`, `sensing-calibration-interpolators.npz`, and
-`reconstructor-noise-interpolator.npz`. Each manifest records its payload filename and
-SHA-256 digest. A changed payload gets a numbered filename, such as
-`covariance-interpolators-2.npz`, so the previous payload stays available while
-the manifest is published. Publishing identical data reuses the current named
-payload. Existing manifests still load using their recorded payload filenames.
+`reconstructor-noise-interpolator.npz`. Each manifest records the array file’s name and SHA-256 digest. A changed array file gets a numbered filename, such as
+`covariance-interpolators-2.npz`, so the previous array file stays available while
+the manifest is saved. Saving identical data reuses the current named
+array file. Existing manifests still load using their recorded array file filenames.
 Serialize writers.
 New files respect the process umask and replacement preserves file permissions.
 
 Loaders do not search native directories, infer another product generation,
-extrapolate support or use MASTSEL as a fallback. Model state is immutable;
+extrapolate calibrated ranges or use MASTSEL as a fallback. Model state is immutable;
 providers can be reused without exposing writable interpolation arrays.
 
-## Fitted-Product Identities
+## Model Files
 
-`read_calibration_product_identity()` captures the content identity of an
-explicit `model.json` and verifies its optional relative `payload` NPZ against
-`payload_sha256`. JSON-only products omit both fields. Scientific model loaders
-must separately validate their own schema, units, coefficients and support.
+`read_calibration_model_files()` returns the manifest and array-file paths and
+checksums for one calibrated model. It verifies the optional relative NPZ
+`array_file` against `array_file_sha256`. JSON-only models omit both fields.
+Scientific model loaders separately validate schema, units, coefficients and
+ranges.
 
-`CalibrationProductIdentity.verify()` checks every bound file. Orchestration
-can persist these identities and reject changed products before execution or
-resume, even when paths/settings remain unchanged. A completed result remains
-self-contained; analysis need not reopen those external files.
+`CalibrationModelFiles.verify()` checks that the manifest and array files still
+match their recorded checksums. Orchestration can retain these records and reject
+changed files before execution or resume, even when paths and settings are
+unchanged. A completed result remains self-contained; analysis need not reopen
+those external files.
 
 ## Numerical Precision
 
@@ -236,19 +260,19 @@ weights, one pooled mean, settling requirements and feedback normalization are
 unchanged. Numerical checks account for dtype and operation scale separately
 from physical acceptance criteria.
 
-Fitted products and reusable observations use version 2 with a precision
+Fitted products and reusable calibration data use version 2 with a precision
 declaration. Version-1 inputs remain readable without imposing the new-work
 default. Loaders preserve stored numeric values and do not invent producer
-precision for unlabelled fitted models. Version-2 numeric payloads must match
+precision for unlabelled fitted models. Version-2 numeric array files must match
 their declared dtype. Older noise-history files may contain float32 histories alongside
 float64 moments; their captured history precision is retained for quantization
 checks.
 
 `CovarianceFunctions`, `ReconstructorNoiseModel`, `ComaResponseModel` and
-`SensingCalibration` offer `prepare(dtype=...)` for immutable runtime conversion.
+`SensingModel` offer `prepare(dtype=...)` for immutable runtime conversion.
 Their producer-precision record remains unchanged, and the original file
 is neither mutated nor rewritten. This conversion does not run calibration.
-`support_precision` separately retains the coarsest coordinate rounding across
+`grid_precision` separately retains the coarsest coordinate rounding across
 conversion and save/load, so promotion keeps the original boundary queries
 valid without changing the producer record. It does not permit extrapolation.
 

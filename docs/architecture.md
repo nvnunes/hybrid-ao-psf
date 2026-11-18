@@ -108,21 +108,22 @@ provide pixel-space covariance or precomputed OTFs directly.
 
 Hybrid AO PSF owns physical calibration contracts, common configuration,
 measurement/build/simulation operations, numerical diagnostics, model persistence
-and fitted-product identities. `E2ECalibration` supplies common workflows with
+and calibrated model file checks. `E2ECalibration` supplies common workflows with
 distinct native reading/measurement hooks. Downstream subclasses own E2E setup,
 source compatibility/conversion, normalization, native execution and reuse
 checks. No opaque native metadata exchange or adapter registry is required.
 
-Reusable observations, standalone builders, explicit save/load operations and
-configured publication remain separate. Common code is shared by Python and
-native CLI workflows. Loaded calibrated products and offline builders require
+Reusable calibration data, model building and model saving remain separate.
+Configured build methods return results without writing files; explicit save
+methods write those results to the configured destinations. Common code is
+shared by Python and native CLI workflows. Loaded calibrated products and offline builders require
 neither a native subclass nor native files/software. Numerical kernels have one
 upstream owner; calibration does not depend on downstream correction modules.
 The four calibration products feed the separate concrete `E2ECalibratedModel`.
 It owns immutable prepared providers and standalone scientific LO composition,
-including reconstructor weights, scalar-bank assembly, actual-feedback noise
+including reconstructor weights, scalar covariance interpolation, actual-feedback noise
 propagation and displacement-mixture parameters. Its INI loader exposes
-validated product-content identities without acquisition metadata. It does not
+checked model-file paths and checksums without acquisition metadata. It does not
 construct science PSFs itself. The canonical engine combines its prediction
 with a science provider. See
 [Calibrated LO prediction](e2e-model.md) for this runtime boundary. See [Calibration](calibration.md) for lifecycle and scientific contracts.

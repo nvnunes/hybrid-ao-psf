@@ -19,7 +19,7 @@ from ._calibration_contracts import (
     _PhysicalRecord,
     _quantity,
 )
-from ._calibration_io import validate_observation_precision
+from ._calibration_io import validate_calibration_data_precision
 from ._calibration_products import immutable_metadata, load_product, save_product
 from ._covariance_calibration import CovarianceFunctions
 from ._io import atomic_output_path
@@ -27,12 +27,15 @@ from ._validation import coarsest_precision, snap_coordinate_range, validate_psf
 
 _KIND = "hybrid-ao-psf-reconstructor-noise"
 _MEASUREMENTS = "hybrid-ao-psf-reconstructor-measurements"
+_INTERPOLATION_CHECK_COUNT = 1200
+_INTERPOLATION_CHECK_SEED = 20261014
+_REDUCTION_QUERY_COUNT = 72
 
 
 def _axis(value, unit, name, *, dtype=np.float64):
     value = _quantity(value, unit, name, 1, dtype=dtype)
     if len(value) < 2 or np.any(value.value <= 0) or np.any(np.diff(value.value) <= 0):
-        raise ValueError(f"{name} requires >=2 increasing positive nodes")
+        raise ValueError(f"{name} requires >=2 increasing positive grid points")
     return value
 
 
@@ -41,32 +44,32 @@ def _axis(value, unit, name, *, dtype=np.float64):
 
 @dataclass(frozen=True, kw_only=True, eq=False)
 class ReconstructorCalibrationMeasurements(_PhysicalRecord):
-    """Complete ordered grid, holdout and equal-signal validation observations.
+    """Ordered grid measurements and their validation measurements.
 
     Attributes:
         dtype: Real calculation/state precision, float32 by default or float64.
         photons_per_frame: Increasing count axis; P*EE signal when ee is None.
         fwhm: Increasing angular width axis.
         ee: Increasing fractions in (0,1], or None for the product representation.
-        inputs: Ordered flattened grid, random holdouts, then 24 triples with
+        inputs: Flattened grid, interpolation check points, then 24 triples with
             identical P*EE and width but distinct P and EE.
-        covariance: Matching (queries,2,2) angular-squared observations.
-        holdouts: Positive number of independent interpolation checks.
-        seed: Nonnegative generator seed used for query construction.
+        covariance: Matching (queries,2,2) angular-squared measurements.
+        seed: Recorded seed for verifying previously measured inputs. Defaults
+            to the seed used by `measure_reconstructor()`.
 
     No detector settings or native files are retained. The full validation
-    observations are required to justify isotropy and the product reduction.
+    measurements are required to justify isotropy and the product reduction.
     """
 
     photons_per_frame: u.Quantity
     fwhm: u.Quantity
     inputs: ReconstructorNoiseInputs
     covariance: u.Quantity
-    holdouts: int
-    seed: int
+    seed: int = _INTERPOLATION_CHECK_SEED
     ee: u.Quantity | None = None
 
     dtype: DTypeLike = field(default=np.float32, kw_only=True)
+    _interpolation_check_count: int = field(init=False, repr=False)
 
     def __post_init__(self):
         object.__setattr__(self, "dtype", validate_psf_dtype(self.dtype))
@@ -79,7 +82,6 @@ class ReconstructorCalibrationMeasurements(_PhysicalRecord):
         )
         if encircled is not None and np.any(encircled.value > 1):
             raise ValueError("ee must be <=1")
-        _count(self.holdouts, "holdouts")
         _count(self.seed, "seed", 0)
         if not isinstance(self.inputs, ReconstructorNoiseInputs):
             raise TypeError("inputs must be ReconstructorNoiseInputs")
@@ -89,16 +91,21 @@ class ReconstructorCalibrationMeasurements(_PhysicalRecord):
             covariance=self.covariance, dtype=self.dtype
         ).covariance
         if covariance.shape[0] != len(self.inputs.ee):
-            raise ValueError("noise observations must align with ordered inputs")
+            raise ValueError("noise measurements must align with ordered inputs")
         object.__setattr__(self, "photons_per_frame", photons)
         object.__setattr__(self, "fwhm", widths)
         object.__setattr__(self, "ee", encircled)
         object.__setattr__(self, "covariance", covariance)
-        expected = reconstructor_calibration_inputs(
+        grid_count = photons.size * widths.size
+        if encircled is not None:
+            grid_count *= encircled.size
+        check_count = len(self.inputs.ee) - grid_count - _REDUCTION_QUERY_COUNT
+        _count(check_count, "interpolation check count")
+        expected = _reconstructor_calibration_inputs(
             photons,
             widths,
             ee=encircled,
-            holdouts=self.holdouts,
+            check_count=check_count,
             seed=self.seed,
             dtype=self.dtype,
         )
@@ -107,24 +114,27 @@ class ReconstructorCalibrationMeasurements(_PhysicalRecord):
                 getattr(expected, name).value, getattr(self.inputs, name).value
             ):
                 raise ValueError(
-                    "measurement inputs differ from the declared ordered grid/holdouts/reduction queries"
+                    "measurement inputs do not match the ordered grid and validation points"
                 )
 
+        object.__setattr__(self, "_interpolation_check_count", check_count)
 
-def reconstructor_calibration_inputs(
+
+def _reconstructor_calibration_inputs(
     photons_per_frame: u.Quantity,
     fwhm: u.Quantity,
     *,
     ee: u.Quantity | None = None,
-    holdouts: int = 1200,
-    seed: int = 20261014,
+    check_count: int = _INTERPOLATION_CHECK_COUNT,
+    seed: int = _INTERPOLATION_CHECK_SEED,
     dtype: DTypeLike = np.float32,
 ) -> ReconstructorNoiseInputs:
     """Construct the deterministic ordered batch for pre-filter noise calibration.
 
     Count/width inputs are increasing physical axes. ee=None uses a P*EE axis;
     a supplied increasing fraction axis keeps P and EE separate. The batch
-    contains flattened ij-grid nodes, seeded holdouts and 24 equal-signal triples.
+    contains flattened ij-grid points, seeded interpolation check points and
+    24 equal-signal triples.
     This function requires no calibration object or native software.
 
     Args:
@@ -132,15 +142,16 @@ def reconstructor_calibration_inputs(
             the product of photon count and encircled energy.
         fwhm: Increasing angular FWHM axis.
         ee: Optional increasing encircled-energy fractions.
-        holdouts: Positive number of seeded interpolation validation points.
-        seed: Seed controlling the ordered holdout batch.
+        check_count: Number of interpolation check points. Use the batch's
+            count when validating retained measurements.
+        seed: Seed controlling the ordered interpolation checks.
         dtype: Numerical precision for the generated coordinates.
 
     Returns:
-        Ordered grid, holdout and equal-signal cases for native measurement.
+        Ordered grid, interpolation and equal-signal cases for native measurement.
 
     Raises:
-        ValueError: If axes, holdout controls or precision are invalid.
+        ValueError: If axes, validation settings or precision are invalid.
     """
     dtype = validate_psf_dtype(dtype)
     photons = _axis(photons_per_frame, u.photon, "photons_per_frame", dtype=dtype).value
@@ -148,7 +159,6 @@ def reconstructor_calibration_inputs(
     encircled = None if ee is None else _axis(ee, u.one, "ee", dtype=dtype).value
     if encircled is not None and np.any(encircled > 1):
         raise ValueError("ee must be <=1")
-    _count(holdouts, "holdouts")
     _count(seed, "seed", 0)
     axes = (
         {"signal": photons, "fwhm": widths}
@@ -158,9 +168,9 @@ def reconstructor_calibration_inputs(
     grid = np.meshgrid(*axes.values(), indexing="ij")
     rng = np.random.default_rng(seed)
     random = {
-        name: rng.uniform(a[0], a[-1], holdouts).astype(dtype)
+        name: rng.uniform(a[0], a[-1], check_count).astype(dtype)
         if name == "ee"
-        else np.exp(rng.uniform(np.log(a[0]), np.log(a[-1]), holdouts).astype(dtype))
+        else np.exp(rng.uniform(np.log(a[0]), np.log(a[-1]), check_count).astype(dtype))
         for name, a in axes.items()
     }
     values = {
@@ -190,7 +200,7 @@ class ReconstructorNoiseModel(_PhysicalRecord):
 
     Attributes:
         producer_dtype: Recorded calibration precision, or None when unknown.
-        support_precision: Coarsest coordinate precision retained through preparation.
+        grid_precision: Coarsest coordinate precision retained through preparation.
         dtype: Real calculation/state precision, float32 by default or float64.
         photons_per_frame: Positive increasing count axis, P*EE when ee=None.
         fwhm: Positive increasing angular width axis.
@@ -213,7 +223,7 @@ class ReconstructorNoiseModel(_PhysicalRecord):
 
     dtype: DTypeLike = field(default=np.float32, kw_only=True)
     producer_dtype: DTypeLike | None = field(default=None, kw_only=True)
-    support_precision: DTypeLike | None = field(default=None, kw_only=True)
+    grid_precision: DTypeLike | None = field(default=None, kw_only=True)
 
     def __post_init__(self):
         object.__setattr__(self, "dtype", validate_psf_dtype(self.dtype))
@@ -223,8 +233,8 @@ class ReconstructorNoiseModel(_PhysicalRecord):
             )
         object.__setattr__(
             self,
-            "support_precision",
-            coarsest_precision(self.dtype, self.producer_dtype, self.support_precision),
+            "grid_precision",
+            coarsest_precision(self.dtype, self.producer_dtype, self.grid_precision),
         )
         photons = _axis(
             self.photons_per_frame, u.photon, "photons_per_frame", dtype=self.dtype
@@ -274,7 +284,7 @@ class ReconstructorNoiseModel(_PhysicalRecord):
             A separate pre-filter noise provider at the requested precision.
 
         Raises:
-            ValueError: If the precision is unsupported or conversion invalidates support.
+            ValueError: If the precision is unsupported or conversion invalidates the calibrated range.
         """
         return replace(self, dtype=validate_psf_dtype(dtype))
 
@@ -283,7 +293,7 @@ class ReconstructorNoiseModel(_PhysicalRecord):
     ) -> u.Quantity:
         """Return broadcast (...,2,2) angular covariance blocks in physical x/y.
 
-        Positive counts and widths and EE in (0,1] must lie inside table support.
+        Positive counts and widths and EE in (0,1] must lie inside table range.
         Product tables bound P*EE, rather than P and EE separately. No additional
         scientific approximation or extrapolation is applied during evaluation.
 
@@ -296,7 +306,7 @@ class ReconstructorNoiseModel(_PhysicalRecord):
             Independent x/y covariance for each broadcast query, in square milliarcseconds.
 
         Raises:
-            ValueError: If queries cannot broadcast or exceed measured support.
+            ValueError: If queries cannot broadcast or exceed measured range.
         """
         if not all(isinstance(v, u.Quantity) for v in (photons_per_frame, ee, fwhm)):
             raise TypeError("noise queries require physical quantities")
@@ -325,7 +335,7 @@ class ReconstructorNoiseModel(_PhysicalRecord):
             if self.ee is None
             else ("photons_per_frame", "ee", "fwhm")
         )
-        precision = self.support_precision
+        precision = self.grid_precision
         values = tuple(
             snap_coordinate_range(value, axis, dtype=precision, label=name)
             for name, value, axis in zip(names, values, axes, strict=True)
@@ -368,7 +378,7 @@ class ReconstructorNoiseModel(_PhysicalRecord):
             with interleaved x/y coordinates.
 
         Raises:
-            ValueError: If inputs are invalid or outside the model support.
+            ValueError: If inputs are invalid or outside the model range.
         """
         blocks = self.predict(photons_per_frame=photons_per_frame, ee=ee, fwhm=fwhm)
         if blocks.ndim != 3 or not len(blocks):
@@ -381,11 +391,11 @@ class ReconstructorNoiseModel(_PhysicalRecord):
 
 @dataclass(frozen=True, kw_only=True)
 class ReconstructorCalibrationResult:
-    """Standalone build output; publishing remains an explicit operation.
+    """Standalone build output; saving remains an explicit operation.
 
     Attributes:
         model: Immutable pre-filter noise prior.
-        diagnostics: Immutable node, holdout and representation checks.
+        diagnostics: Grid point, interpolation and representation checks.
     """
 
     model: ReconstructorNoiseModel
@@ -403,14 +413,14 @@ def build_reconstructor_calibration(
     interpolation: str = "log-linear",
     dtype: DTypeLike = np.float32,
 ) -> ReconstructorCalibrationResult:
-    """Validate observations and build the calibrated prior without native access.
+    """Validate measurements and build the calibrated prior without native access.
 
     Reject anisotropic/cross-axis priors and unjustified P*EE reduction. Preserve
-    population/isotropy thresholds, seeded holdout queries and interpolation
-    arithmetic. No files are opened or published by this operation.
+    population/isotropy thresholds, seeded interpolation checks and interpolation
+    arithmetic. No files are opened or saved by this operation.
 
     Args:
-        measurements: Grid and holdout pre-filter covariance observations.
+        measurements: Pre-filter covariance measurements for fitting and validation.
         interpolation: Strategy for interpolating the scalar variance prior.
         dtype: Numerical precision for validation and fitted state.
 
@@ -419,7 +429,7 @@ def build_reconstructor_calibration(
 
     Raises:
         TypeError: If measurements is not an ordered reconstructor record.
-        ValueError: If the observations do not support a valid scalar prior.
+        ValueError: If the measurements do not support a valid scalar prior.
     """
     if not isinstance(measurements, ReconstructorCalibrationMeasurements):
         raise TypeError("measurements must be ReconstructorCalibrationMeasurements")
@@ -449,17 +459,17 @@ def build_reconstructor_calibration(
         )
     )
     count = int(np.prod(dimensions))
-    holdouts = measurements.holdouts
-    if len(scalar) != count + holdouts + 72:
+    check_count = measurements._interpolation_check_count
+    if len(scalar) != count + check_count + _REDUCTION_QUERY_COUNT:
         raise ValueError("unexpected calibration batch length")
-    product = scalar[count + holdouts :].reshape(-1, 3)
+    product = scalar[count + check_count :].reshape(-1, 3)
     reduction = float(np.max(abs(product / product[:, :1] - 1)))
     if measurements.ee is None and reduction > max(1e-10, 8 * np.finfo(dtype).eps):
         raise ValueError("P*EE reduction is unsupported; use separate inputs")
     model = ReconstructorNoiseModel(
         dtype=dtype,
         producer_dtype=dtype,
-        support_precision=coarsest_precision(dtype, measurements.dtype),
+        grid_precision=coarsest_precision(dtype, measurements.dtype),
         photons_per_frame=measurements.photons_per_frame,
         fwhm=measurements.fwhm,
         ee=measurements.ee,
@@ -467,22 +477,22 @@ def build_reconstructor_calibration(
         interpolation=interpolation,
     )
     prediction = model.predict(
-        photons_per_frame=measurements.inputs.photons_per_frame[: count + holdouts],
-        ee=measurements.inputs.ee[: count + holdouts],
-        fwhm=measurements.inputs.fwhm[: count + holdouts],
+        photons_per_frame=measurements.inputs.photons_per_frame[: count + check_count],
+        ee=measurements.inputs.ee[: count + check_count],
+        fwhm=measurements.inputs.fwhm[: count + check_count],
     ).value[..., 0, 0]
-    node_error = float(np.max(abs(prediction[:count] / scalar[:count] - 1)))
-    if node_error > max(1e-12, 16 * np.finfo(dtype).eps):
-        raise ValueError("interpolator does not recover grid nodes")
-    error = prediction[count:] / scalar[count : count + holdouts] - 1
+    grid_point_error = float(np.max(abs(prediction[:count] / scalar[:count] - 1)))
+    if grid_point_error > max(1e-12, 16 * np.finfo(dtype).eps):
+        raise ValueError("interpolator does not reproduce values at grid points")
+    error = prediction[count:] / scalar[count : count + check_count] - 1
     return ReconstructorCalibrationResult(
         model=model,
         diagnostics={
-            "node_max_relative_error": node_error,
-            "holdout_count": holdouts,
-            "holdout_median_abs_percent": float(np.median(abs(error)) * 100),
-            "holdout_p95_abs_percent": float(np.percentile(abs(error), 95) * 100),
-            "holdout_max_abs_percent": float(np.max(abs(error)) * 100),
+            "grid_point_max_relative_error": grid_point_error,
+            "interpolation_check_count": check_count,
+            "interpolation_check_median_abs_percent": float(np.median(abs(error)) * 100),
+            "interpolation_check_p95_abs_percent": float(np.percentile(abs(error), 95) * 100),
+            "interpolation_check_max_abs_percent": float(np.max(abs(error)) * 100),
             "isotropy_max_relative_error": isotropy,
             "product_max_relative_error": reduction,
             "product_reduction_verified": reduction <= 1e-10,
@@ -500,13 +510,13 @@ def build_reconstructor_calibration(
 def save_reconstructor_calibration(
     model: ReconstructorNoiseModel, path: str | Path
 ) -> None:
-    """Publish the runtime prior at model.json, preserving accepted data on failure.
+    """Save the runtime prior at model.json, preserving accepted data on failure.
 
     Args:
         model: The fitted pre-filter reconstructor noise prior.
         path: Destination model.json manifest. Create its parent directories if
-            needed. Store the numerical payload beside the manifest. Replace
-            the manifest only after publishing the payload.
+            needed. Store the numerical array file beside the manifest. Replace
+            the manifest only after saving the array file.
 
     Raises:
         TypeError: If the input is not the expected calibration record.
@@ -525,7 +535,7 @@ def save_reconstructor_calibration(
         _KIND,
         {
             "precision": model.dtype.name,
-            "support_precision": model.support_precision.name,
+            "grid_precision": model.grid_precision.name,
             "producer_precision": None
             if model.producer_dtype is None
             else np.dtype(model.producer_dtype).name,
@@ -556,11 +566,11 @@ def load_reconstructor_calibration(path: str | Path) -> ReconstructorNoiseModel:
         ValueError: If its schema or numerical contents are invalid.
     """
     header, arrays = load_product(path, _KIND)
-    if (set(header) - {"precision", "producer_precision", "support_precision"}) != {
+    if (set(header) - {"precision", "producer_precision", "grid_precision"}) != {
         "schema",
         "version",
-        "payload",
-        "payload_sha256",
+        "array_file",
+        "array_file_sha256",
         "representation",
         "interpolation",
         "units",
@@ -587,7 +597,7 @@ def load_reconstructor_calibration(path: str | Path) -> ReconstructorNoiseModel:
     return ReconstructorNoiseModel(
         dtype=header.get("precision", arrays["variance"].dtype),
         producer_dtype=header.get("producer_precision"),
-        support_precision=header.get("support_precision"),
+        grid_precision=header.get("grid_precision"),
         photons_per_frame=arrays["photons_per_frame"] * u.photon,
         fwhm=arrays["fwhm"] * u.mas,
         variance=arrays["variance"] * u.mas**2,
@@ -605,7 +615,7 @@ def save_reconstructor_measurements(
     """Atomically retain the complete ordered physical batch for offline building.
 
     Args:
-        measurements: The ordered grid and validation observations.
+        measurements: The ordered grid and validation measurements.
         path: Destination NPZ file. Create its parent directories if
             needed. Atomically replace any existing destination.
 
@@ -618,7 +628,7 @@ def save_reconstructor_measurements(
         "schema": _MEASUREMENTS,
         "version": 2,
         "precision": measurements.dtype.name,
-        "holdouts": measurements.holdouts,
+        "holdouts": measurements._interpolation_check_count,
         "seed": measurements.seed,
         "representation": "product" if measurements.ee is None else "separate",
         "units": {"count": "ph", "fwhm": "mas", "ee": "", "covariance": "mas2"},
@@ -648,7 +658,7 @@ def load_reconstructor_measurements(
         path: Path to the saved NPZ file.
 
     Returns:
-        The ordered grid and validation observations reconstructed at its stored precision.
+        The ordered grid and validation measurements reconstructed at its stored precision.
 
     Raises:
         FileNotFoundError: If a required file is missing.
@@ -658,7 +668,7 @@ def load_reconstructor_measurements(
 
     with np.load(Path(path), allow_pickle=False) as saved:
         header = json.loads(str(saved["__header__"]))
-        validate_observation_precision(header, saved)
+        validate_calibration_data_precision(header, saved)
         if (
             (set(header) - ({"precision"} if header.get("version") == 2 else set()))
             != {"schema", "version", "holdouts", "seed", "representation", "units"}
@@ -683,7 +693,8 @@ def load_reconstructor_measurements(
             *(["ee"] if not product else []),
         }:
             raise ValueError("invalid reconstructor measurement fields")
-        return ReconstructorCalibrationMeasurements(
+        _count(header["holdouts"], "stored interpolation check count")
+        measurements = ReconstructorCalibrationMeasurements(
             dtype=header.get("precision", np.float64),
             photons_per_frame=saved["photons_per_frame"] * u.photon,
             fwhm=saved["fwhm"] * u.mas,
@@ -695,9 +706,11 @@ def load_reconstructor_measurements(
                 fwhm=saved["input_fwhm"] * u.mas,
             ),
             covariance=saved["covariance"] * u.mas**2,
-            holdouts=header["holdouts"],
             seed=header["seed"],
         )
+        if header["holdouts"] != measurements._interpolation_check_count:
+            raise ValueError("stored interpolation check count does not match the measurements")
+        return measurements
 
 
 # Solve the field-centre reconstructor
@@ -789,7 +802,7 @@ def build_lo_reconstructor(
     Unsupported queries and unsolvable covariance matrices propagate errors.
 
     Args:
-        covariances: Calibrated bank supplying atmospheric field covariances.
+        covariances: Calibrated interpolator supplying atmospheric field covariances.
         noise: Calibrated reconstructor noise prior.
         ngs_positions: Cartesian angular NGS positions with shape ``(NGS, 2)``.
         zenith_angle: Common angular viewing coordinate.
@@ -802,7 +815,7 @@ def build_lo_reconstructor(
         Dimensionless reconstructing weights with two interleaved columns per NGS.
 
     Raises:
-        ValueError: If the supplied inputs or their calibrated support are invalid.
+        ValueError: If the supplied inputs or their calibrated range are invalid.
     """
     from ._calibration_contracts import _angle
     from ._calibration_numerics import lo_reconstructor
@@ -846,17 +859,17 @@ def build_lo_reconstructor(
 # Validate the reconstructor against telemetry
 
 
-def validate_covariance_reconstructor(
+def _validate_covariance_reconstructor(
     covariances: CovarianceFunctions,
     noise: ReconstructorNoiseModel,
     telemetry: CovarianceTelemetry,
 ) -> Mapping:
     """Check calibrated-weight atmospheric assembly against direct matrix simulation.
 
-    Use matching uncentred telemetry for one measured ZA plane and the bank's
+    Use matching uncentred telemetry for one measured ZA plane and the interpolator's
     settled window. Choose one/two/three measured directions, build absolute
     weights with the calibrated prior, and use a controlled full-matrix sensing
-    response whose feedback eigenvalues are bank nodes. This isolates numerical
+    response whose feedback eigenvalues are grid points. This isolates numerical
     assembly from feedback interpolation and physical gain modelling. Compare
     command, science/command and residual covariances using one pooled mean.
     Raise on incompatible timing/directions or discrepancies above rtol=1e-12,
@@ -864,12 +877,12 @@ def validate_covariance_reconstructor(
     No native files, WFS model or MASTSEL calculation is used.
 
     Args:
-        covariances: Measured covariance bank.
+        covariances: Measured covariance interpolators.
         noise: Accepted reconstructor noise prior.
         telemetry: Matched histories at one measured zenith plane.
 
     Returns:
-        Immutable per-asterism evidence comparing bank and direct simulation.
+        Immutable per-asterism evidence comparing interpolator and direct simulation.
 
     Raises:
         TypeError: If inputs are not the required typed records.
@@ -880,15 +893,15 @@ def validate_covariance_reconstructor(
         or not isinstance(noise, ReconstructorNoiseModel)
         or not isinstance(telemetry, CovarianceTelemetry)
     ):
-        raise TypeError("calibrated bank, prior and physical telemetry required")
+        raise TypeError("calibrated interpolator, prior and physical telemetry required")
     if telemetry.frame_rate != covariances.controller.frame_rate:
         raise ValueError("validation and covariance frame rates differ")
     dtype = covariances.dtype
     cut = covariances.discard
     if telemetry.tilt.shape[1] - cut < 3:
         raise ValueError("insufficient validation frames after settling")
-    nodes = covariances.feedback[[0, -1]]
-    feedback = np.diag(nodes)
+    feedback_endpoints = covariances.feedback[[0, -1]]
+    feedback = np.diag(feedback_endpoints)
     chosen = np.linspace(
         0, len(telemetry.positions) - 1, min(3, len(telemetry.positions)), dtype=int
     )
@@ -950,7 +963,11 @@ def validate_covariance_reconstructor(
                 a = projection @ left
                 k += (
                     covariances.C_t_Tt(
-                        *science_position, xi, yi, nodes[p], zenith_angle=angle
+                        *science_position,
+                        xi,
+                        yi,
+                        feedback_endpoints[p],
+                        zenith_angle=angle,
                     ).value
                     @ a.T
                 )
@@ -960,7 +977,13 @@ def validate_covariance_reconstructor(
                         q += (
                             a
                             @ covariances.C_Tt_Tt(
-                                xi, yi, xg, yg, nodes[p], nodes[j], zenith_angle=angle
+                                xi,
+                                yi,
+                                xg,
+                                yg,
+                                feedback_endpoints[p],
+                                feedback_endpoints[j],
+                                zenith_angle=angle,
                             ).value
                             @ b.T
                         )

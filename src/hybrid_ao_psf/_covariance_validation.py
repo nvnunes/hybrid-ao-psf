@@ -21,6 +21,9 @@ from ._covariance_statistics import (
     scalar_filter,
 )
 
+BOOTSTRAP_DRAWS = 200
+BOOTSTRAP_SEED = 20261013
+
 
 def _cov(left, right):
     left = left - left.mean(-1, keepdims=True)
@@ -46,8 +49,8 @@ def assembly_check(source: HistoryArrays, settings: FilterSettings) -> dict:
         source.positions[chosen],
     )
     tables = covariance_tables(source, settings)
-    nodes = np.asarray(settings.strengths, dtype=dtype)
-    b = nodes[[0, -1]]
+    grid_feedback = np.asarray(settings.strengths, dtype=dtype)
+    b = grid_feedback[[0, -1]]
     basis = np.array([[1.0, 0.3], [0.1, 1.0]], dtype=dtype)
     inverse = np.linalg.inv(basis)
     projections = [np.outer(basis[:, p], inverse[p]) for p in range(2)]
@@ -92,12 +95,12 @@ def assembly_check(source: HistoryArrays, settings: FilterSettings) -> dict:
         )
         for i, ri in enumerate(weights):
             for p, pp in enumerate(projections):
-                ip = 0 if p == 0 else len(nodes) - 1
+                ip = 0 if p == 0 else len(grid_feedback) - 1
                 predicted_ka += tables["C_t_Tt"][0, i, ip] @ (pp @ ri).T
                 predicted_kc += h[i] * tables["C_t_Tc"][0, i, ip] @ (pp @ ri).T
                 for g, rg in enumerate(weights):
                     for q, pq in enumerate(projections):
-                        iq = 0 if q == 0 else len(nodes) - 1
+                        iq = 0 if q == 0 else len(grid_feedback) - 1
                         left, right = pp @ ri, pq @ rg
                         predicted_a += left @ tables["C_Tt_Tt"][i, g, ip, iq] @ right.T
                         predicted_c += (
@@ -154,11 +157,11 @@ def assembly_check(source: HistoryArrays, settings: FilterSettings) -> dict:
 class InterpolationDiagnostics:
     """Accumulate same-PH withheld feedback and reduced-grid spatial checks.
 
-    Feedback checks use adjacent-node midpoints and unequal strength pairs.
-    Spatial checks use a reduced rectangular grid (every other full-grid node),
-    with nearest-node filling and withheld actual directions. They describe
+    Feedback checks use midpoints between adjacent values and unequal strength pairs.
+    Spatial checks use every other point on the full grid, fill from the nearest
+    measured points and compare at withheld directions. They describe
     that coarser grid; they are not off-grid truth for the final interpolator.
-    Only a bounded set of direction pairs is retained, not full per-PH banks.
+    Only a bounded set of direction pairs is retained, not full per-PH covariance tables.
     """
 
     def __init__(self, source: HistoryArrays, settings: FilterSettings):
@@ -290,7 +293,8 @@ class InterpolationDiagnostics:
             else None,
             "spatial_training_count": len(self.training),
             "spatial_withheld_indices": self.withheld.tolist(),
-            "limitations": "Bounded same-PH checks; coarse withheld spatial design, not final-grid off-node truth. No between-ZA truth test.",
+            "limitations": ("Same-PH checks at withheld points on a coarser spatial grid. "
+                "No reference comparison between points on the final grid or between zenith angles."),
         }
 
 
@@ -300,10 +304,8 @@ def precision_report(
     *,
     direction_count: int,
     strength_count: int,
-    bootstrap_draws: int = 200,
-    seed: int = 20261013,
 ) -> dict:
-    """Whole-PH bootstrap precision and joint PSD of the retained feature bank.
+    """Whole-PH bootstrap precision and joint PSD of the retained feature set.
 
     grams contains within-PH covariance; means contains each PH's time mean.
     Resample both together and recalculate the pooled mean in each draw.
@@ -339,11 +341,11 @@ def precision_report(
     minimum = float(np.linalg.eigvalsh(correlation).min())
     if minimum < -max(1e-12, 8 * total * np.finfo(grams.dtype).eps):
         raise ValueError(f"Joint feature covariance is not PSD: {minimum}")
-    rng = np.random.default_rng(seed)
+    rng = np.random.default_rng(BOOTSTRAP_SEED)
     samples = np.array(
         [
             pooled(rng.integers(0, len(grams), len(grams)))
-            for _ in range(bootstrap_draws)
+            for _ in range(BOOTSTRAP_DRAWS)
         ]
     )
     errors = np.linalg.norm(samples - mean, axis=(1, 2)) / max(
@@ -374,8 +376,8 @@ def precision_report(
             errors_block * norm, [16, 50, 84]
         ).tolist()
     return {
-        "bootstrap_samples": bootstrap_draws,
-        "bootstrap_seed": seed,
+        "bootstrap_samples": BOOTSTRAP_DRAWS,
+        "bootstrap_seed": BOOTSTRAP_SEED,
         "ph_count": len(grams),
         "direction_count": direction_count,
         "strength_count": strength_count,
@@ -393,7 +395,7 @@ def precision_report(
         if half
         else None,
         "joint_correlation_min_eigenvalue": minimum,
-        "limitations": "Precision of selected direction/strength joint bank; not a guarantee for all queries.",
+        "limitations": "Precision of selected direction/strength joint covariance; not a guarantee for all queries.",
     }
 
 

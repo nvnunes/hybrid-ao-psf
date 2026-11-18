@@ -32,11 +32,11 @@ from ._calibration_contracts import (
     SensingWfsSampling,
 )
 from ._calibration_io import (
-    CalibrationFileIdentity,
-    CalibrationProductIdentity,
-    load_calibration_samples,
-    read_calibration_product_identity,
-    save_calibration_samples,
+    CalibrationFile,
+    CalibrationModelFiles,
+    load_calibration_data,
+    read_calibration_model_files,
+    save_calibration_data,
 )
 from ._coma_calibration import (
     ComaCalibrationMeasurements,
@@ -70,23 +70,19 @@ from ._reconstructor_calibration import (
     build_reconstructor_calibration,
     load_reconstructor_calibration,
     load_reconstructor_measurements,
-    reconstructor_calibration_inputs,
     save_reconstructor_calibration,
     save_reconstructor_measurements,
     solve_lo_reconstructor,
-    validate_covariance_reconstructor,
 )
 from ._sensing_calibration import (
-    SensingCalibration,
     SensingCalibrationResult,
+    SensingModel,
     build_sensing_calibration,
     load_sensing_calibration,
     save_sensing_calibration,
 )
 from ._sensing_measurements import (
     SensingCalibrationMeasurements,
-    WfsSensingStatistics,
-    estimate_sensing_statistics,
     load_sensing_measurements,
     save_sensing_measurements,
 )
@@ -99,8 +95,8 @@ from ._sensing_noise import (
 )
 from ._sensing_response import (
     SensingPrediction,
-    SensingResponseCalibration,
     SensingResponseModel,
+    SensingResponseResult,
     build_sensing_response,
 )
 from ._version import __version__
@@ -205,21 +201,20 @@ __all__ = [  # noqa: RUF022
     "E2ECalibratedModel",
     "load_e2e_calibrated_model",
     "E2ELowOrderPrediction",
-    # Calibration configuration and reusable observations
+    # Calibration configuration and reusable measurements
     "E2ECalibration",
     "E2ECalibrationConfiguration",
     "load_e2e_calibration_configuration",
     "CalibrationPhotometry",
     "FixedGainIntegrator",
-    "save_calibration_samples",
-    "load_calibration_samples",
-    "CalibrationProductIdentity",
-    "CalibrationFileIdentity",
-    "read_calibration_product_identity",
+    "save_calibration_data",
+    "load_calibration_data",
+    "CalibrationModelFiles",
+    "CalibrationFile",
+    "read_calibration_model_files",
     # Reconstructor noise calibration
     "ReconstructorCalibrationSettings",
     "ReconstructorNoiseInputs",
-    "reconstructor_calibration_inputs",
     "ReconstructorNoiseMeasurements",
     "ReconstructorCalibrationMeasurements",
     "save_reconstructor_measurements",
@@ -239,7 +234,6 @@ __all__ = [  # noqa: RUF022
     "build_covariance_calibration",
     "CovarianceCalibrationResult",
     "CovarianceFunctions",
-    "validate_covariance_reconstructor",
     "save_covariance_calibration",
     "load_covariance_calibration",
     # Coma calibration
@@ -264,10 +258,8 @@ __all__ = [  # noqa: RUF022
     "SensingCalibrationMeasurements",
     "save_sensing_measurements",
     "load_sensing_measurements",
-    "estimate_sensing_statistics",
-    "WfsSensingStatistics",
     "build_sensing_response",
-    "SensingResponseCalibration",
+    "SensingResponseResult",
     "SensingResponseModel",
     "SensingPrediction",
     "SensingNoiseRequest",
@@ -277,7 +269,7 @@ __all__ = [  # noqa: RUF022
     "load_sensing_noise",
     "build_sensing_calibration",
     "SensingCalibrationResult",
-    "SensingCalibration",
+    "SensingModel",
     "NoiseBlurModel",
     "save_sensing_calibration",
     "load_sensing_calibration",

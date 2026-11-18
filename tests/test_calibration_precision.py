@@ -46,13 +46,13 @@ def _reference(values, b, gain, delay):
 
 
 @pytest.mark.parametrize("dtype", [np.float32, np.float64])
-def test_filtered_pooled_covariance_bank_matches_independent_reference(tmp_path, dtype):
+def test_filtered_pooled_covariance_tables_matches_independent_reference(tmp_path, dtype):
     source = _source(dtype)
     controller = FixedGainIntegrator(
         dtype=dtype, gain=0.3, delay=2, frame_rate=500 * u.Hz
     )
     settings = CovarianceCalibrationSettings(
-        feedback=(0.2, 1.0, 2.0), bootstrap_draws=7
+        feedback=(0.2, 1.0, 2.0)
     )
     measured = measure_covariance_calibration(
         source, controller, settings=settings, dtype=dtype
@@ -107,13 +107,14 @@ def test_filtered_pooled_covariance_bank_matches_independent_reference(tmp_path,
     assert promoted.producer_dtype == dtype
     assert loaded.dtype == dtype
     assert not np.shares_memory(
-        promoted._bank.arrays["C_t_t"], loaded._bank.arrays["C_t_t"]
+        promoted._interpolator.arrays["C_t_t"], loaded._interpolator.arrays["C_t_t"]
     )
 
 
 @pytest.mark.parametrize("dtype", [np.float32, np.float64])
 def test_known_wfs_response_and_population_noise_in_selected_precision(dtype):
-    from hybrid_ao_psf import SensingWfsMeasurements, estimate_sensing_statistics
+    from hybrid_ao_psf import SensingWfsMeasurements
+    from hybrid_ao_psf._sensing_measurements import _estimate_sensing_statistics
 
     rng = np.random.default_rng(324)
     zero = rng.normal(size=(4096, 2)) @ np.array([[2.0, 0.3], [0.1, 1.0]]) + [
@@ -133,7 +134,7 @@ def test_known_wfs_response_and_population_noise_in_selected_precision(dtype):
     samples = SensingWfsMeasurements(
         dtype=dtype, zero=zero * u.mas, shifted=shifted * u.mas
     )
-    stats = estimate_sensing_statistics(
+    stats = _estimate_sensing_statistics(
         samples, displacement=10 * u.mas, block_draws=64, dtype=dtype
     )
     for name in (

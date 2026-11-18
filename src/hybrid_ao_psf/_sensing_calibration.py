@@ -24,8 +24,8 @@ from ._noise_blur import NoiseBlurModel
 from ._sensing_noise import SensingNoiseMeasurements
 from ._sensing_response import (
     SensingPrediction,
-    SensingResponseCalibration,
     SensingResponseModel,
+    SensingResponseResult,
 )
 from ._sensing_statistics import (
     PROJECTION_EDGES,
@@ -48,11 +48,11 @@ _UNITS = {
 
 
 @dataclass(frozen=True, kw_only=True)
-class SensingCalibration:
+class SensingModel:
     """Complete immutable sensing provider, independent of acquisition/measurement files.
 
     Attributes:
-        response: Gain/log-variance tables with measured field/magnitude/ZA support,
+        response: Gain/log-variance tables with measured field/magnitude/ZA ranges,
             photometric convention and fixed numerical controller.
         blur: Covariance-preserving two-Gaussian shape fitted to pooled measurement
             histories with equal single-/multiple-NGS family weights.
@@ -75,7 +75,7 @@ class SensingCalibration:
         """Numerical precision used by this complete runtime model."""
         return self.response.dtype
 
-    def prepare(self, *, dtype: DTypeLike = np.float32) -> SensingCalibration:
+    def prepare(self, *, dtype: DTypeLike = np.float32) -> SensingModel:
         """Create immutable runtime state at a requested precision.
 
         Args:
@@ -85,9 +85,9 @@ class SensingCalibration:
             A separate sensing response and blur model at the requested precision.
 
         Raises:
-            ValueError: If the precision is unsupported or conversion invalidates support.
+            ValueError: If the precision is unsupported or conversion invalidates the calibrated range.
         """
-        return SensingCalibration(
+        return SensingModel(
             response=self.response.prepare(dtype=dtype),
             blur=self.blur.prepare(dtype=dtype),
         )
@@ -113,7 +113,7 @@ class SensingCalibration:
 
         Raises:
             TypeError: If a physical input lacks its required quantity.
-            ValueError: If inputs are invalid or require interpolation outside measured support.
+            ValueError: If inputs are invalid or require interpolation outside measured range.
         """
         return self.response.predict(
             positions=positions, magnitudes=magnitudes, zenith_angle=zenith_angle
@@ -168,22 +168,22 @@ class SensingCalibrationResult:
     """Complete model plus immutable interpolation/shape/width-fit diagnostics.
 
     Attributes:
-        model: Publishable sensing provider; sensor tables alone are insufficient.
+        model: Saveable sensing provider; sensor tables alone are insufficient.
         diagnostics: Case-balanced optimizer evidence, full radial/projection
             statistics and per-case in-sample distribution/width checks.
     """
 
-    model: SensingCalibration
+    model: SensingModel
     diagnostics: Mapping
 
     def __post_init__(self):
-        if not isinstance(self.model, SensingCalibration):
-            raise TypeError("model must be complete SensingCalibration")
+        if not isinstance(self.model, SensingModel):
+            raise TypeError("model must be complete SensingModel")
         object.__setattr__(self, "diagnostics", immutable_metadata(self.diagnostics))
 
 
 def build_sensing_calibration(
-    response: SensingResponseCalibration,
+    response: SensingResponseResult,
     noise_measurements: Iterable[SensingNoiseMeasurements],
     *,
     dtype: DTypeLike = np.float32,
@@ -207,11 +207,11 @@ def build_sensing_calibration(
 
     Raises:
         TypeError: If response or measurement records have unsupported types.
-        ValueError: If measurement support is incomplete, histories conflict with
+        ValueError: If measurement grid is incomplete, histories conflict with
             the response, or the fit is invalid.
     """
-    if not isinstance(response, SensingResponseCalibration):
-        raise TypeError("prepared sensing response/banks required")
+    if not isinstance(response, SensingResponseResult):
+        raise TypeError("prepared sensing response/interpolators required")
     dtype = validate_psf_dtype(dtype)
     validation_models = {response.model.dtype: response.model}
     cases = []
@@ -285,7 +285,7 @@ def build_sensing_calibration(
             "noise-shape measurement must cover every measured response zenith plane"
         )
     blur, fit = fit_noise_blur(cases, dtype=dtype)
-    model = SensingCalibration(response=response.model.prepare(dtype=dtype), blur=blur)
+    model = SensingModel(response=response.model.prepare(dtype=dtype), blur=blur)
     diagnostic = {
         "final_fit": fit,
         "distribution_checks": [assess_noise_blur(blur, case) for case in cases],
@@ -302,7 +302,7 @@ def build_sensing_calibration(
                 case.statistics.projection_cdf.tolist() for case in cases
             ],
         },
-        "measured_inputs": response.bank_count,
+        "measured_inputs": response.measured_point_count,
         "asterisms": len(cases),
         "paired_displacement_samples": sum(
             case.statistics.sample_count for case in cases
@@ -313,20 +313,20 @@ def build_sensing_calibration(
     return SensingCalibrationResult(model=model, diagnostics=diagnostic)
 
 
-def save_sensing_calibration(model: SensingCalibration, path: str | Path) -> None:
-    """Publish the complete shared response/shape product, retaining acquisition data.
+def save_sensing_calibration(model: SensingModel, path: str | Path) -> None:
+    """Save the complete shared response/shape product, retaining acquisition data.
 
     Args:
         model: The complete sensing response and displacement shape.
         path: Destination model.json manifest. Create its parent directories if
-            needed. Store the numerical payload beside the manifest. Replace
-            the manifest only after publishing the payload.
+            needed. Store the numerical array file beside the manifest. Replace
+            the manifest only after saving the array file.
 
     Raises:
         TypeError: If the input is not the expected calibration record.
     """
-    if not isinstance(model, SensingCalibration):
-        raise TypeError("complete SensingCalibration required")
+    if not isinstance(model, SensingModel):
+        raise TypeError("complete SensingModel required")
     response = model.response
     save_product(
         path,
@@ -334,7 +334,7 @@ def save_sensing_calibration(model: SensingCalibration, path: str | Path) -> Non
         {
             "units": _UNITS,
             "precision": model.dtype.name,
-            "support_precision": response.support_precision.name,
+            "grid_precision": response.grid_precision.name,
             "producer_precision": None
             if response.producer_dtype is None
             else response.producer_dtype.name,
@@ -349,7 +349,7 @@ def save_sensing_calibration(model: SensingCalibration, path: str | Path) -> Non
     )
 
 
-def load_sensing_calibration(path: str | Path) -> SensingCalibration:
+def load_sensing_calibration(path: str | Path) -> SensingModel:
     """Load the exact shared runtime schema with immutable state and no native files.
 
     Args:
@@ -364,12 +364,12 @@ def load_sensing_calibration(path: str | Path) -> SensingCalibration:
     """
     header, arrays = load_product(path, _KIND)
     if (
-        (set(header) - {"precision", "producer_precision", "support_precision"})
+        (set(header) - {"precision", "producer_precision", "grid_precision"})
         != {
             "schema",
             "version",
-            "payload",
-            "payload_sha256",
+            "array_file",
+            "array_file_sha256",
             "units",
             "controller",
             "photometry",
@@ -393,8 +393,8 @@ def load_sensing_calibration(path: str | Path) -> SensingCalibration:
         header["field_radius_arcsec"] * u.arcsec,
         header["magnitude_intervals"],
         producer_dtype=header.get("producer_precision"),
-        support_precision=header.get("support_precision"),
+        grid_precision=header.get("grid_precision"),
     )
-    return SensingCalibration(
+    return SensingModel(
         response=response, blur=NoiseBlurModel(**header["noise_blur"], dtype=dtype)
     )

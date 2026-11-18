@@ -19,13 +19,13 @@ from ._calibration_contracts import (
     _PhysicalRecord,
     _quantity,
 )
-from ._calibration_io import validate_observation_precision
+from ._calibration_io import validate_calibration_data_precision
 from ._calibration_numerics import filter_input
 from ._calibration_products import controller_header, read_controller_header
 from ._covariance_calibration import CovarianceFunctions
 from ._io import atomic_output_path
 from ._reconstructor_calibration import ReconstructorNoiseModel, build_lo_reconstructor
-from ._sensing_response import SensingResponseCalibration
+from ._sensing_response import SensingResponseResult
 from ._sensing_statistics import pooled_displacement_moments
 from ._validation import validate_psf_dtype
 
@@ -56,7 +56,7 @@ class SensingNoiseRequest(_PhysicalRecord):
         dtype: Real calculation/state precision, float32 by default or float64.
         key: Nonempty case label, unique with zenith angle within a fit.
         population: Caller-defined sampling label retained in diagnostics.
-        zenith_angle: Scalar physical viewing angle of the captured noise banks.
+        zenith_angle: Scalar physical viewing angle of the captured noise samples.
         positions: Cartesian NGS directions, shape (N,2), angular.
         magnitudes: Per-NGS magnitudes in the measured photometric convention.
         ee: Per-NGS dimensionless HO encircled-energy fractions in (0,1].
@@ -267,7 +267,7 @@ def _validate_history_moments(record: SensingNoiseMeasurements) -> None:
 
 
 def simulate_sensing_noise(
-    response: SensingResponseCalibration,
+    response: SensingResponseResult,
     requests: Iterable[SensingNoiseRequest],
     covariances: CovarianceFunctions,
     noise_prior: ReconstructorNoiseModel,
@@ -279,15 +279,15 @@ def simulate_sensing_noise(
 
     Use zero command prehistory, discard the declared settling interval, then
     remove one pooled mean across retained frames and realizations. Preserve
-    the original star/draw order, rectangular bank mixing and selected-precision retained
+    the original star/draw order, rectangular mixing of noise samples and selected-precision retained
     histories. No E2E modules/files or calibration object are needed.
 
     Args:
-        response: Numerical sensing calibration with captured noise banks.
+        response: Numerical sensing calibration with captured noise samples.
         requests: Asterisms and seeds defining the independent measurement cases.
-        covariances: Bank used for atmospheric reconstruction geometry.
+        covariances: Covariance interpolators used for atmospheric reconstruction geometry.
         noise_prior: Separate pre-filter noise prior used in reconstruction.
-        settings: Optional observation-compatible noise-history and settling controls.
+        settings: Optional measurement-compatible noise-history and settling controls.
         dtype: Noise simulation arithmetic precision, either float32 or float64.
 
     Yields:
@@ -296,10 +296,10 @@ def simulate_sensing_noise(
 
     Raises:
         TypeError: If any provider or request is the wrong type.
-        ValueError: If the inputs conflict, a loop is unstable or support is exceeded.
+        ValueError: If the inputs conflict, a loop is unstable or the calibrated range is exceeded.
     """
     if (
-        not isinstance(response, SensingResponseCalibration)
+        not isinstance(response, SensingResponseResult)
         or not isinstance(covariances, CovarianceFunctions)
         or not isinstance(noise_prior, ReconstructorNoiseModel)
     ):
@@ -319,7 +319,7 @@ def simulate_sensing_noise(
         or settings.displacement != response._displacement
     ):
         raise ValueError(
-            "measurement sampling/displacement settings differ from captured observations"
+            "measurement sampling/displacement settings differ from captured measurements"
         )
     controller = response.model.controller
     if (
@@ -367,7 +367,7 @@ def simulate_sensing_noise(
         x = np.zeros((2, realizations, frames), dtype=dtype)
         rng = np.random.default_rng(request.seed)
         for g in range(n):
-            samples = response.draw_noise(
+            samples = response._draw_noise(
                 position=request.positions[g],
                 magnitude=request.magnitudes[g],
                 zenith_angle=request.zenith_angle,
@@ -465,7 +465,7 @@ def load_sensing_noise(path: str | Path) -> SensingNoiseMeasurements:
     """
     with np.load(Path(path), allow_pickle=False) as saved:
         header = json.loads(str(saved["__header__"]))
-        validate_observation_precision(header, saved, history_fields=("displacements",))
+        validate_calibration_data_precision(header, saved, history_fields=("displacements",))
         if (
             (set(header) - {"precision"})
             != {

@@ -21,8 +21,8 @@ from hybrid_ao_psf import (
     NoiseBlurModel,
     PsfMetricSamples,
     ReconstructorNoiseModel,
-    SensingCalibration,
     SensingCalibrationMeasurements,
+    SensingModel,
     SensingWfsMeasurements,
     SensingWfsSampling,
     build_covariance_calibration,
@@ -119,15 +119,15 @@ def synthetic():
         magnitude_intervals=[[8, 10]] * u.mag,
         dtype=np.float64,
     ).model
-    sensing = SensingCalibration(
+    sensing = SensingModel(
         response=sensor, blur=NoiseBlurModel(0.7, 0.3, 0.6, dtype=np.float64)
     )
     coma_model = ComaResponseModel(
         a0=0.08 * u.mas / u.nm,
         b=0.01 * u.mas / u.nm,
         m_half=9 * u.mag,
-        magnitude_support=[8, 10] * u.mag,
-        zenith_support=[0, 40] * u.deg,
+        magnitude_range=[8, 10] * u.mag,
+        zenith_range=[0, 40] * u.deg,
         photometry=photometry,
         dtype=np.float64,
     )
@@ -151,15 +151,15 @@ def synthetic():
     base = measure_covariance_calibration(
         record,
         controller,
-        settings=CovarianceCalibrationSettings(feedback=(0.2, 2.0), bootstrap_draws=3),
+        settings=CovarianceCalibrationSettings(feedback=(0.2, 2.0)),
         dtype=np.float64,
     )
-    bank = build_covariance_calibration([base], dtype=np.float64).model
+    covariances = build_covariance_calibration([base], dtype=np.float64).model
     strengths = [0.2, 2.0]
     for indices in ([0], [0, 8], [0, 8, 2]):
         positions = record.positions[indices]
         weights = build_lo_reconstructor(
-            bank,
+            covariances,
             prior,
             ngs_positions=positions,
             zenith_angle=record.zenith_angle,
@@ -179,14 +179,14 @@ def synthetic():
         record,
         controller,
         settings=CovarianceCalibrationSettings(
-            feedback=tuple(sorted(set(strengths))), bootstrap_draws=3
+            feedback=tuple(sorted(set(strengths)))
         ),
         dtype=np.float64,
     )
     assert measured.discard == base.discard
-    bank = build_covariance_calibration([measured], dtype=np.float64).model
+    covariances = build_covariance_calibration([measured], dtype=np.float64).model
     return E2ECalibratedModel(
-        covariance=bank,
+        covariance=covariances,
         coma=coma_model,
         sensing=sensing,
         reconstructor=prior,
@@ -373,7 +373,7 @@ def test_precision_immutability_and_input_rejection(synthetic, dtype, indices):
                 assert getattr(result, name).unit == expected.unit
             backing = backing.base
         np.testing.assert_array_equal(getattr(result, name), expected)
-    with pytest.raises(ValueError, match="support|outside"):
+    with pytest.raises(ValueError, match="range|outside"):
         model.predict(**(args | {"magnitudes": np.full(len(indices), 12) * u.mag}))
     with pytest.raises(ValueError, match="distinct"):
         model.predict(
@@ -479,7 +479,8 @@ def test_configured_native_free_loading_and_conflicts(synthetic, tmp_path, monke
 
     monkeypatch.setattr(builtins, "__import__", guarded)
     loaded = load_e2e_calibrated_model(ini)
-    assert len(loaded.product_identities) == 5
+    assert len(loaded.model_files) == 5
+    assert not hasattr(loaded, "product_identities")
     args = {
         "ngs_positions": record.positions[[0, 8]],
         "magnitudes": [9, 9] * u.mag,
@@ -490,7 +491,7 @@ def test_configured_native_free_loading_and_conflicts(synthetic, tmp_path, monke
         loaded.predict(**args).total, model.predict(**args).total
     )
     with pytest.raises(TypeError):
-        loaded.product_identities["other"] = None
+        loaded.model_files["other"] = None
     np.testing.assert_allclose(
         loaded.predict(
             **(
@@ -582,13 +583,13 @@ def test_unsupported_spatial_and_zenith_queries_are_rejected(synthetic):
         "science_positions": record.positions[[4]],
         "zenith_angle": 20 * u.deg,
     }
-    with pytest.raises(ValueError, match="support|outside"):
+    with pytest.raises(ValueError, match="range|outside"):
         model.predict(**(args | {"science_positions": [[10, 10]] * u.arcsec}))
     with pytest.raises(ValueError, match="range|fixed"):
         model.predict(**(args | {"zenith_angle": 60 * u.deg}))
 
 
-def test_complex_feedback_bank_uses_symmetric_part_but_noise_uses_actual(
+def test_complex_feedback_interpolation_uses_symmetric_part_but_noise_uses_actual(
     synthetic, monkeypatch
 ):
     import hybrid_ao_psf._lo_model as implementation
@@ -661,7 +662,7 @@ def test_complex_feedback_bank_uses_symmetric_part_but_noise_uses_actual(
 @pytest.mark.parametrize(
     "feedback,error",
     [
-        (np.eye(2) * 2.5, "support"),
+        (np.eye(2) * 2.5, "range"),
         (np.eye(2) * 4, "Unstable"),
         (np.array([[0.7, -0.6], [0.6, -0.1]]), "Unstable"),  # Symmetric part only.
         (np.array([[0.8, 1.0], [0, 0.8]]), "defective"),
@@ -697,7 +698,7 @@ def test_direct_model_construction_prepares_nested_provider_precision(synthetic,
     # Outer dtype agrees while the public nested blur/photometry disagree.
     other = np.float64 if dtype == np.float32 else np.float32
     response = model.sensing.response.prepare(dtype=dtype)
-    sensing = SensingCalibration(
+    sensing = SensingModel(
         response=response, blur=model.sensing.blur.prepare(dtype=other)
     )
     coma = replace(
@@ -718,7 +719,7 @@ def test_direct_model_construction_prepares_nested_provider_precision(synthetic,
 
 def test_direct_model_construction_validates_nested_values_after_rounding(synthetic):
     model, _ = synthetic
-    sensing = SensingCalibration(
+    sensing = SensingModel(
         response=model.sensing.response.prepare(dtype=np.float32),
         blur=NoiseBlurModel(0.999999999, 0.3, 0.6, dtype=np.float64),
     )
@@ -741,3 +742,63 @@ def test_prepared_controller_scalar_storage_and_units_are_immutable(synthetic, d
             assert controller.frame_rate.unit == u.Hz
         backing = backing.base
     assert controller.frame_rate == 500 * u.Hz
+
+
+@pytest.mark.parametrize("family", ["covariance", "coma", "sensing", "reconstructor"])
+def test_calibrated_models_use_grid_precision_without_former_names(
+    synthetic, tmp_path, family
+):
+    import json
+
+    import hybrid_ao_psf as api
+
+    model, _ = synthetic
+    source = getattr(model, family)
+    path = tmp_path / "model.json"
+    getattr(api, f"save_{family}_calibration")(source, path)
+    header = json.loads(path.read_text())
+    assert header["grid_precision"] == "float64"
+    assert "support_precision" not in header
+    loaded = getattr(api, f"load_{family}_calibration")(path)
+    response = loaded.response if family == "sensing" else loaded
+    assert response.grid_precision == np.dtype("float64")
+    assert not hasattr(response, "support_precision")
+    if family == "coma":
+        np.testing.assert_array_equal(loaded.magnitude_range, source.magnitude_range)
+        np.testing.assert_array_equal(loaded.zenith_range, source.zenith_range)
+        assert not hasattr(loaded, "magnitude_support")
+        assert not hasattr(loaded, "zenith_support")
+    if family == "sensing":
+        assert not hasattr(response, "support_mask")
+        with np.load(path.parent / header["array_file"]) as arrays:
+            assert "measured_mask" in arrays.files
+            assert "support" not in arrays.files
+            np.testing.assert_array_equal(arrays["measured_mask"], source.response.measured_mask)
+    header["support_precision"] = header.pop("grid_precision")
+    path.write_text(json.dumps(header))
+    with pytest.raises(ValueError):
+        getattr(api, f"load_{family}_calibration")(path)
+
+
+def test_sensing_measured_mask_rejects_interpolation_through_unmeasured_points(synthetic):
+    model, _ = synthetic
+    source = model.sensing.response
+    with pytest.raises(ValueError):
+        source.measured_mask.flags.writeable = True
+    arrays = {name: values.copy() for name, values in source._arrays.items()}
+    arrays["measured_mask"][0, 0, 0, 0] = False
+    masked = type(source)._from_arrays(
+        arrays, source.controller, source.photometry,
+        source.field_radius, source.magnitude_intervals.value,
+        producer_dtype=source.producer_dtype, grid_precision=source.grid_precision,
+    )
+    # This query is inside all ranges but needs the missing grid point.
+    with pytest.raises(ValueError, match="unmeasured grid points"):
+        masked.predict(
+            positions=[[-0.5, -0.5]] * u.arcsec,
+            magnitudes=9 * u.mag, zenith_angle=20 * u.deg,
+        )
+    masked.predict(
+        positions=[[1, 1]] * u.arcsec,
+        magnitudes=10 * u.mag, zenith_angle=20 * u.deg,
+    )

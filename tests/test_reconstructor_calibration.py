@@ -13,7 +13,6 @@ from astropy import units as u
 from hybrid_ao_psf import (
     E2ECalibration,
     E2ECalibrationConfiguration,
-    ReconstructorCalibrationSettings,
     ReconstructorNoiseMeasurements,
     build_reconstructor_calibration,
     load_reconstructor_calibration,
@@ -65,7 +64,6 @@ def calibration(tmp_path):
         science_psf=tmp_path / "absent/science.pkl",
         ngs_psf=tmp_path / "absent/ngs.pkl",
         ngs_metrics=tmp_path / "absent/metrics.pkl",
-        reconstructor=ReconstructorCalibrationSettings(holdouts=11),
         dtype=np.float64,
     )
     return SyntheticCalibration(config)
@@ -89,7 +87,7 @@ def test_measure_offline_build_roundtrip_and_support(calibration, tmp_path, sepa
     built = build_reconstructor_calibration(restored, dtype=np.float64)
     assert built.diagnostics["product_reduction_verified"]
     if not separate:
-        assert built.diagnostics["holdout_max_abs_percent"] < 1e-10
+        assert built.diagnostics["interpolation_check_max_abs_percent"] < 1e-10
     path = tmp_path / "model/model.json"
     save_reconstructor_calibration(built.model, path)
     model = load_reconstructor_calibration(path)
@@ -121,10 +119,10 @@ def test_measure_offline_build_roundtrip_and_support(calibration, tmp_path, sepa
     with pytest.raises(ValueError):
         model.variance.value.flags.writeable = True
     with pytest.raises(TypeError):
-        built.diagnostics["holdout_count"] = 0
+        built.diagnostics["interpolation_check_count"] = 0
 
 
-def test_interrupted_manifest_publication_preserves_accepted_prior(
+def test_interrupted_manifest_saving_preserves_accepted_prior(
     calibration, tmp_path, monkeypatch
 ):
     import hybrid_ao_psf._calibration_products as products
@@ -152,6 +150,32 @@ def test_interrupted_manifest_publication_preserves_accepted_prior(
     np.testing.assert_array_equal(
         load_reconstructor_calibration(path).variance, model.variance
     )
+
+
+@pytest.mark.parametrize(
+    "key, error",
+    [
+        ("holdouts", "stored interpolation check count"),
+        ("seed", "ordered grid and validation points"),
+    ],
+)
+def test_reconstructor_measurements_reject_wrong_validation_metadata(
+    calibration, tmp_path, key, error
+):
+    measurements = calibration.measure_reconstructor(
+        20 * u.deg, photons_per_frame=[1, 1000] * u.photon, fwhm=[80, 200] * u.mas
+    )
+    path = tmp_path / "measurements.npz"
+    save_reconstructor_measurements(measurements, path)
+    with np.load(path, allow_pickle=False) as saved:
+        arrays = dict(saved)
+    header = json.loads(str(arrays["__header__"]))
+    header[key] += 1
+    arrays["__header__"] = json.dumps(header)
+    np.savez_compressed(path, **arrays)
+
+    with pytest.raises(ValueError, match=error):
+        load_reconstructor_measurements(path)
 
 
 def test_wrong_product_units_are_rejected(calibration, tmp_path):
@@ -186,7 +210,7 @@ class Block(importlib.abc.MetaPathFinder):
 sys.meta_path.insert(0,Block())
 from hybrid_ao_psf import load_reconstructor_measurements,build_reconstructor_calibration
 result=build_reconstructor_calibration(load_reconstructor_measurements(sys.argv[1]))
-assert result.diagnostics['holdout_count']==11
+assert result.diagnostics['interpolation_check_count'] == 1200
 """
     subprocess.run([sys.executable, "-c", script, str(path)], check=True)
 

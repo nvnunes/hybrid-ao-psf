@@ -11,9 +11,9 @@ from hybrid_ao_psf import (
     ReconstructorNoiseMeasurements,
     ReconstructorNoiseModel,
     build_psf_metric_interpolator,
-    load_calibration_samples,
+    load_calibration_data,
     load_psf_metric_interpolator,
-    save_calibration_samples,
+    save_calibration_data,
     save_psf_metric_interpolator,
 )
 
@@ -69,9 +69,9 @@ def test_ngs_original_zenith_queries_survive_precision_loading(angles, tmp_path)
 
 
 @pytest.mark.parametrize("change", ["missing", "mismatch", "integer"])
-def test_v2_observation_precision_cannot_silently_round(tmp_path, change):
+def test_v2_measurement_precision_cannot_silently_round(tmp_path, change):
     path = tmp_path / "record.npz"
-    save_calibration_samples(
+    save_calibration_data(
         ReconstructorNoiseMeasurements(
             covariance=np.array([np.eye(2) * (1.0 + 1e-9)]) * u.mas**2, dtype=np.float64
         ),
@@ -89,11 +89,11 @@ def test_v2_observation_precision_cannot_silently_round(tmp_path, change):
     arrays["__header__"] = json.dumps(header)
     np.savez(path, **arrays)
     with pytest.raises(ValueError, match="precision|schema"):
-        load_calibration_samples(path)
+        load_calibration_data(path)
 
 
 @pytest.mark.parametrize("source_dtype", [np.float32, np.float64])
-def test_promoted_sensing_prediction_and_noise_draw_keep_source_nodes(source_dtype):
+def test_promoted_sensing_prediction_and_noise_draw_keep_source_grid_points(source_dtype):
     from hybrid_ao_psf import (
         CalibrationPhotometry,
         FixedGainIntegrator,
@@ -144,7 +144,7 @@ def test_promoted_sensing_prediction_and_noise_draw_keep_source_nodes(source_dty
             zenith_angle=20.2 * u.deg,
         )
         assert prediction.gain.dtype == response.model.dtype
-        draws = response.draw_noise(
+        draws = response._draw_noise(
             position=[0.1, 0.2] * u.arcsec,
             magnitude=8.1 * u.mag,
             zenith_angle=20.2 * u.deg,
@@ -153,7 +153,7 @@ def test_promoted_sensing_prediction_and_noise_draw_keep_source_nodes(source_dty
         )
         assert draws.dtype == response.model.dtype and draws.shape == (10, 2)
         with pytest.raises(ValueError, match="measured zenith|range"):
-            response.draw_noise(
+            response._draw_noise(
                 position=[0.1, 0.2] * u.arcsec,
                 magnitude=8.1 * u.mag,
                 zenith_angle=20.3 * u.deg,
@@ -181,7 +181,7 @@ def test_real_calibration_boundaries_reject_complex(dtype):
         controller.filter(np.ones((1, 10, 2)) * u.mas, np.eye(2, dtype=complex))
 
 
-def test_support_rounding_survives_preparation_and_product_roundtrip(tmp_path):
+def test_grid_rounding_survives_preparation_and_product_roundtrip(tmp_path):
     from hybrid_ao_psf import (
         load_reconstructor_calibration,
         save_reconstructor_calibration,
@@ -202,7 +202,7 @@ def test_support_rounding_survives_preparation_and_product_roundtrip(tmp_path):
         load_reconstructor_calibration(path).prepare(dtype=np.float64),
     ):
         assert model.producer_dtype == np.dtype("float64")
-        assert model.support_precision == np.dtype("float32")
+        assert model.grid_precision == np.dtype("float32")
         result = model.predict(
             photons_per_frame=0.1 * u.photon, ee=1 * u.one, fwhm=10.1 * u.mas
         )

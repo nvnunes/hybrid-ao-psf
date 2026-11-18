@@ -45,10 +45,10 @@ and reading saved PSFs.
 ## E2E Calibration
 
 The package root exports `E2ECalibration`, physical sample/settings/result types,
-family-specific measure/build/save/load operations and fitted-product identities.
+family-specific measure/build/save/load operations and calibrated model file checks.
 The four model types are `ReconstructorNoiseModel`, `CovarianceFunctions`,
-`ComaResponseModel` and `SensingCalibration`. The configured subclass supplies
-native observations; standalone builders, numerical simulation and loaded model
+`ComaResponseModel` and `SensingModel`. The configured subclass supplies
+native measurements; standalone builders, numerical simulation and loaded model
 evaluation need no native software. See [Calibration](calibration.md) for
 stages, physical conventions, configuration and product contracts.
 

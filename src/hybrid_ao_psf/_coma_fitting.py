@@ -9,6 +9,8 @@ from dataclasses import dataclass
 import numpy as np
 from scipy.optimize import minimize
 
+_HELDOUT_ZENITH_DEG = 30.0
+
 
 @dataclass(frozen=True)
 class _ResponseArrays:
@@ -225,12 +227,12 @@ def fit_airmass(
     standard_error,
     *,
     sensing_wavelength,
-    heldout_zenith=30.0,
 ):
     """Joint equal-ZA/magnitude fit, retaining the two-SE and held-out checks.
 
-    The caller selects ZA planes and the held-out angle. measurements and
-    standard_error are (ZA,magnitude). All three parameters are fitted together.
+    Measurements and standard errors have axes (zenith angle, magnitude).
+    Fit all three parameters together. Check the 30-degree plane when at least
+    three other planes are available to fit it independently.
     """
     dtype = np.asarray(measurements).dtype
     zeniths, magnitudes, measured, error = (
@@ -295,14 +297,14 @@ def fit_airmass(
         "maxRelativeError": np.max(np.abs(predicted / measured - 1)),
         "maxRelativeErrorBeyondSamplingUncertainty": excess,
     }
-    heldout = np.isclose(zeniths, heldout_zenith, rtol=0, atol=1e-9)
+    heldout = np.isclose(zeniths, _HELDOUT_ZENITH_DEG, rtol=0, atol=1e-9)
     if heldout.any() and (~heldout).sum() >= 3:
         p, ok = solve(x[~heldout], measured[~heldout])
         test = response_law(p, x[heldout], magnitudes)
         delta = test - measured[heldout]
         relative = np.max(np.abs(delta / measured[heldout]))
         result["heldout"] = {
-            "zenith": heldout_zenith,
+            "zenith": _HELDOUT_ZENITH_DEG,
             "parameters": p,
             "converged": bool(ok),
             "predicted": test,

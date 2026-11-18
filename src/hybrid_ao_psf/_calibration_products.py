@@ -1,4 +1,4 @@
-"""Bounded model publication and strict scientific-product envelopes."""
+"""Bounded model saving and strict scientific-product envelopes."""
 
 from __future__ import annotations
 
@@ -21,7 +21,7 @@ from ._io import atomic_output_path
 
 _PRODUCT_VERSIONS = {"hybrid-ao-psf-sensing-calibration": 3}
 
-_PAYLOAD_STEMS = {
+_ARRAY_FILE_STEMS = {
     "hybrid-ao-psf-covariance-functions": "covariance-interpolators",
     "hybrid-ao-psf-sensing-calibration": "sensing-calibration-interpolators",
     "hybrid-ao-psf-reconstructor-noise": "reconstructor-noise-interpolator",
@@ -51,43 +51,43 @@ def json_metadata(value):
     return value
 
 
-def payload_destination(path: Path, kind: str, digest: str) -> tuple[Path, bool]:
-    """Choose a descriptive payload path and report whether it can be reused.
+def array_file_destination(path: Path, kind: str, digest: str) -> tuple[Path, bool]:
+    """Choose a descriptive array file path and report whether it can be reused.
 
-    An identical current payload can be reused after verifying its bytes.
+    An identical current array file can be reused after verifying its bytes.
     Otherwise allocate a new name so the previous manifest stays usable until
-    publication completes. Serialized writers leave existing revisions intact.
+    saving completes. Serialized writers leave existing revisions intact.
     """
-    stem = _PAYLOAD_STEMS[kind]
+    stem = _ARRAY_FILE_STEMS[kind]
     try:
         current = json.loads(path.read_text())
     except (FileNotFoundError, ValueError):
         current = {}
-    if isinstance(current, dict) and current.get("payload_sha256") == digest:
-        name = current.get("payload")
+    if isinstance(current, dict) and current.get("array_file_sha256") == digest:
+        name = current.get("array_file")
         pattern = rf"{re.escape(stem)}(?:-[0-9]+)?\.npz"
         if isinstance(name, str) and re.fullmatch(pattern, name):
-            payload = path.with_name(name)
+            array_file = path.with_name(name)
             if (
-                payload.is_file()
-                and not payload.is_symlink()
-                and _digest(payload) == digest
+                array_file.is_file()
+                and not array_file.is_symlink()
+                and _digest(array_file) == digest
             ):
-                return payload, True
+                return array_file, True
 
     for revision in count(1):
         name = f"{stem}.npz" if revision == 1 else f"{stem}-{revision}.npz"
-        payload = path.with_name(name)
-        if not payload.exists() and not payload.is_symlink():
-            return payload, False
+        array_file = path.with_name(name)
+        if not array_file.exists() and not array_file.is_symlink():
+            return array_file, False
 
 
 def save_product(path, kind, metadata, arrays=None):
-    """Publish one model.json after its complete numeric payload is durable.
+    """Save one model.json after its complete numeric array file is durable.
 
-    Separate payload revisions keep the previously accepted manifest usable if
+    Separate array file revisions keep the previously accepted manifest usable if
     writing or replacement is interrupted. Writers must be serialized. Old
-    payloads remain available for bound readers; measurements are not replaced.
+    array files remain available for bound readers; measurements are not replaced.
     Both outputs use the existing atomic writer and file-mode convention.
     """
     path = Path(path).expanduser().resolve()
@@ -98,7 +98,7 @@ def save_product(path, kind, metadata, arrays=None):
         "version": _PRODUCT_VERSIONS.get(kind, 2),
         **json_metadata(metadata),
     }
-    if set(metadata) & {"schema", "version", "payload", "payload_sha256"}:
+    if set(metadata) & {"schema", "version", "array_file", "array_file_sha256"}:
         raise ValueError("product metadata cannot replace envelope fields")
     path.parent.mkdir(parents=True, exist_ok=True)
     if arrays is not None:
@@ -108,26 +108,26 @@ def save_product(path, kind, metadata, arrays=None):
         with tempfile.TemporaryDirectory(
             prefix=".calibration-", dir=path.parent
         ) as work:
-            temporary = Path(work) / "payload.npz"
+            temporary = Path(work) / "array_file.npz"
             with temporary.open("wb") as stream:
                 np.savez_compressed(stream, **arrays)
             digest = _digest(temporary)
-            payload, reused = payload_destination(path, kind, digest)
+            array_file, reused = array_file_destination(path, kind, digest)
             if not reused:
                 with (
-                    atomic_output_path(payload) as target,
+                    atomic_output_path(array_file) as target,
                     temporary.open("rb") as source,
                     target.open("wb") as destination,
                 ):
                     shutil.copyfileobj(source, destination, length=1024 * 1024)
-            header.update(payload=payload.name, payload_sha256=digest)
-    publish_manifest(path, header)
+            header.update(array_file=array_file.name, array_file_sha256=digest)
+    save_manifest(path, header)
 
 
-def publish_manifest(path, header, *, diagnostics=None):
+def save_manifest(path, header, *, diagnostics=None):
     """Replace this product's model/optional diagnostic JSON with bounded rollback.
 
-    Numeric payloads must already be complete. The two known metadata files are
+    Numeric array files must already be complete. The two known metadata files are
     backed up before writing; model.json commits last. Cancellation restores both
     old files, including when raised after rename. If restoration itself fails,
     retain the backups outside temporary cleanup and report their recovery path.
@@ -192,11 +192,11 @@ def publish_manifest(path, header, *, diagnostics=None):
 
 
 def load_product(path, kind):
-    """Read the exact envelope and verify payload identity before numeric loading."""
-    from ._calibration_io import read_calibration_product_identity
+    """Read the exact envelope and verify array file checksums before numeric loading."""
+    from ._calibration_io import read_calibration_model_files
 
     path = Path(path).expanduser().resolve()
-    identity = read_calibration_product_identity(path)
+    model_files = read_calibration_model_files(path)
     header = json.loads(path.read_text())
     versions = (_PRODUCT_VERSIONS[kind],) if kind in _PRODUCT_VERSIONS else (1, 2)
     if (
@@ -208,30 +208,30 @@ def load_product(path, kind):
     if header["version"] >= 2:
         if (
             header.get("precision") not in ("float32", "float64")
-            or header.get("support_precision", header.get("precision"))
+            or header.get("grid_precision", header.get("precision"))
             not in ("float32", "float64")
             or "producer_precision" not in header
             or header["producer_precision"] not in (None, "float32", "float64")
         ):
             raise ValueError("invalid calibration precision declaration")
-    elif {"precision", "producer_precision", "support_precision"} & header.keys():
+    elif {"precision", "producer_precision", "grid_precision"} & header.keys():
         raise ValueError("version 1 does not declare calibration precision")
     arrays = None
-    if "payload" in header:
-        with np.load(path.parent / header["payload"], allow_pickle=False) as saved:
+    if "array_file" in header:
+        with np.load(path.parent / header["array_file"], allow_pickle=False) as saved:
             arrays = {key: saved[key] for key in saved.files}
         if header["version"] >= 2 and any(
             (
                 value.dtype != np.dtype(bool)
-                if name in {"measured_mask", "support"}
+                if name == "measured_mask"
                 else value.dtype.kind not in "iu"
                 if name == "source_mapping"
                 else value.dtype != np.dtype(header["precision"])
             )
             for name, value in arrays.items()
         ):
-            raise ValueError("calibration payload precision disagrees with header")
-    identity.verify()
+            raise ValueError("calibration array file precision disagrees with header")
+    model_files.verify()
     return header, arrays
 
 

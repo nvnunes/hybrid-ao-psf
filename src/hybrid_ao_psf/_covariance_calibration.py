@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import json
 from collections.abc import Iterable, Mapping
-from dataclasses import dataclass, field, replace
+from dataclasses import asdict, dataclass, field, replace
 from pathlib import Path
 from types import MappingProxyType
 
@@ -22,7 +22,7 @@ from ._calibration_contracts import (
     _PhysicalRecord,
     _quantity,
 )
-from ._calibration_io import validate_observation_precision
+from ._calibration_io import validate_calibration_data_precision
 from ._calibration_numerics import settling_cut
 from ._calibration_products import (
     controller_header,
@@ -41,6 +41,8 @@ from ._covariance_statistics import (
     features,
 )
 from ._covariance_validation import (
+    BOOTSTRAP_DRAWS,
+    BOOTSTRAP_SEED,
     InterpolationDiagnostics,
     joint_query_check,
     pilot_diagnostics,
@@ -66,7 +68,7 @@ class CovarianceCalibrationMeasurements(_PhysicalRecord):
         zenith_angle: Viewing angle in [0,90) degrees.
         positions: Cartesian angular directions, (directions,2).
         controller: Fixed gain/delay/frame rate used for every independent reset.
-        settings: Feedback nodes, settling and whole-realization bootstrap controls.
+        settings: Feedback grid points and settling settings.
         discard: Common discarded frame count for all six functions.
         frames: Input frames per independent realization, before discard.
         realizations: Actual number of equally weighted histories.
@@ -280,8 +282,6 @@ def measure_covariance_calibration(
             np.array(means),
             direction_count=len(direction_indices),
             strength_count=len(feedback_indices),
-            bootstrap_draws=settings.bootstrap_draws,
-            seed=settings.seed,
         ),
     }
     for name in ("C_t_t", "C_Tc_Tc", "C_Tt_Tt"):
@@ -312,7 +312,7 @@ def measure_covariance_calibration(
     )
 
 
-# Fitted covariance bank and physical queries
+# Fitted covariance interpolators and physical queries
 
 
 def _readonly(value, dtype=None):
@@ -320,12 +320,12 @@ def _readonly(value, dtype=None):
     return np.frombuffer(value.tobytes(), dtype=value.dtype).reshape(value.shape)
 
 
-class _CovarianceBank:
+class _CovarianceInterpolator:
     """Private canonical-unit evaluator used by numerical diagnostics and queries."""
 
-    def __init__(self, arrays, support_dtype=None):
-        self.support_dtype = (
-            arrays["C_t_t"].dtype if support_dtype is None else np.dtype(support_dtype)
+    def __init__(self, arrays, grid_precision=None):
+        self.grid_precision = (
+            arrays["C_t_t"].dtype if grid_precision is None else np.dtype(grid_precision)
         )
         self.dtype = validate_psf_dtype(arrays["C_t_t"].dtype)
         self.arrays = {name: _readonly(value) for name, value in arrays.items()}
@@ -354,13 +354,13 @@ class _CovarianceBank:
         za, *args = fields
         za_bound = (
             2
-            * np.finfo(self.support_dtype).eps
+            * np.finfo(self.grid_precision).eps
             * max(1.0, abs(float(self.zeniths[0])), abs(float(self.zeniths[-1])))
         )
         if np.any(za < self.zeniths[0] - za_bound) or np.any(
             za > self.zeniths[-1] + za_bound
         ):
-            raise ValueError("zenith outside calibrated support")
+            raise ValueError("zenith outside calibrated range")
         za = np.clip(za, self.zeniths[0], self.zeniths[-1])
         names = (
             ["x1", "y1", "x2", "y2"]
@@ -377,12 +377,12 @@ class _CovarianceBank:
         ):
             bound = (
                 2
-                * np.finfo(self.support_dtype).eps
+                * np.finfo(self.grid_precision).eps
                 * max(1.0, abs(float(axis[0])), abs(float(axis[-1])))
             )
             if np.any(value < axis[0] - bound) or np.any(value > axis[-1] + bound):
                 raise ValueError(
-                    f"covariance query outside calibrated {label} support [{axis[0]}, {axis[-1]}]"
+                    f"covariance query outside calibrated {label} range [{axis[0]}, {axis[-1]}]"
                 )
             args[index] = np.clip(value, axis[0], axis[-1])
         points = np.column_stack(
@@ -415,7 +415,7 @@ class _CovarianceBank:
 
 @dataclass(frozen=True, init=False, eq=False)
 class CovarianceFunctions:
-    """Immutable six-function bank with physical public inputs and outputs.
+    """Immutable six-function interpolator with physical public inputs and outputs.
 
     Construction is performed by build_covariance_calibration or the strict
     loader. Queries broadcast Cartesian angular coordinates and dimensionless
@@ -424,11 +424,11 @@ class CovarianceFunctions:
     normalization is undone once after rectangular interpolation in airmass.
     """
 
-    _bank: _CovarianceBank
+    _interpolator: _CovarianceInterpolator
     _controller: FixedGainIntegrator
     _discard: int
     _producer_dtype: np.dtype | None
-    _support_precision: np.dtype
+    _grid_precision: np.dtype
 
     def __init__(self):
         raise TypeError(
@@ -442,9 +442,9 @@ class CovarianceFunctions:
         controller: FixedGainIntegrator,
         discard: int,
         producer_dtype: DTypeLike | None = None,
-        support_precision: DTypeLike | None = None,
+        grid_precision: DTypeLike | None = None,
     ) -> CovarianceFunctions:
-        """Validate and own a rectangular bank for build, load, and preparation.
+        """Validate and own a rectangular interpolator for build, load, and preparation.
 
         Args:
             arrays: Airmass and zenith-in-degrees axes for the same planes, x/y
@@ -454,12 +454,12 @@ class CovarianceFunctions:
                 input, in left-to-right order. The final axes are physical x/y
                 covariance components, with units given by ``FUNCTIONS``. The
                 ``(x, y)`` measured mask and source-index map identify which
-                rectangular nodes come from each measured direction.
+                rectangular grid coordinates come from each measured direction.
             controller: Fixed integrator used to measure all planes.
             discard: Number of settling frames removed from each history.
             producer_dtype: Original calibration precision, if recorded.
-            support_precision: Coarsest precision already retained for support
-                comparisons. The bank uses the coarsest of this, producer
+            grid_precision: Coarsest precision already retained for grid
+                comparisons. The interpolator uses the coarsest of this, producer
                 precision, and the current table dtype.
 
         Returns:
@@ -467,7 +467,7 @@ class CovarianceFunctions:
             precision of the supplied covariance tables.
 
         Raises:
-            ValueError: If grid support, mapping, table shapes, precision, or
+            ValueError: If grid ranges, mapping, table shapes, precision, or
                 settling metadata are inconsistent.
         """
         dtype = validate_psf_dtype(arrays["C_t_t"].dtype)
@@ -500,12 +500,12 @@ class CovarianceFunctions:
             or len(arrays["x_arcsec"]) < 2
             or len(arrays["y_arcsec"]) < 2
         ):
-            raise ValueError("invalid covariance spatial/feedback/zenith support")
-        support_precision = coarsest_precision(dtype, producer_dtype, support_precision)
+            raise ValueError("invalid covariance spatial/feedback/zenith ranges")
+        grid_precision = coarsest_precision(dtype, producer_dtype, grid_precision)
         if not np.allclose(
             arrays["airmass"],
             1 / np.cos(np.deg2rad(za)),
-            rtol=max(1e-12, 4 * np.finfo(support_precision).eps),
+            rtol=max(1e-12, 4 * np.finfo(grid_precision).eps),
             atol=0,
         ):
             raise ValueError("airmass and zenith axes disagree")
@@ -541,8 +541,8 @@ class CovarianceFunctions:
             ):
                 raise ValueError(f"invalid normalized covariance table {name}")
         result = object.__new__(cls)
-        object.__setattr__(result, "_support_precision", support_precision)
-        object.__setattr__(result, "_bank", _CovarianceBank(arrays, support_precision))
+        object.__setattr__(result, "_grid_precision", grid_precision)
+        object.__setattr__(result, "_interpolator", _CovarianceInterpolator(arrays, grid_precision))
         object.__setattr__(result, "_controller", controller)
         object.__setattr__(result, "_discard", discard)
         object.__setattr__(
@@ -554,8 +554,8 @@ class CovarianceFunctions:
 
     @property
     def dtype(self) -> np.dtype:
-        """Numerical precision of this loaded or prepared bank."""
-        return self._bank.dtype
+        """Numerical precision of this loaded or prepared interpolator."""
+        return self._interpolator.dtype
 
     @property
     def producer_dtype(self) -> np.dtype | None:
@@ -563,9 +563,9 @@ class CovarianceFunctions:
         return self._producer_dtype
 
     @property
-    def support_precision(self) -> np.dtype:
+    def grid_precision(self) -> np.dtype:
         """Coarsest coordinate precision retained through preparation and loading."""
-        return self._support_precision
+        return self._grid_precision
 
     @property
     def controller(self) -> FixedGainIntegrator:
@@ -579,23 +579,23 @@ class CovarianceFunctions:
 
     @property
     def zenith_angles(self) -> u.Quantity:
-        """Return the measured viewing-angle nodes, in degrees."""
-        return u.Quantity(self._bank.zeniths, u.deg, copy=False)
+        """Return the measured zenith angles, in degrees."""
+        return u.Quantity(self._interpolator.zeniths, u.deg, copy=False)
 
     @property
     def x(self) -> u.Quantity:
-        """Return the rectangular Cartesian x nodes, in arcseconds."""
-        return u.Quantity(self._bank.x, u.arcsec, copy=False)
+        """Return the rectangular Cartesian x coordinates, in arcseconds."""
+        return u.Quantity(self._interpolator.x, u.arcsec, copy=False)
 
     @property
     def y(self) -> u.Quantity:
-        """Return the rectangular Cartesian y nodes, in arcseconds."""
-        return u.Quantity(self._bank.y, u.arcsec, copy=False)
+        """Return the rectangular Cartesian y coordinates, in arcseconds."""
+        return u.Quantity(self._interpolator.y, u.arcsec, copy=False)
 
     @property
     def feedback(self) -> np.ndarray:
-        """Return immutable increasing scalar feedback nodes."""
-        return self._bank.strengths.view()
+        """Return immutable increasing scalar feedback grid points."""
+        return self._interpolator.strengths.view()
 
     @property
     def normalized_tables(self) -> Mapping[str, u.Quantity]:
@@ -606,7 +606,7 @@ class CovarianceFunctions:
         """
         return MappingProxyType(
             {
-                name: u.Quantity(self._bank.arrays[name], u.Unit(unit), copy=False)
+                name: u.Quantity(self._interpolator.arrays[name], u.Unit(unit), copy=False)
                 for name, (_, _, unit) in FUNCTIONS.items()
             }
         )
@@ -618,7 +618,7 @@ class CovarianceFunctions:
             dtype: Float32 or float64 for query calculations.
 
         Returns:
-            A separate provider with the same support and controller.
+            A separate provider with the same grid and controller.
 
         Raises:
             ValueError: If the precision is unsupported or rounding collapses
@@ -627,14 +627,14 @@ class CovarianceFunctions:
         dtype = validate_psf_dtype(dtype)
         arrays = {
             name: value.astype(dtype) if value.dtype.kind == "f" else value.copy()
-            for name, value in self._bank.arrays.items()
+            for name, value in self._interpolator.arrays.items()
         }
         return self._from_arrays(
             arrays,
             replace(self.controller, dtype=dtype),
             self.discard,
             self.producer_dtype,
-            self.support_precision,
+            self.grid_precision,
         )
 
     def _evaluate(self, name, coordinates, zenith_angle):
@@ -654,7 +654,7 @@ class CovarianceFunctions:
             for value in [*args, zenith_angle.value]
         ):
             raise ValueError("covariance coordinates and feedback must be real")
-        return self._bank.evaluate(name, args, zenith_angle.to_value(u.deg)) * u.Unit(
+        return self._interpolator.evaluate(name, args, zenith_angle.to_value(u.deg)) * u.Unit(
             FUNCTIONS[name][2]
         )
 
@@ -674,7 +674,7 @@ class CovarianceFunctions:
             y1: First field direction's y-coordinate in angular units.
             x2: Second field direction's x-coordinate in angular units.
             y2: Second field direction's y-coordinate in angular units.
-            zenith_angle: Observation zenith angle in angular units.
+            zenith_angle: Measurement zenith angle in angular units.
 
         Returns:
             Covariance in square milliarcseconds, with shape
@@ -683,7 +683,7 @@ class CovarianceFunctions:
 
         Raises:
             TypeError: If field coordinates or zenith angle lack physical quantities.
-            ValueError: If inputs cannot broadcast or are outside calibrated support.
+            ValueError: If inputs cannot broadcast or are outside calibrated range.
         """
         return self._evaluate("C_t_t", [x1, y1, x2, y2], zenith_angle)
 
@@ -707,7 +707,7 @@ class CovarianceFunctions:
             y2: Second field direction's y-coordinate in angular units.
             b1: Dimensionless loop feedback for the first direction.
             b2: Dimensionless loop feedback for the second direction.
-            zenith_angle: Observation zenith angle in angular units.
+            zenith_angle: Measurement zenith angle in angular units.
 
         Returns:
             Covariance in square nanometres of OPD, with shape
@@ -716,7 +716,7 @@ class CovarianceFunctions:
 
         Raises:
             TypeError: If field coordinates or zenith angle lack physical quantities.
-            ValueError: If inputs cannot broadcast or are outside calibrated support.
+            ValueError: If inputs cannot broadcast or are outside calibrated range.
         """
         return self._evaluate("C_Tc_Tc", [x1, y1, x2, y2, b1, b2], zenith_angle)
 
@@ -738,7 +738,7 @@ class CovarianceFunctions:
             x2: Second field direction's x-coordinate in angular units.
             y2: Second field direction's y-coordinate in angular units.
             b2: Dimensionless loop feedback for the second direction.
-            zenith_angle: Observation zenith angle in angular units.
+            zenith_angle: Measurement zenith angle in angular units.
 
         Returns:
             Covariance in milliarcseconds times nanometres of OPD, with shape
@@ -747,7 +747,7 @@ class CovarianceFunctions:
 
         Raises:
             TypeError: If field coordinates or zenith angle lack physical quantities.
-            ValueError: If inputs cannot broadcast or are outside calibrated support.
+            ValueError: If inputs cannot broadcast or are outside calibrated range.
         """
         return self._evaluate("C_t_Tc", [x1, y1, x2, y2, b2], zenith_angle)
 
@@ -771,7 +771,7 @@ class CovarianceFunctions:
             y2: Second field direction's y-coordinate in angular units.
             b1: Dimensionless loop feedback for the first direction.
             b2: Dimensionless loop feedback for the second direction.
-            zenith_angle: Observation zenith angle in angular units.
+            zenith_angle: Measurement zenith angle in angular units.
 
         Returns:
             Covariance in milliarcseconds times nanometres of OPD, with shape
@@ -780,7 +780,7 @@ class CovarianceFunctions:
 
         Raises:
             TypeError: If field coordinates or zenith angle lack physical quantities.
-            ValueError: If inputs cannot broadcast or are outside calibrated support.
+            ValueError: If inputs cannot broadcast or are outside calibrated range.
         """
         return self._evaluate("C_Tt_Tc", [x1, y1, x2, y2, b1, b2], zenith_angle)
 
@@ -804,7 +804,7 @@ class CovarianceFunctions:
             y2: Second field direction's y-coordinate in angular units.
             b1: Dimensionless loop feedback for the first direction.
             b2: Dimensionless loop feedback for the second direction.
-            zenith_angle: Observation zenith angle in angular units.
+            zenith_angle: Measurement zenith angle in angular units.
 
         Returns:
             Covariance in square milliarcseconds, with shape
@@ -813,7 +813,7 @@ class CovarianceFunctions:
 
         Raises:
             TypeError: If field coordinates or zenith angle lack physical quantities.
-            ValueError: If inputs cannot broadcast or are outside calibrated support.
+            ValueError: If inputs cannot broadcast or are outside calibrated range.
         """
         return self._evaluate("C_Tt_Tt", [x1, y1, x2, y2, b1, b2], zenith_angle)
 
@@ -835,7 +835,7 @@ class CovarianceFunctions:
             x2: Second field direction's x-coordinate in angular units.
             y2: Second field direction's y-coordinate in angular units.
             b2: Dimensionless loop feedback for the second direction.
-            zenith_angle: Observation zenith angle in angular units.
+            zenith_angle: Measurement zenith angle in angular units.
 
         Returns:
             Covariance in square milliarcseconds, with shape
@@ -844,21 +844,21 @@ class CovarianceFunctions:
 
         Raises:
             TypeError: If field coordinates or zenith angle lack physical quantities.
-            ValueError: If inputs cannot broadcast or are outside calibrated support.
+            ValueError: If inputs cannot broadcast or are outside calibrated range.
         """
         return self._evaluate("C_t_Tt", [x1, y1, x2, y2, b2], zenith_angle)
 
 
-# Build a multi-zenith bank
+# Build a multi-zenith interpolator
 
 
 @dataclass(frozen=True, kw_only=True)
 class CovarianceCalibrationResult:
-    """Standalone covariance build output, without implicit publication.
+    """Standalone covariance build output, without implicit saving.
 
     Attributes:
-        model: Immutable combined multi-zenith six-function interpolator bank.
-        diagnostics: Immutable knot/joint-validity and per-plane diagnostics.
+        model: Immutable combined multi-zenith six-function interpolator.
+        diagnostics: Grid point errors, joint covariance checks and per-plane diagnostics.
     """
 
     model: CovarianceFunctions
@@ -875,23 +875,23 @@ def build_covariance_calibration(
     *,
     dtype: DTypeLike = np.float32,
 ) -> CovarianceCalibrationResult:
-    """Combine compatible measured planes into one rectangular covariance bank.
+    """Combine compatible measured planes into rectangular covariance interpolators.
 
     Require the same directions, cadence, controller, feedback and settled window;
-    realization counts may differ. Nearest-node corner filling, normalization
-    and interpolation in airmass preserve the accepted numerical procedure.
+    realization counts may differ. Fill corners from the nearest measured point,
+    normalize by feedback and interpolate in airmass.
     Native metadata and sources are neither inspected nor retained.
 
     Args:
-        planes: Measurements with distinct zenith angles and compatible support.
+        planes: Measurements with distinct zenith angles and compatible grids.
         dtype: Float32 or float64 for fitted state and queries.
 
     Returns:
-        A read-only six-function bank and numerical validation diagnostics.
+        A read-only six-function interpolator and numerical validation diagnostics.
 
     Raises:
         ValueError: If measurements conflict, precision is unsupported or
-            the bank fails knot recovery.
+            interpolation fails to reproduce values at grid points.
     """
     planes = sorted(planes, key=lambda plane: plane.zenith_angle.value)
     if not planes or any(
@@ -970,38 +970,38 @@ def build_covariance_calibration(
                 if right:
                     args.append(plane.settings.feedback[-1])
                     index.append(len(plane.settings.feedback) - 1)
-                actual = model._bank.evaluate(name, args, plane.zenith_angle.value)
+                actual = model._interpolator.evaluate(name, args, plane.zenith_angle.value)
                 expected = plane.tables[name].value[tuple(index)]
                 scale = max(float(np.linalg.norm(expected)), np.finfo(float).tiny)
                 maximum = max(maximum, float(np.linalg.norm(actual - expected) / scale))
             if maximum > max(1e-12, 16 * np.finfo(first.dtype).eps):
-                raise ValueError(f"interpolation knot recovery failed for {name}")
+                raise ValueError(f"interpolation did not reproduce grid values for {name}")
             errors[f"za{plane.zenith_angle.value:g}_{name}"] = maximum
     return CovarianceCalibrationResult(
         model=model,
         diagnostics={
-            "knot_scaled_errors": errors,
+            "grid_point_scaled_errors": errors,
             "za_count": len(planes),
             "array_bytes": sum(value.nbytes for value in arrays.values()),
-            "joint_query": joint_query_check(model._bank),
+            "joint_query": joint_query_check(model._interpolator),
             "plane_diagnostics": [json_metadata(plane.diagnostics) for plane in planes],
         },
     )
 
 
-# Save and load fitted banks
+# Save and load fitted interpolators
 
 
 def save_covariance_calibration(model: CovarianceFunctions, path: str | Path) -> None:
-    """Publish one combined runtime bank at model.json, retaining measurements.
+    """Save one combined runtime interpolator at model.json, retaining measurements.
 
     Args:
-        model: Fitted covariance bank to publish.
-        path: Destination JSON manifest. The companion array payload is stored
-            beside it. The manifest is replaced after publishing the payload.
+        model: Fitted covariance interpolators to save.
+        path: Destination JSON manifest. The companion array file is stored
+            beside it. The manifest is replaced after saving the array file.
 
     Raises:
-        TypeError: If model is not a CovarianceFunctions bank.
+        TypeError: If model is not a CovarianceFunctions interpolator.
     """
     if not isinstance(model, CovarianceFunctions):
         raise TypeError("model must be CovarianceFunctions")
@@ -1011,7 +1011,7 @@ def save_covariance_calibration(model: CovarianceFunctions, path: str | Path) ->
         {
             "units": _UNITS,
             "precision": model.dtype.name,
-            "support_precision": model.support_precision.name,
+            "grid_precision": model.grid_precision.name,
             "producer_precision": None
             if model.producer_dtype is None
             else model.producer_dtype.name,
@@ -1019,31 +1019,31 @@ def save_covariance_calibration(model: CovarianceFunctions, path: str | Path) ->
             "controller": controller_header(model.controller),
             "discard": model.discard,
         },
-        model._bank.arrays,
+        model._interpolator.arrays,
     )
 
 
 def load_covariance_calibration(path: str | Path) -> CovarianceFunctions:
-    """Load a strict immutable bank without source histories or E2E software.
+    """Load a strict immutable interpolator without source histories or E2E software.
 
     Args:
-        path: JSON manifest identifying the companion array payload.
+        path: JSON manifest identifying the companion array file.
 
     Returns:
-        The fitted covariance bank in its stored precision.
+        The fitted covariance interpolators in its stored precision.
 
     Raises:
-        FileNotFoundError: If the manifest or payload is missing.
-        ValueError: If schema, payload identity, units or support are invalid.
+        FileNotFoundError: If the manifest or array file is missing.
+        ValueError: If schema, array file identity, units or ranges are invalid.
     """
     header, arrays = load_product(path, _KIND)
     if (
-        (set(header) - {"precision", "producer_precision", "support_precision"})
+        (set(header) - {"precision", "producer_precision", "grid_precision"})
         != {
             "schema",
             "version",
-            "payload",
-            "payload_sha256",
+            "array_file",
+            "array_file_sha256",
             "units",
             "normalization",
             "controller",
@@ -1056,7 +1056,7 @@ def load_covariance_calibration(path: str | Path) -> CovarianceFunctions:
         raise ValueError("invalid covariance product fields, units or normalization")
     dtype = validate_psf_dtype(header.get("precision", arrays["C_t_t"].dtype))
     if dtype != arrays["C_t_t"].dtype:
-        raise ValueError("covariance payload precision disagrees with header")
+        raise ValueError("covariance array file precision disagrees with header")
     controller = FixedGainIntegrator(
         dtype=dtype,
         gain=header["controller"]["gain"],
@@ -1069,7 +1069,7 @@ def load_covariance_calibration(path: str | Path) -> CovarianceFunctions:
         controller,
         header["discard"],
         header.get("producer_precision"),
-        header.get("support_precision"),
+        header.get("grid_precision"),
     )
 
 
@@ -1090,6 +1090,9 @@ def save_covariance_measurements(
     """
     if not isinstance(measurements, CovarianceCalibrationMeasurements):
         raise TypeError("unsupported covariance measurement type")
+    bootstrap = measurements.diagnostics.get("precision")
+    if not isinstance(bootstrap, Mapping):
+        bootstrap = {}
     header = {
         "schema": _MEASUREMENTS,
         "version": 2,
@@ -1097,7 +1100,11 @@ def save_covariance_measurements(
         "units": _UNITS,
         "zenith_angle_deg": float(measurements.zenith_angle.value),
         "controller": controller_header(measurements.controller),
-        "settings": measurements.settings.__dict__,
+        "settings": {
+            **asdict(measurements.settings),
+            "bootstrap_draws": bootstrap.get("bootstrap_samples", BOOTSTRAP_DRAWS),
+            "seed": bootstrap.get("bootstrap_seed", BOOTSTRAP_SEED),
+        },
         "discard": measurements.discard,
         "frames": measurements.frames,
         "realizations": measurements.realizations,
@@ -1128,7 +1135,7 @@ def load_covariance_measurements(path: str | Path) -> CovarianceCalibrationMeasu
     """
     with np.load(Path(path), allow_pickle=False) as saved:
         header = json.loads(str(saved["__header__"]))
-        validate_observation_precision(header, saved)
+        validate_calibration_data_precision(header, saved)
         expected = {
             "schema",
             "version",
@@ -1155,6 +1162,10 @@ def load_covariance_measurements(path: str | Path) -> CovarianceCalibrationMeasu
         controller = header["controller"]
         if set(controller) != {"gain", "delay", "frame_rate_hz"}:
             raise ValueError("invalid covariance controller fields")
+        settings = dict(header["settings"])
+        # The file format records how the saved uncertainty report was generated.
+        _count(settings.pop("bootstrap_draws", BOOTSTRAP_DRAWS), "bootstrap draw count")
+        _count(settings.pop("seed", BOOTSTRAP_SEED), "bootstrap seed", 0)
         return CovarianceCalibrationMeasurements(
             dtype=dtype,
             zenith_angle=header["zenith_angle_deg"] * u.deg,
@@ -1165,7 +1176,7 @@ def load_covariance_measurements(path: str | Path) -> CovarianceCalibrationMeasu
                 delay=controller["delay"],
                 frame_rate=controller["frame_rate_hz"] * u.Hz,
             ),
-            settings=CovarianceCalibrationSettings(**header["settings"]),
+            settings=CovarianceCalibrationSettings(**settings),
             discard=header["discard"],
             frames=header["frames"],
             realizations=header["realizations"],

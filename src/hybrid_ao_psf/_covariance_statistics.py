@@ -44,7 +44,7 @@ class FilterSettings:
             or np.any(b <= 0)
             or np.any(np.diff(b) <= 0)
         ):
-            raise ValueError("Feedback nodes must be increasing, finite and positive")
+            raise ValueError("Feedback values must be increasing, finite and positive")
         if (
             not np.isfinite(self.gain)
             or self.gain <= 0

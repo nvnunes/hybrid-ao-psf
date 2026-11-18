@@ -1,4 +1,4 @@
-"""Measured magnitude support and rectangular noise-bank mixing weights."""
+"""Measured magnitude intervals and rectangular mixing of noise samples weights."""
 
 import itertools
 
@@ -9,12 +9,11 @@ from numpy.typing import ArrayLike
 def calibration_magnitude_intervals(
     magnitudes: ArrayLike, declared: ArrayLike | None = None
 ) -> list[list[float]]:
-    """Return supported intervals for a sorted measured magnitude axis.
+    """Return measured intervals for a sorted measured magnitude axis.
 
-    Explicit intervals permit calibrated nonuniform node spacing. Their ends
-    must be measured nodes, intervals must be ordered and disjoint, and every
-    node must be covered. Without a declaration, retain the conservative gap
-    rule: spacing above the minimum splits support.
+    Explicit intervals permit nonuniform magnitude spacing. Intervals must be ordered
+    and disjoint, end at measured magnitudes and cover every measured magnitude.
+    Without explicit intervals, spacing above the minimum splits the measured range.
     """
     magnitudes = np.asarray(magnitudes)
     if (
@@ -39,7 +38,7 @@ def calibration_magnitude_intervals(
             )
         ):
             raise ValueError(
-                "Magnitude intervals must be ordered, disjoint and end at measured nodes."
+                "Magnitude intervals must be ordered, disjoint and end at measured magnitudes."
             )
         covered = np.any(
             (magnitudes[:, None] >= intervals[:, 0] - 1e-10)
@@ -47,7 +46,7 @@ def calibration_magnitude_intervals(
             axis=1,
         )
         if not covered.all():
-            raise ValueError("Magnitude intervals must cover every measured node.")
+            raise ValueError("Magnitude intervals must cover every measured magnitude.")
         return intervals.tolist()
     differences = np.diff(magnitudes)
     max_gap = float(np.min(differences)) if len(differences) else 0.0
@@ -62,7 +61,7 @@ def calibration_magnitude_intervals(
 
 
 def rectangular_neighbors(point, axes):
-    """Return only nonzero-weight vertices; refuse extrapolation."""
+    """Return only nonzero-weight grid points; refuse extrapolation."""
     choices = []
     for value, axis in zip(point, axes, strict=True):
         if value < axis[0] or value > axis[-1]:

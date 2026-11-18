@@ -8,7 +8,7 @@ from ._covariance_statistics import FUNCTIONS
 def rectangular_mapping(
     positions: np.ndarray,
 ) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
-    """Map the full rectangular grid to measured nodes with nearest-node filling.
+    """Map the full rectangular grid to the nearest measured points.
 
     Use one common map for both variables and all covariance blocks. Ties follow
     rectangular y/x order, matching the established science-PSF fill convention.
@@ -16,7 +16,7 @@ def rectangular_mapping(
     positions = np.asarray(positions)
     xs, ys = np.unique(positions[:, 0]), np.unique(positions[:, 1])
     if len(xs) < 2 or len(ys) < 2:
-        raise ValueError("Covariance spatial grid needs at least two nodes per axis")
+        raise ValueError("Covariance spatial grid needs at least two points per axis")
     grid = np.full((len(xs), len(ys)), -1, int)
     for index, point in enumerate(positions):
         ix, iy = np.searchsorted(xs, point[0]), np.searchsorted(ys, point[1])

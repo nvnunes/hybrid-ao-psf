@@ -1,4 +1,4 @@
-"""Portable calibration observations and fitted-product content identities."""
+"""Portable calibration data and calibrated model file checks."""
 
 from __future__ import annotations
 
@@ -24,7 +24,7 @@ from ._calibration_contracts import (
 from ._io import atomic_output_path
 from ._validation import validate_psf_dtype
 
-_SAMPLE_SCHEMAS = {
+_DATA_SCHEMAS = {
     "covariance-telemetry": (
         CovarianceTelemetry,
         {
@@ -65,8 +65,8 @@ _SAMPLE_SCHEMAS = {
 }
 
 
-def save_calibration_samples(
-    samples: CovarianceTelemetry
+def save_calibration_data(
+    data: CovarianceTelemetry
     | ComaWavefronts
     | ComaWfsMeasurements
     | ComaResponseMeasurements
@@ -76,7 +76,7 @@ def save_calibration_samples(
     | ReconstructorNoiseMeasurements,
     path: str | Path,
 ) -> None:
-    """Atomically save a supported physical observation record to numeric NPZ.
+    """Atomically save typed calibration data to numeric NPZ.
 
     The NPZ contains arrays plus a strict versioned JSON header with physical
     units and record kind. It contains no pickle/native setup/source identities.
@@ -84,29 +84,29 @@ def save_calibration_samples(
     failed/interrupted writes and retain their permission bits.
 
     Args:
-        samples: The typed physical sample record.
+        data: Typed calibration inputs or measurements.
         path: Destination NPZ file. Create its parent directories if
             needed. Atomically replace any existing destination.
 
     Raises:
         TypeError: If the input is not the expected calibration record.
     """
-    for kind, (cls, units) in _SAMPLE_SCHEMAS.items():
-        if type(samples) is cls:
+    for kind, (cls, units) in _DATA_SCHEMAS.items():
+        if type(data) is cls:
             break
     else:
-        raise TypeError("unsupported calibration sample record")
+        raise TypeError("unsupported calibration data type")
     header = {
         "schema": "hybrid-ao-psf-calibration-samples",
-        "version": 2 if hasattr(samples, "dtype") else 1,
+        "version": 2 if hasattr(data, "dtype") else 1,
         "kind": kind,
         "units": units,
     }
-    if hasattr(samples, "dtype"):
-        header["precision"] = samples.dtype.name
+    if hasattr(data, "dtype"):
+        header["precision"] = data.dtype.name
     arrays = {
-        item.name: getattr(samples, item.name)
-        for item in fields(samples)
+        item.name: getattr(data, item.name)
+        for item in fields(data)
         if item.name != "dtype"
     }
     arrays = {
@@ -117,18 +117,18 @@ def save_calibration_samples(
         np.savez(stream, __header__=json.dumps(header, sort_keys=True), **arrays)
 
 
-def validate_observation_precision(header, saved, *, history_fields=()):
+def validate_calibration_data_precision(header, saved, *, history_fields=()):
     """Reject missing/mismatched v2 declarations before coercing constructors.
 
     Simulation history fields retain their actual captured precision independently
     of calculation precision, including legacy histories rewritten as v2.
     """
     if not isinstance(header, dict):
-        raise ValueError("invalid observation header")  # noqa: TRY004 -- persisted schema, not a call argument.
+        raise ValueError("invalid calibration-data header")  # noqa: TRY004 -- persisted schema, not a call argument.
     if header.get("version") != 2:
         return
     if header.get("precision") not in ("float32", "float64"):
-        raise ValueError("version-2 observations require precision float32 or float64")
+        raise ValueError("version-2 calibration data require precision float32 or float64")
     dtype = validate_psf_dtype(header["precision"])
     for name in saved.files:
         if name == "__header__":
@@ -138,10 +138,10 @@ def validate_observation_precision(header, saved, *, history_fields=()):
         if name in history_fields:
             validate_psf_dtype(saved[name].dtype)
         elif saved[name].dtype != dtype:
-            raise ValueError(f"observation precision mismatch at {name}")
+            raise ValueError(f"calibration-data precision mismatch at {name}")
 
 
-def load_calibration_samples(
+def load_calibration_data(
     path: str | Path,
 ) -> (
     CovarianceTelemetry
@@ -153,17 +153,17 @@ def load_calibration_samples(
     | ReconstructorNoiseInputs
     | ReconstructorNoiseMeasurements
 ):
-    """Load exactly a supported sample schema, validating units, axes and values.
+    """Load exactly a supported calibration-data schema, validating units, axes and values.
 
     Native and historical measurement formats are rejected. The downstream
     one-time importer owns conversion from accepted older local records.
-    Returns the corresponding immutable physical observation type.
+    Returns the corresponding immutable calibration-data type.
 
     Args:
         path: Path to the saved NPZ file.
 
     Returns:
-        The typed physical sample record reconstructed at its stored precision.
+        The typed calibration data reconstructed at its stored precision.
 
     Raises:
         FileNotFoundError: If a required file is missing.
@@ -171,7 +171,7 @@ def load_calibration_samples(
     """
     with np.load(Path(path), allow_pickle=False) as saved:
         if "__header__" not in saved.files or saved["__header__"].ndim != 0:
-            raise ValueError("missing scalar calibration-samples header")
+            raise ValueError("missing scalar calibration-data header")
         header = json.loads(str(saved["__header__"]))
         if (
             not isinstance(header, dict)
@@ -181,17 +181,17 @@ def load_calibration_samples(
             or header["schema"] != "hybrid-ao-psf-calibration-samples"
             or type(header["version"]) is not int
             or header["version"] not in (1, 2)
-            or header["kind"] not in _SAMPLE_SCHEMAS
+            or header["kind"] not in _DATA_SCHEMAS
         ):
-            raise ValueError("unsupported calibration-samples schema")
-        validate_observation_precision(header, saved)
-        cls, units = _SAMPLE_SCHEMAS[header["kind"]]
+            raise ValueError("unsupported calibration-data schema")
+        validate_calibration_data_precision(header, saved)
+        cls, units = _DATA_SCHEMAS[header["kind"]]
         if header["units"] != units or set(saved.files) != {
             "__header__",
             *(item.name for item in fields(cls) if item.name != "dtype"),
         }:
             raise ValueError(
-                "calibration sample fields/units do not match their schema"
+                "calibration data fields/units do not match their schema"
             )
         values = {
             item.name: saved[item.name] for item in fields(cls) if item.name != "dtype"
@@ -209,11 +209,11 @@ def _digest(path):
 
 
 @dataclass(frozen=True)
-class CalibrationFileIdentity:
-    """One resolved product file and its SHA-256 content identity.
+class CalibrationFile:
+    """One resolved calibration file and its SHA-256 checksum.
 
     Attributes:
-        path: Absolute model entrypoint or numeric payload path.
+        path: Absolute manifest, array file or NGS metric file path.
         sha256: Lowercase 64-character SHA-256 digest of accepted bytes.
     """
 
@@ -230,91 +230,94 @@ class CalibrationFileIdentity:
     def verify(self) -> None:
         """Reject missing or changed file bytes, without loading native/model code."""
         if _digest(self.path) != self.sha256:
-            raise ValueError(f"Calibration product content changed: {self.path}")
+            raise ValueError(f"Calibration file content changed: {self.path}")
 
 
 @dataclass(frozen=True)
-class CalibrationProductIdentity:
-    """Immutable runtime content binding for one fitted product.
+class CalibrationModelFiles:
+    """Manifest and array files for one calibrated model, with their checksums.
 
     Attributes:
-        entrypoint: Identity of the explicit model.json entrypoint.
-        payloads: Identities of referenced numerical files, empty for JSON-only.
+        manifest: Path and checksum of the model.json manifest.
+        array_files: Paths and checksums of numerical files, empty for JSON-only.
 
     Runtime loaders validate each scientific schema separately. Orchestration
-    can persist these supported identities and verify them before execution,
+    can retain these paths and checksums and verify the files before execution,
     without knowing private model schema fields or constructing native adapters.
     """
 
-    entrypoint: CalibrationFileIdentity
-    payloads: tuple[CalibrationFileIdentity, ...] = ()
+    manifest: CalibrationFile
+    array_files: tuple[CalibrationFile, ...] = ()
 
     def __post_init__(self):
         if (
-            not isinstance(self.entrypoint, CalibrationFileIdentity)
-            or self.entrypoint.path.name != "model.json"
+            not isinstance(self.manifest, CalibrationFile)
+            or self.manifest.path.name != "model.json"
         ):
-            raise ValueError("entrypoint must identify model.json")
-        values = tuple(self.payloads)
-        if any(not isinstance(value, CalibrationFileIdentity) for value in values):
-            raise TypeError("payloads must contain CalibrationFileIdentity values")
-        paths = [self.entrypoint.path, *(value.path for value in values)]
+            raise ValueError("manifest must identify model.json")
+        values = tuple(self.array_files)
+        if any(not isinstance(value, CalibrationFile) for value in values):
+            raise TypeError("array_files must contain CalibrationFile values")
+        paths = [self.manifest.path, *(value.path for value in values)]
         if len(set(paths)) != len(paths):
-            raise ValueError("product file identities must be distinct")
-        object.__setattr__(self, "payloads", values)
+            raise ValueError("model file paths must be distinct")
+        object.__setattr__(self, "array_files", values)
 
     def verify(self) -> None:
-        """Verify all bound files, including payloads, before loading for execution."""
-        self.entrypoint.verify()
-        for identity in self.payloads:
-            identity.verify()
+        """Verify the manifest and array files before loading for execution."""
+        self.manifest.verify()
+        for array_file in self.array_files:
+            array_file.verify()
 
 
-def read_calibration_product_identity(path: str | Path) -> CalibrationProductIdentity:
-    """Read model.json identity and verify its optional relative NPZ payload.
+def read_calibration_model_files(path: str | Path) -> CalibrationModelFiles:
+    """Read a model manifest and verify its referenced array file.
 
-    Shared fitted schemas use payload and payload_sha256 together, or neither
-    for JSON-only products. This checks content binding, not the scientific
-    schema, coefficients, units or support; each fitted loader validates those.
-    Changed manifest bytes during the read or mismatched payload digests raise.
+    Shared fitted schemas use array_file and array_file_sha256 together, or
+    neither for JSON-only products. This checks file contents, not the scientific
+    schema, coefficients, units or ranges; each fitted loader validates those.
+    Changed manifest bytes during the read or mismatched array file digests raise.
 
     Args:
-        path: Path to the fitted product's model.json manifest.
+        path: Path to the calibrated model's model.json manifest.
 
     Returns:
-        The resolved manifest and optional payload identities with their SHA-256 digests.
+        The resolved manifest and optional array file paths with their
+        SHA-256 digests.
 
     Raises:
-        FileNotFoundError: If the manifest or payload is missing.
+        FileNotFoundError: If the manifest or array file is missing.
         TypeError: If the manifest does not contain an object.
-        ValueError: If the path, manifest fields or checked content identity is invalid.
+        ValueError: If the path, manifest fields or checksum is invalid.
     """
     path = Path(path).expanduser().resolve()
     if path.name != "model.json":
-        raise ValueError("fitted product entrypoint must be model.json")
+        raise ValueError("model manifest must be model.json")
     raw = path.read_bytes()
     header = json.loads(raw)
     if not isinstance(header, dict):
         raise TypeError("model.json must contain an object")
-    payloads = ()
-    if ("payload" in header) != ("payload_sha256" in header):
-        raise ValueError("payload and payload_sha256 must appear together")
-    if "payload" in header:
-        if not isinstance(header["payload"], str) or not header["payload"]:
-            raise ValueError("payload must be a nonempty relative NPZ path")
-        relative = Path(header["payload"])
+    if {"payload", "payload_sha256"} & header.keys():
+        raise ValueError("Model manifest uses unsupported array file fields")
+    array_files = ()
+    if ("array_file" in header) != ("array_file_sha256" in header):
+        raise ValueError("array_file and array_file_sha256 must appear together")
+    if "array_file" in header:
+        if not isinstance(header["array_file"], str) or not header["array_file"]:
+            raise ValueError("array file must be a nonempty relative NPZ path")
+        relative = Path(header["array_file"])
         if (
             relative.is_absolute()
             or ".." in relative.parts
             or relative.suffix != ".npz"
         ):
-            raise ValueError("payload must be a relative NPZ path within the product")
-        payload = (path.parent / relative).resolve()
-        if not payload.is_relative_to(path.parent):
-            raise ValueError("payload must remain within the product directory")
-        payloads = (CalibrationFileIdentity(payload, header["payload_sha256"]),)
-    identity = CalibrationProductIdentity(
-        CalibrationFileIdentity(path, hashlib.sha256(raw).hexdigest()), payloads
+            raise ValueError("array file must be a relative NPZ path within the model")
+        array_file = (path.parent / relative).resolve()
+        if not array_file.is_relative_to(path.parent):
+            raise ValueError("array file must remain within the model directory")
+        array_files = (CalibrationFile(array_file, header["array_file_sha256"]),)
+    model_files = CalibrationModelFiles(
+        CalibrationFile(path, hashlib.sha256(raw).hexdigest()), array_files
     )
-    identity.verify()
-    return identity
+    model_files.verify()
+    return model_files

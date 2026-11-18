@@ -63,7 +63,7 @@ unavailable files, and retained flux.
 `tests/test_calibration_boundary.py` uses independent synthetic records for
 physical units, pooled-mean input preservation, immutable values/unit metadata,
 configuration precedence, schema rejection, atomic sample round trips and
-manifest/payload content binding. Native conversion tests belong downstream;
+manifest/array file content binding. Native conversion tests belong downstream;
 common tests require no native E2E files or software.
 
 ## Calibration Pipeline Coverage
@@ -71,12 +71,13 @@ common tests require no native E2E files or software.
 `test_calibration_kernels.py` and `test_controller_noise_contracts.py` compare
 physical controller/filtering, reconstruction and blur operations with
 independent recurrences, impulse sums and closed forms. The four family suites
-cover retained observations, offline building, support/units/settings rejection,
+cover retained measurements, offline building, range, unit and settings rejection,
 immutable model state and numerical persistence. `test_calibration_workflows.py`
 exercises all four configured workflows with a synthetic subclass, including
 configured spot loading, calibrated reconstruction validation, noise-only simulation
-and complete shape fitting without native files. Publication tests interrupt
-payload writes and manifest replacement and verify complete usable products and
+and complete shape fitting without native files. Each configured build leaves
+its output untouched until explicit saving. Tests interrupt
+array file writes and manifest replacement and verify complete usable products and
 preserved permissions. Native conversion and source/reuse tests belong downstream.
 
 ## Calibrated LO Composition Coverage
@@ -88,7 +89,7 @@ realization means. It checks independent noise impulse sums, real/scalar and
 complex-feedback behavior, both precisions, prepared-result immutability, complete
 preparation of mixed-precision providers, rounding-time validation, content-bound
 INI loading without native imports, missing products, numerical conflicts and
-support rejection. `test_contracts.py` additionally checks shared metric numeric
+out-of-range rejection. `test_contracts.py` additionally checks shared metric numeric
 backing and unit metadata throughout the backing chain, including preserved
 legacy precision. PSF construction is covered separately below.
 

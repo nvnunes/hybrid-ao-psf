@@ -351,23 +351,23 @@ def _calibrated_provenance(
     model: E2ECalibratedModel, provenance: dict[str, str]
 ) -> dict[str, str]:
     """Record the exact fitted inputs and controller behind the prediction."""
-    identities = {}
-    for name, identity in model.product_identities.items():
-        if hasattr(identity, "entrypoint"):
-            identities[name] = {
-                "entrypoint": str(identity.entrypoint.path),
-                "sha256": identity.entrypoint.sha256,
-                "payloads": [
+    model_files = {}
+    for name, files in model.model_files.items():
+        if hasattr(files, "manifest"):
+            model_files[name] = {
+                "manifest": str(files.manifest.path),
+                "sha256": files.manifest.sha256,
+                "array_files": [
                     {"path": str(item.path), "sha256": item.sha256}
-                    for item in identity.payloads
+                    for item in files.array_files
                 ],
             }
         else:
-            identities[name] = {"path": str(identity.path), "sha256": identity.sha256}
+            model_files[name] = {"path": str(files.path), "sha256": files.sha256}
     return {
         **provenance,
         "e2e_model": _type_identity(model),
-        "e2e_model_inputs": json.dumps(identities, sort_keys=True),
+        "e2e_model_inputs": json.dumps(model_files, sort_keys=True),
         "e2e_controller_gain": str(model.covariance.controller.gain),
         "e2e_controller_delay_frames": str(model.covariance.controller.delay),
         "e2e_magnitude_band": model.coma.photometry.magnitude_band,

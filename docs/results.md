@@ -50,7 +50,7 @@ facts. No fitted provider or native object is stored. New engine results record
 coordinates and ZA; legacy MASTSEL results may lack them.
 
 `provenance` is a string mapping stored as group attributes. E2E execution records
-product content identities, controller settings and magnitude convention.
+calibrated model file paths and checksums, controller settings and magnitude convention.
 Optional diagnostics contain the PSD mask and scalar Ctot summaries; debug
 results also contain the pre-blur PSFs. The public diagnostics object derives
 its PSD-valid count and fraction from the mask.

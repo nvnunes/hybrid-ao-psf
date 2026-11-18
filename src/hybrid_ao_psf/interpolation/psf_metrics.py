@@ -1375,7 +1375,7 @@ def save_psf_metric_interpolator(
 ) -> None:
     """Write a versioned pickle with the fitted metrics and their coordinate ranges.
 
-    Create missing parent directories and publish the file atomically.
+    Create missing parent directories and save the file atomically.
 
     Args:
         interpolator: Fitted metric provider to save.

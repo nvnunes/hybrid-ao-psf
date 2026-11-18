@@ -20,9 +20,9 @@ from numpy.typing import DTypeLike, NDArray
 from ._calibration_config import load_e2e_calibration_configuration
 from ._calibration_contracts import _angle, _quantity
 from ._calibration_io import (
-    CalibrationFileIdentity,
-    CalibrationProductIdentity,
-    read_calibration_product_identity,
+    CalibrationFile,
+    CalibrationModelFiles,
+    read_calibration_model_files,
 )
 from ._coma_calibration import ComaResponseModel, load_coma_calibration
 from ._covariance_calibration import CovarianceFunctions, load_covariance_calibration
@@ -38,7 +38,7 @@ from ._reconstructor_calibration import (
     _reconstructor_atmospheric_covariances,
     load_reconstructor_calibration,
 )
-from ._sensing_calibration import SensingCalibration, load_sensing_calibration
+from ._sensing_calibration import SensingModel, load_sensing_calibration
 from ._validation import validate_psf_dtype
 from .interpolation import PsfMetricInterpolator, load_psf_metric_interpolator
 
@@ -60,20 +60,20 @@ class E2ECalibratedModel(_LowOrderModel):
         reconstructor: Separate calibrated pre-filter noise prior.
         ngs_metrics: Immutable NGS HO EE/FWHM/Strehl interpolator.
         dtype: Runtime arithmetic, default float32 or explicit float64.
-        product_identities: Read-only content identities, populated by the INI
-            loader for the four products and NGS metric file. Direct construction
-            may leave this empty; it makes no file-provenance claim.
+        model_files: Read-only paths and checksums, populated by the INI loader
+            for the four calibrated models and NGS metric file. Direct construction
+            from providers may leave this empty.
     """
 
     covariance: CovarianceFunctions
     coma: ComaResponseModel
-    sensing: SensingCalibration
+    sensing: SensingModel
     reconstructor: ReconstructorNoiseModel
     ngs_metrics: PsfMetricInterpolator
     dtype: DTypeLike = np.float32
-    product_identities: Mapping[
-        str, CalibrationProductIdentity | CalibrationFileIdentity
-    ] = field(default_factory=dict)
+    model_files: Mapping[str, CalibrationModelFiles | CalibrationFile] = field(
+        default_factory=dict
+    )
 
     def __post_init__(self):
         dtype = validate_psf_dtype(self.dtype)
@@ -81,7 +81,7 @@ class E2ECalibratedModel(_LowOrderModel):
         for name, cls in (
             ("covariance", CovarianceFunctions),
             ("coma", ComaResponseModel),
-            ("sensing", SensingCalibration),
+            ("sensing", SensingModel),
             ("reconstructor", ReconstructorNoiseModel),
             ("ngs_metrics", PsfMetricInterpolator),
         ):
@@ -111,24 +111,20 @@ class E2ECalibratedModel(_LowOrderModel):
             != sensing_photometry.photons_per_frame_zeropoint
         ):
             raise ValueError("coma and sensing photometry conventions differ")
-        identities = dict(self.product_identities)
-        if identities and set(identities) != {
+        model_files = dict(self.model_files)
+        if model_files and set(model_files) != {
             "covariance",
             "coma",
             "sensing",
             "reconstructor",
             "ngs_metrics",
         }:
-            raise ValueError("product identities must bind all five runtime inputs")
-        for name, value in identities.items():
-            expected = (
-                CalibrationFileIdentity
-                if name == "ngs_metrics"
-                else CalibrationProductIdentity
-            )
+            raise ValueError("model_files must describe all five runtime inputs")
+        for name, value in model_files.items():
+            expected = CalibrationFile if name == "ngs_metrics" else CalibrationModelFiles
             if not isinstance(value, expected):
-                raise TypeError(f"invalid {name} product identity")
-        object.__setattr__(self, "product_identities", MappingProxyType(identities))
+                raise TypeError(f"invalid {name} model files")
+        object.__setattr__(self, "model_files", MappingProxyType(model_files))
 
     def prepare(self, *, dtype: DTypeLike) -> E2ECalibratedModel:
         """Return immutable runtime state at dtype without altering saved products.
@@ -137,10 +133,10 @@ class E2ECalibratedModel(_LowOrderModel):
             dtype: Numerical precision, either float32 or float64.
 
         Returns:
-            A separate prepared model with the accepted product identities at the requested precision.
+            A separate prepared model with the same model files at the requested precision.
 
         Raises:
-            ValueError: If the precision is unsupported or conversion invalidates support.
+            ValueError: If the precision is unsupported or conversion invalidates the calibrated range.
         """
         dtype = validate_psf_dtype(dtype)
         return self if dtype == self.dtype else replace(self, dtype=dtype)
@@ -175,7 +171,7 @@ class E2ECalibratedModel(_LowOrderModel):
 
         Raises:
             TypeError: If required inputs are not physical quantities.
-            ValueError: If geometry, photometry, fitted support or low-order
+            ValueError: If geometry, photometry, calibrated ranges or low-order
                 covariance and feedback are invalid.
         """
         dtype = self.dtype
@@ -296,7 +292,7 @@ def _calibrated_command_covariances(
 ) -> _TiltCommandCovariances:
     """Contract the six calibrated functions with the scalar closed-loop response.
 
-    Borrow the fitted bank, physical field coordinates, and numerical WFS
+    Borrow the fitted interpolator, physical field coordinates, and numerical WFS
     responses for one asterism. Use the solved reconstructor and scalar
     feedback projectors to return science and command covariances in mas².
 
@@ -382,8 +378,8 @@ def load_e2e_calibrated_model(
     Resolve defaults then INI precision then explicit dtype. Open only the four
     model.json products and the NGS metric interpolator; native sections,
     acquisition sources, science PSFs and NGS spot PSFs are not opened.
-    Each fitted loader validates its schema/support/conventions. Product-content
-    identities bind the loaded bytes and are available for orchestration reuse.
+    Each fitted loader validates its schema, ranges and conventions. Model-file
+    paths and checksums are available for orchestration and reuse checks.
     Missing/incompatible products raise; no native calibration is started.
 
     Args:
@@ -391,7 +387,7 @@ def load_e2e_calibrated_model(
         dtype: Optional float32 or float64 override of the configured precision.
 
     Returns:
-        A prepared low-order model with validated input identities.
+        A prepared low-order model with checked input files.
 
     Raises:
         FileNotFoundError: If the configuration or a provider file is missing.
@@ -402,10 +398,10 @@ def load_e2e_calibrated_model(
         name: getattr(config, name + "_model")
         for name in ("covariance", "coma", "sensing", "reconstructor")
     }
-    identities = {
-        name: read_calibration_product_identity(value) for name, value in paths.items()
+    model_files = {
+        name: read_calibration_model_files(value) for name, value in paths.items()
     }
-    identities["ngs_metrics"] = CalibrationFileIdentity(
+    model_files["ngs_metrics"] = CalibrationFile(
         config.ngs_metrics, hashlib.sha256(config.ngs_metrics.read_bytes()).hexdigest()
     )
     model = E2ECalibratedModel(
@@ -415,8 +411,8 @@ def load_e2e_calibrated_model(
         reconstructor=load_reconstructor_calibration(paths["reconstructor"]),
         ngs_metrics=load_psf_metric_interpolator(config.ngs_metrics),
         dtype=config.dtype if dtype is None else dtype,
-        product_identities=identities,
+        model_files=model_files,
     )
-    for identity in identities.values():
-        identity.verify()
+    for model_file in model_files.values():
+        model_file.verify()
     return model

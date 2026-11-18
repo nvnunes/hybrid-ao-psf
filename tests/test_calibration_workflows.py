@@ -21,7 +21,6 @@ from hybrid_ao_psf import (
     FixedGainIntegrator,
     PsfSamples,
     ReconstructorCalibrationResult,
-    ReconstructorCalibrationSettings,
     ReconstructorNoiseMeasurements,
     SensingCalibrationSettings,
     SensingNoiseRequest,
@@ -144,9 +143,8 @@ def pipeline(tmp_path_factory, request):
         science_psf=tmp_path / "unused-science.pkl",
         ngs_psf=tmp_path / "spots.pkl",
         ngs_metrics=tmp_path / "unused-metrics.pkl",
-        reconstructor=ReconstructorCalibrationSettings(holdouts=7),
         covariance=CovarianceCalibrationSettings(
-            feedback=(0.5, 1, 1.5), bootstrap_draws=3
+            feedback=(0.5, 1, 1.5)
         ),
         coma=ComaCalibrationSettings(samples=32, noise_draws=16),
         sensing=SensingCalibrationSettings(
@@ -179,14 +177,18 @@ def pipeline(tmp_path_factory, request):
         20 * u.deg, photons_per_frame=[1, 1e8] * u.photon, fwhm=[80, 200] * u.mas
     )
     calibration.native_available = False
-    prior = calibration.build_reconstructor(prior).model
+    result = calibration.build_reconstructor(prior)
+    assert not config.reconstructor_model.parent.exists()
+    assert calibration.save_reconstructor(result) == config.reconstructor_model
+    prior = result.model
     calibration.native_available = True
     covariances = list(calibration.measure_covariance())
     telemetry = list(calibration.read_covariance_telemetry())
     calibration.native_available = False
-    covariances = calibration.build_covariance(
-        covariances, validation_telemetry=telemetry
-    ).model
+    result = calibration.build_covariance(covariances, validation_telemetry=telemetry)
+    assert not config.covariance_model.parent.exists()
+    assert calibration.save_covariance(result) == config.covariance_model
+    covariances = result.model
     calibration.native_available = True
     coma = [
         calibration.measure_coma(
@@ -197,7 +199,10 @@ def pipeline(tmp_path_factory, request):
         for angle in (0, 20, 30, 40)
     ]
     calibration.native_available = False
-    coma = calibration.build_coma(coma).model
+    result = calibration.build_coma(coma)
+    assert not config.coma_model.parent.exists()
+    assert calibration.save_coma(result) == config.coma_model
+    coma = result.model
     calibration.native_available = True
     rows = np.array([[x, y, m] for x in (-1, 1) for y in (-1, 1) for m in (8, 10)])
     points = list(
@@ -230,7 +235,10 @@ def pipeline(tmp_path_factory, request):
         for n in (1, 2, 3)
     ]
     noise_measurements = list(calibration.simulate_sensing_noise(response, requests))
-    sensing = calibration.build_sensing(response, noise_measurements).model
+    result = calibration.build_sensing(response, noise_measurements)
+    assert not config.sensing_model.parent.exists()
+    assert calibration.save_sensing(result) == config.sensing_model
+    sensing = result.model
     return calibration, (prior, covariances, coma, sensing)
 
 
@@ -252,7 +260,7 @@ def test_configured_four_family_handoff_without_native_files(pipeline):
     for family in ("reconstructor", "covariance", "coma", "sensing"):
         assert getattr(config, f"{family}_model").with_name("diagnostics.json").exists()
     assert [
-        json.loads(path.read_text()).get("payload")
+        json.loads(path.read_text()).get("array_file")
         for path in (
             config.reconstructor_model,
             config.covariance_model,
@@ -268,18 +276,18 @@ def test_configured_four_family_handoff_without_native_files(pipeline):
 
 
 @pytest.mark.parametrize("configured", [False, True])
-def test_named_payloads_preserve_prior_revision_and_reuse_current(
+def test_named_array_files_preserve_prior_revision_and_reuse_current(
     pipeline, tmp_path, configured
 ):
-    from hybrid_ao_psf._calibration_workflows import publish_result
+    from hybrid_ao_psf._calibration_workflows import save_result
 
     _, models = pipeline
     model = models[0]
     path = tmp_path / "model.json"
 
-    def publish(prior):
+    def save(prior):
         if configured:
-            publish_result(
+            save_result(
                 ReconstructorCalibrationResult(model=prior, diagnostics={}),
                 path,
                 save_reconstructor_calibration,
@@ -287,20 +295,20 @@ def test_named_payloads_preserve_prior_revision_and_reuse_current(
         else:
             save_reconstructor_calibration(prior, path)
 
-    publish(model)
+    save(model)
     original = path.with_name("reconstructor-noise-interpolator.npz")
-    original_payload = original.read_bytes()
+    original_array_file = original.read_bytes()
     updated = replace(model, variance=model.variance * 1.01)
-    publish(updated)
-    publish(updated)
+    save(updated)
+    save(updated)
 
     manifest = path.read_bytes()
-    assert json.loads(manifest)["payload"] == "reconstructor-noise-interpolator-2.npz"
+    assert json.loads(manifest)["array_file"] == "reconstructor-noise-interpolator-2.npz"
     assert {file.name for file in tmp_path.glob("*.npz")} == {
         "reconstructor-noise-interpolator.npz",
         "reconstructor-noise-interpolator-2.npz",
     }
-    assert original.read_bytes() == original_payload
+    assert original.read_bytes() == original_array_file
     np.testing.assert_array_equal(
         load_reconstructor_calibration(path).variance, updated.variance
     )
@@ -314,11 +322,11 @@ def test_named_payloads_preserve_prior_revision_and_reuse_current(
     [
         (family, boundary)
         for family in range(4)
-        for boundary in ("payload", "manifest", "committed")
-        if not (family == 2 and boundary == "payload")
+        for boundary in ("array_file", "manifest", "committed")
+        if not (family == 2 and boundary == "array_file")
     ],
 )
-def test_publication_interruption_leaves_complete_usable_product(
+def test_saving_interruption_leaves_complete_usable_product(
     pipeline, monkeypatch, family, boundary, tmp_path
 ):
     import hybrid_ao_psf._calibration_products as products
@@ -337,7 +345,7 @@ def test_publication_interruption_leaves_complete_usable_product(
         load_coma_calibration,
         load_sensing_calibration,
     )[family]
-    path = tmp_path / "published/model.json"
+    path = tmp_path / "saved/model.json"
     save(model, path)
     path.chmod(0o640)
     before = path.read_bytes()
@@ -345,7 +353,7 @@ def test_publication_interruption_leaves_complete_usable_product(
 
     @contextmanager
     def interrupted(destination):
-        if boundary == "payload" and destination.suffix == ".npz":
+        if boundary == "array_file" and destination.suffix == ".npz":
             raise KeyboardInterrupt
         if destination.name == "model.json" and boundary == "manifest":
             with original(destination) as temporary:
@@ -360,7 +368,7 @@ def test_publication_interruption_leaves_complete_usable_product(
     if family == 0:
         model = replace(model, variance=model.variance * 1.01)
     elif family == 1:
-        arrays = {k: v.copy() for k, v in model._bank.arrays.items()}
+        arrays = {k: v.copy() for k, v in model._interpolator.arrays.items()}
         for name in ("C_t_t", "C_Tc_Tc", "C_t_Tc", "C_Tt_Tc", "C_Tt_Tt", "C_t_Tt"):
             arrays[name] *= 1.01
         model = type(model)._from_arrays(arrays, model.controller, model.discard)
@@ -387,7 +395,9 @@ def test_publication_interruption_leaves_complete_usable_product(
 
 
 def test_calibrated_reconstructor_validation_rejects_mismatched_telemetry(pipeline):
-    from hybrid_ao_psf import validate_covariance_reconstructor
+    from hybrid_ao_psf._reconstructor_calibration import (
+        _validate_covariance_reconstructor,
+    )
 
     calibration, models = pipeline
     calibration.native_available = True
@@ -395,7 +405,7 @@ def test_calibrated_reconstructor_validation_rejects_mismatched_telemetry(pipeli
     calibration.native_available = False
     changed = replace(telemetry, tilt=telemetry.tilt * 1.1)
     with pytest.raises(ValueError, match="calibrated-reconstructor validation failed"):
-        validate_covariance_reconstructor(models[1], models[0], changed)
+        _validate_covariance_reconstructor(models[1], models[0], changed)
 
 
 @pytest.mark.parametrize("family", range(4))
@@ -422,7 +432,7 @@ def test_each_product_rejects_wrong_declared_units(pipeline, tmp_path, family):
         load(path)
 
 
-def test_configured_publication_restores_model_and_diagnostics_on_cancellation(
+def test_configured_saving_restores_model_and_diagnostics_on_cancellation(
     pipeline, monkeypatch
 ):
     import hybrid_ao_psf._calibration_products as products
@@ -432,7 +442,7 @@ def test_configured_publication_restores_model_and_diagnostics_on_cancellation(
     diagnostics = path.with_name("diagnostics.json")
     before = (path.read_bytes(), diagnostics.read_bytes())
     calibration.native_available = True
-    observations = calibration.measure_reconstructor(
+    measurements = calibration.measure_reconstructor(
         20 * u.deg, photons_per_frame=[1, 1e8] * u.photon, fwhm=[80, 220] * u.mas
     )
     calibration.native_available = False
@@ -445,9 +455,11 @@ def test_configured_publication_restores_model_and_diagnostics_on_cancellation(
         if destination == path:
             raise KeyboardInterrupt
 
+    result = calibration.build_reconstructor(measurements)
+    assert (path.read_bytes(), diagnostics.read_bytes()) == before
     monkeypatch.setattr(products, "atomic_output_path", interrupted)
     with pytest.raises(KeyboardInterrupt):
-        calibration.build_reconstructor(observations)
+        calibration.save_reconstructor(result)
     assert (path.read_bytes(), diagnostics.read_bytes()) == before
     load_reconstructor_calibration(path)
 
@@ -496,4 +508,20 @@ def test_invalid_sensing_arguments_do_not_dispatch_native(pipeline, updates):
     values = {"position": [0, 0] * u.arcsec, "magnitude": 8 * u.mag, "sampling": None}
     values.update(updates)
     with pytest.raises((ValueError, TypeError, u.UnitConversionError)):
-        calibration.measure_sensing_point(20 * u.deg, spot=spot, **values)
+        calibration._measure_sensing_point(20 * u.deg, spot=spot, **values)
+
+
+@pytest.mark.parametrize("family", ["reconstructor", "covariance", "coma", "sensing"])
+def test_configured_save_rejects_wrong_result_before_writing(
+    pipeline, tmp_path, family
+):
+    calibration, _ = pipeline
+    config = replace(
+        calibration.configuration,
+        **{f"{family}_model": tmp_path / family / "model.json"},
+    )
+    calibration = SyntheticCalibration(config)
+    calibration.native_available = False
+    with pytest.raises(TypeError, match="result must be"):
+        getattr(calibration, f"save_{family}")(None)
+    assert not (tmp_path / family).exists()

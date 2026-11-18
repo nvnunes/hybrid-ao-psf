@@ -23,21 +23,17 @@ from ._validation import validate_psf_dtype
 
 @dataclass(frozen=True, kw_only=True)
 class CovarianceCalibrationSettings:
-    """Scalar bank controls; fixed controller settings come from the adapter.
+    """Scalar interpolator controls; fixed controller settings come from the adapter.
 
     Attributes:
-        feedback: Increasing positive dimensionless scalar feedback nodes.
+        feedback: Increasing positive dimensionless scalar feedback grid points.
         settling_tolerance: Positive bound on retained initial-state propagation.
         maximum_discard: Maximum saved-frame settling cut to consider.
-        bootstrap_draws: Whole-realization resamples for sampling checks.
-        seed: Nonnegative resampling seed.
     """
 
     feedback: tuple[float, ...] = tuple(n / 10 for n in range(2, 21))
     settling_tolerance: float = 1e-8
     maximum_discard: int = 500
-    bootstrap_draws: int = 200
-    seed: int = 20261013
 
     def __post_init__(self):
         values = np.asarray(self.feedback)
@@ -49,7 +45,7 @@ class CovarianceCalibrationSettings:
             or np.any(values <= 0)
             or np.any(np.diff(values) <= 0)
         ):
-            raise ValueError("feedback must contain increasing positive finite nodes")
+            raise ValueError("feedback values must be increasing, positive and finite")
         object.__setattr__(self, "feedback", tuple(map(float, values)))
         if (
             not np.isfinite(self.settling_tolerance)
@@ -57,35 +53,30 @@ class CovarianceCalibrationSettings:
         ):
             raise ValueError("settling_tolerance must lie in (0,1)")
         _count(self.maximum_discard, "maximum_discard")
-        _count(self.bootstrap_draws, "bootstrap_draws")
-        _count(self.seed, "seed", 0)
 
 
 @dataclass(frozen=True, kw_only=True)
 class ComaCalibrationSettings:
-    """Independent wavefront and response-fit sampling controls.
+    """Wavefront and detector-noise sampling settings.
 
     Attributes:
         samples: Independent wavefronts, a positive multiple of four.
         noise_draws: Draws per wavefront/magnitude, a multiple of four.
         noise_seed: Native uint32 seed.
-        bootstrap_seed: Shared uint32 resampling seed.
     """
 
     samples: int = 512
     noise_draws: int = 512
     noise_seed: int = 10003000
-    bootstrap_seed: int = 901732
 
     def __post_init__(self):
         for name in ("samples", "noise_draws"):
             _count(getattr(self, name), name, 4)
             if getattr(self, name) % 4:
                 raise ValueError(f"{name} must be divisible by four")
-        for name in ("noise_seed", "bootstrap_seed"):
-            _count(getattr(self, name), name, 0)
-            if getattr(self, name) >= 2**32:
-                raise ValueError(f"{name} must fit uint32")
+        _count(self.noise_seed, "noise_seed", 0)
+        if self.noise_seed >= 2**32:
+            raise ValueError("noise_seed must fit uint32")
 
 
 @dataclass(frozen=True, kw_only=True)
@@ -133,22 +124,18 @@ class ReconstructorCalibrationSettings:
 
     Attributes:
         representation: Product P*EE or separate P,EE table axes.
-        signal_nodes: Photon/signal axis length.
-        fwhm_nodes: Angular width axis length.
-        ee_nodes: EE axis length for separate representation.
+        signal_point_count: Number of points along the photon or P*EE axis.
+        fwhm_point_count: Number of points along the FWHM axis.
+        ee_point_count: Number of points along the EE axis for the separate representation.
         padding: Fractional range padding, in [0,1).
-        holdouts: Independent interpolation query count.
-        seed: Nonnegative sampling seed.
         interpolation: Linear or log-linear covariance interpolation.
     """
 
     representation: str = "product"
-    signal_nodes: int = 129
-    fwhm_nodes: int = 97
-    ee_nodes: int = 17
+    signal_point_count: int = 129
+    fwhm_point_count: int = 97
+    ee_point_count: int = 17
     padding: float = 0.1
-    holdouts: int = 1200
-    seed: int = 20261014
     interpolation: str = "log-linear"
 
     def __post_init__(self):
@@ -157,10 +144,8 @@ class ReconstructorCalibrationSettings:
             "separate",
         ) or self.interpolation not in ("linear", "log-linear"):
             raise ValueError("unsupported noise-prior representation/interpolation")
-        for name in ("signal_nodes", "fwhm_nodes", "ee_nodes"):
+        for name in ("signal_point_count", "fwhm_point_count", "ee_point_count"):
             _count(getattr(self, name), name, 2)
-        _count(self.holdouts, "holdouts")
-        _count(self.seed, "seed", 0)
         if not np.isfinite(self.padding) or not 0 <= self.padding < 1:
             raise ValueError("padding must lie in [0,1)")
 
@@ -179,7 +164,7 @@ class E2ECalibrationConfiguration:
         science_psf: Science HO interpolator path.
         ngs_psf: NGS HO PSF interpolator path for fixed-spot measurements.
         ngs_metrics: NGS HO metric interpolator path for reconstruction.
-        covariance: Effective common bank controls.
+        covariance: Effective common interpolator controls.
         coma: Effective response controls.
         sensing: Effective fixed-spot/simulation controls.
         reconstructor: Effective prior controls.

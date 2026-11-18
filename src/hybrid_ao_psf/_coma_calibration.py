@@ -1,10 +1,10 @@
-"""Primary-coma response calibration, with measured support and physical units."""
+"""Primary-coma response calibration, with measured range and physical units."""
 
 from __future__ import annotations
 
 import json
 from collections.abc import Iterable, Mapping
-from dataclasses import dataclass, field, replace
+from dataclasses import asdict, dataclass, field, replace
 from pathlib import Path
 
 import numpy as np
@@ -16,10 +16,11 @@ from ._calibration_contracts import (
     CalibrationPhotometry,
     ComaResponseMeasurements,
     _angle,
+    _count,
     _PhysicalRecord,
     _quantity,
 )
-from ._calibration_io import validate_observation_precision
+from ._calibration_io import validate_calibration_data_precision
 from ._calibration_products import (
     immutable_metadata,
     load_product,
@@ -32,6 +33,7 @@ from ._validation import coarsest_precision, snap_coordinate_range, validate_psf
 
 _KIND = "hybrid-ao-psf-coma-response"
 _MEASUREMENTS = "hybrid-ao-psf-coma-measurements"
+_BOOTSTRAP_SEED = 901732
 _FIELDS = ("coma", "magnitudes", "tilt_mean", "tilt_batches", "tilt_noiseless")
 _UNITS = {
     "coma": "nm",
@@ -44,7 +46,7 @@ _UNITS = {
 
 @dataclass(frozen=True, kw_only=True, eq=False)
 class ComaCalibrationMeasurements(_PhysicalRecord):
-    """Reusable paired response observations and their effective fit controls.
+    """Reusable paired response measurements and their effective fit controls.
 
     Attributes:
         dtype: Real calculation/state precision, float32 by default or float64.
@@ -54,7 +56,9 @@ class ComaCalibrationMeasurements(_PhysicalRecord):
             retained optimizer's phase-to-OPD numerical conditioning only;
             fitted response and prediction always use mas/nm OPD.
         photometry: Measured magnitude convention and incident-count zero point.
-        settings: Effective sample/noise-draw controls and bootstrap seed.
+        settings: Wavefront and detector-noise sampling settings.
+        bootstrap_seed: Recorded resampling seed for imported measurements.
+            Defaults to the fixed seed used for new measurements.
 
     No native setup, provenance dictionary or acquisition file is required by
     the standalone estimator. Means remain intact until paired regression.
@@ -65,6 +69,7 @@ class ComaCalibrationMeasurements(_PhysicalRecord):
     sensing_wavelength: u.Quantity
     photometry: CalibrationPhotometry
     settings: ComaCalibrationSettings
+    bootstrap_seed: int = _BOOTSTRAP_SEED
 
     dtype: DTypeLike = field(default=np.float32, kw_only=True)
 
@@ -84,6 +89,9 @@ class ComaCalibrationMeasurements(_PhysicalRecord):
             raise TypeError("typed response, photometry and coma settings required")
         if self.response.dtype != self.dtype:
             raise ValueError("response precision must match measurement dtype")
+        _count(self.bootstrap_seed, "bootstrap_seed", 0)
+        if self.bootstrap_seed >= 2**32:
+            raise ValueError("bootstrap_seed must fit uint32")
         batches = self.response.tilt_batches.shape[2]
         if (
             len(self.response.coma) != self.settings.samples
@@ -98,17 +106,17 @@ class ComaCalibrationMeasurements(_PhysicalRecord):
 
 @dataclass(frozen=True, kw_only=True, eq=False)
 class ComaResponseModel(_PhysicalRecord):
-    """Positive three-parameter magnitude/airmass response over measured support.
+    """Positive three-parameter magnitude/airmass response over measured range.
 
     Attributes:
         producer_dtype: Recorded calibration precision, or None when unknown.
-        support_precision: Coarsest coordinate precision retained through preparation.
+        grid_precision: Coarsest coordinate precision retained through preparation.
         dtype: Real calculation/state precision, float32 by default or float64.
         a0: Zenith bright-star response in angular tilt per OPD length.
         b: Response change per unit increase in airmass, in the same units.
         m_half: Magnitude at half response, inside the measured magnitude range.
-        magnitude_support: Two increasing measured magnitude limits.
-        zenith_support: Two increasing measured angular viewing limits.
+        magnitude_range: Two increasing measured magnitude limits.
+        zenith_range: Two increasing measured angular viewing limits.
         photometry: Explicit magnitude convention and incident-count conversion.
 
     The response is (a0+b*(airmass-1))/(1+10**(0.4*(m-m_half))). No native
@@ -118,13 +126,13 @@ class ComaResponseModel(_PhysicalRecord):
     a0: u.Quantity
     b: u.Quantity
     m_half: u.Quantity
-    magnitude_support: u.Quantity
-    zenith_support: u.Quantity
+    magnitude_range: u.Quantity
+    zenith_range: u.Quantity
     photometry: CalibrationPhotometry
 
     dtype: DTypeLike = field(default=np.float32, kw_only=True)
     producer_dtype: DTypeLike | None = field(default=None, kw_only=True)
-    support_precision: DTypeLike | None = field(default=None, kw_only=True)
+    grid_precision: DTypeLike | None = field(default=None, kw_only=True)
 
     def __post_init__(self):
         object.__setattr__(self, "dtype", validate_psf_dtype(self.dtype))
@@ -134,8 +142,8 @@ class ComaResponseModel(_PhysicalRecord):
             )
         object.__setattr__(
             self,
-            "support_precision",
-            coarsest_precision(self.dtype, self.producer_dtype, self.support_precision),
+            "grid_precision",
+            coarsest_precision(self.dtype, self.producer_dtype, self.grid_precision),
         )
         values = {
             name: _quantity(getattr(self, name), unit, name, ndim, dtype=self.dtype)
@@ -143,13 +151,13 @@ class ComaResponseModel(_PhysicalRecord):
                 ("a0", u.mas / u.nm, 0),
                 ("b", u.mas / u.nm, 0),
                 ("m_half", u.mag, 0),
-                ("magnitude_support", u.mag, 1),
-                ("zenith_support", u.deg, 1),
+                ("magnitude_range", u.mag, 1),
+                ("zenith_range", u.deg, 1),
             )
         }
         magnitude, angles = (
-            values["magnitude_support"].value,
-            values["zenith_support"].value,
+            values["magnitude_range"].value,
+            values["zenith_range"].value,
         )
         if (
             magnitude.shape != (2,)
@@ -157,14 +165,14 @@ class ComaResponseModel(_PhysicalRecord):
             or magnitude[0] >= magnitude[1]
             or not 0 <= angles[0] < angles[1] < 90
         ):
-            raise ValueError("increasing measured magnitude/zenith support required")
+            raise ValueError("increasing measured magnitude/zenith ranges required")
         if not magnitude[0] < values["m_half"].value < magnitude[1]:
-            raise ValueError("half-response magnitude must lie inside measured support")
+            raise ValueError("half-response magnitude must lie inside measured range")
         amplitude = values["a0"].value + values["b"].value * (
             1 / np.cos(np.deg2rad(angles)) - 1
         )
         if np.min(amplitude) <= 0:
-            raise ValueError("coma response must be positive over its measured support")
+            raise ValueError("coma response must be positive over its measured range")
         if not isinstance(self.photometry, CalibrationPhotometry):
             raise TypeError("photometry must be CalibrationPhotometry")
         for name, value in values.items():
@@ -177,10 +185,10 @@ class ComaResponseModel(_PhysicalRecord):
             dtype: Numerical precision, either float32 or float64.
 
         Returns:
-            A separate response model with the same measured support at the requested precision.
+            A separate response model with the same measured range at the requested precision.
 
         Raises:
-            ValueError: If the precision is unsupported or conversion invalidates support.
+            ValueError: If the precision is unsupported or conversion invalidates the calibrated range.
         """
         return replace(
             self,
@@ -192,7 +200,7 @@ class ComaResponseModel(_PhysicalRecord):
         """Return broadcast primary-coma WFS response in mas/nm OPD.
 
         Require finite physical magnitude/angle values inside actual measured
-        support. The caller uses this model's explicit magnitude convention.
+        ranges. The caller uses this model's explicit magnitude convention.
 
         Args:
             magnitude: Magnitude quantities in the calibrated photometric convention.
@@ -203,7 +211,7 @@ class ComaResponseModel(_PhysicalRecord):
 
         Raises:
             TypeError: If a required physical quantity is missing.
-            ValueError: If query values or units are invalid or outside measured support.
+            ValueError: If query values or units are invalid or outside measured range.
         """
         if not isinstance(magnitude, u.Quantity) or not isinstance(
             zenith_angle, u.Quantity
@@ -217,16 +225,16 @@ class ComaResponseModel(_PhysicalRecord):
             v.dtype.kind not in "fiu" or not np.isfinite(v).all() for v in (mag, angle)
         ):
             raise ValueError("finite real magnitude/angle values required")
-        precision = self.support_precision
+        precision = self.grid_precision
         mag = snap_coordinate_range(
             mag,
-            self.magnitude_support.value,
+            self.magnitude_range.value,
             dtype=precision,
             label="coma-response magnitude",
         )
         angle = snap_coordinate_range(
             angle,
-            self.zenith_support.value,
+            self.zenith_range.value,
             dtype=precision,
             label="coma-response zenith angle",
         )
@@ -276,25 +284,21 @@ class ComaCalibrationResult:
 def build_coma_calibration(
     measurements: Iterable[ComaCalibrationMeasurements],
     *,
-    heldout_zenith: u.Quantity | None = 30 * u.deg,
-    bootstrap_seed: int | None = None,
     dtype: DTypeLike = np.float32,
 ) -> ComaCalibrationResult:
     """Estimate each plane and fit the retained joint response law offline.
 
     Preserve scalar/matrix paired regression, the 200-replicate full/half
     wavefront bootstrap, four detector batches, optimizer initialization and
-    acceptance criteria. Inputs must share magnitude nodes, photometry and
-    conditioning wavelength. At least three distinct viewing planes are needed;
-    optional held-out validation runs only with three other training planes.
-    bootstrap_seed=None retains each recorded fit seed; an explicit uint32
-    seed changes resampling without reacquiring WFS observations. No wavefront
-    images, native files or calibration subclass are required.
+    acceptance criteria. Inputs must share magnitude values, photometry and
+    conditioning wavelength. The fit needs at least three distinct zenith planes.
+    It also checks the 30-degree plane against a fit to the remaining planes when
+    at least three of them are available.
+    Each plane retains its original resampling seed for reproducible checks.
+    No wavefront images, native files or calibration subclass are required.
 
     Args:
         measurements: Compatible paired WFS measurements by zenith plane.
-        heldout_zenith: Optional measured zenith angle for a withheld-plane check.
-        bootstrap_seed: Optional override for the resampling seed.
         dtype: Numerical precision, either float32 or float64.
 
     Returns:
@@ -303,12 +307,6 @@ def build_coma_calibration(
     Raises:
         ValueError: If the inputs conflict or do not span the response fit.
     """
-    if bootstrap_seed is not None:
-        from ._calibration_contracts import _count
-
-        _count(bootstrap_seed, "bootstrap_seed", 0)
-        if bootstrap_seed >= 2**32:
-            raise ValueError("bootstrap_seed must fit uint32")
     measurements = list(measurements)
     if len(measurements) < 3 or any(
         not isinstance(item, ComaCalibrationMeasurements) for item in measurements
@@ -349,9 +347,7 @@ def build_coma_calibration(
         fit = fit_response(
             response,
             sensing_wavelength=float(item.sensing_wavelength.value),
-            bootstrap_seed=item.settings.bootstrap_seed
-            if bootstrap_seed is None
-            else bootstrap_seed,
+            bootstrap_seed=item.bootstrap_seed,
             noise_draws=item.settings.noise_draws,
         )
         if not fit["accepted"]:
@@ -359,14 +355,12 @@ def build_coma_calibration(
                 f"rejected coma response estimate at zenith {item.zenith_angle}"
             )
         fits.append(fit)
-    heldout = -1.0 if heldout_zenith is None else float(_angle(heldout_zenith).value)
     joint = fit_airmass(
         angles,
         magnitudes,
         np.stack([fit["h"] for fit in fits]),
         np.stack([fit["standardError"] for fit in fits]),
         sensing_wavelength=float(first.sensing_wavelength.value),
-        heldout_zenith=heldout,
     )
     if not joint["accepted"]:
         raise ValueError("joint coma response law failed acceptance")
@@ -374,12 +368,12 @@ def build_coma_calibration(
     model = ComaResponseModel(
         dtype=dtype,
         producer_dtype=dtype,
-        support_precision=coordinate_precision,
+        grid_precision=coordinate_precision,
         a0=a0 * u.mas / u.nm,
         b=b * u.mas / u.nm,
         m_half=half * u.mag,
-        magnitude_support=magnitudes[[0, -1]] * u.mag,
-        zenith_support=angles[[0, -1]] * u.deg,
+        magnitude_range=magnitudes[[0, -1]] * u.mag,
+        zenith_range=angles[[0, -1]] * u.deg,
         photometry=first.photometry,
     )
     return ComaCalibrationResult(
@@ -389,21 +383,16 @@ def build_coma_calibration(
                 f"{angle:g}": fit for angle, fit in zip(angles, fits, strict=True)
             },
             "joint": joint,
-            "bootstrap_seeds": [
-                item.settings.bootstrap_seed
-                if bootstrap_seed is None
-                else bootstrap_seed
-                for item in measurements
-            ],
+            "bootstrap_seeds": [item.bootstrap_seed for item in measurements],
         },
     )
 
 
 def save_coma_calibration(model: ComaResponseModel, path: str | Path) -> None:
-    """Atomically publish a JSON-only response model with physical support.
+    """Atomically save a JSON-only response model with physical ranges.
 
     Args:
-        model: The fitted primary-coma response and its measured support.
+        model: The fitted primary-coma response and its measured range.
         path: Destination model.json manifest. Create its parent directories if
             needed. Atomically replace any existing destination.
 
@@ -417,7 +406,7 @@ def save_coma_calibration(model: ComaResponseModel, path: str | Path) -> None:
         _KIND,
         {
             "precision": model.dtype.name,
-            "support_precision": model.support_precision.name,
+            "grid_precision": model.grid_precision.name,
             "producer_precision": None
             if model.producer_dtype is None
             else np.dtype(model.producer_dtype).name,
@@ -426,8 +415,8 @@ def save_coma_calibration(model: ComaResponseModel, path: str | Path) -> None:
                 "b_mas_per_nm": float(model.b.value),
                 "m_half_mag": float(model.m_half.value),
             },
-            "magnitude_support": model.magnitude_support.value.tolist(),
-            "zenith_support_deg": model.zenith_support.value.tolist(),
+            "magnitude_range": model.magnitude_range.value.tolist(),
+            "zenith_range_deg": model.zenith_range.value.tolist(),
             "photometry": photometry_header(model.photometry),
             "units": {"response": "mas/nm", "magnitude": "mag", "zenith": "deg"},
         },
@@ -441,7 +430,7 @@ def load_coma_calibration(path: str | Path) -> ComaResponseModel:
         path: Path to the saved model.json manifest.
 
     Returns:
-        The fitted primary-coma response and its measured support reconstructed at its stored precision.
+        The fitted primary-coma response and its measured range reconstructed at its stored precision.
 
     Raises:
         FileNotFoundError: If a required file is missing.
@@ -450,13 +439,13 @@ def load_coma_calibration(path: str | Path) -> ComaResponseModel:
     header, arrays = load_product(path, _KIND)
     if (
         arrays is not None
-        or (set(header) - {"precision", "producer_precision", "support_precision"})
+        or (set(header) - {"precision", "producer_precision", "grid_precision"})
         != {
             "schema",
             "version",
             "parameters",
-            "magnitude_support",
-            "zenith_support_deg",
+            "magnitude_range",
+            "zenith_range_deg",
             "photometry",
             "units",
         }
@@ -472,12 +461,12 @@ def load_coma_calibration(path: str | Path) -> ComaResponseModel:
     return ComaResponseModel(
         dtype=header.get("precision", np.float64),
         producer_dtype=header.get("producer_precision"),
-        support_precision=header.get("support_precision"),
+        grid_precision=header.get("grid_precision"),
         a0=coefficients["a0_mas_per_nm"] * u.mas / u.nm,
         b=coefficients["b_mas_per_nm"] * u.mas / u.nm,
         m_half=coefficients["m_half_mag"] * u.mag,
-        magnitude_support=header["magnitude_support"] * u.mag,
-        zenith_support=header["zenith_support_deg"] * u.deg,
+        magnitude_range=header["magnitude_range"] * u.mag,
+        zenith_range=header["zenith_range_deg"] * u.deg,
         photometry=CalibrationPhotometry(
             dtype=header.get("precision", np.float64),
             magnitude_band=photometry["magnitude_band"],
@@ -490,10 +479,10 @@ def load_coma_calibration(path: str | Path) -> ComaResponseModel:
 def save_coma_measurements(
     measurements: ComaCalibrationMeasurements, path: str | Path
 ) -> None:
-    """Atomically save sufficient paired observations and effective numerical controls.
+    """Atomically save sufficient paired measurements and effective numerical controls.
 
     Args:
-        measurements: Paired coma observations with their fit controls.
+        measurements: Paired coma measurements with their fit controls.
         path: Destination NPZ file. Create its parent directories if
             needed. Atomically replace any existing destination.
 
@@ -509,7 +498,10 @@ def save_coma_measurements(
         "zenith_angle_deg": float(measurements.zenith_angle.value),
         "sensing_wavelength_m": float(measurements.sensing_wavelength.value),
         "photometry": photometry_header(measurements.photometry),
-        "settings": measurements.settings.__dict__,
+        "settings": {
+            **asdict(measurements.settings),
+            "bootstrap_seed": measurements.bootstrap_seed,
+        },
         "units": _UNITS,
     }
     with atomic_output_path(Path(path)) as temporary, temporary.open("wb") as stream:
@@ -521,13 +513,13 @@ def save_coma_measurements(
 
 
 def load_coma_measurements(path: str | Path) -> ComaCalibrationMeasurements:
-    """Load strict paired response observations without wavefront/native resources.
+    """Load strict paired response measurements without wavefront/native resources.
 
     Args:
         path: Path to the saved NPZ file.
 
     Returns:
-        Paired coma observations with their fit controls reconstructed at its stored precision.
+        Paired coma measurements with their fit controls reconstructed at its stored precision.
 
     Raises:
         FileNotFoundError: If a required file is missing.
@@ -535,7 +527,7 @@ def load_coma_measurements(path: str | Path) -> ComaCalibrationMeasurements:
     """
     with np.load(Path(path), allow_pickle=False) as saved:
         header = json.loads(str(saved["__header__"]))
-        validate_observation_precision(header, saved)
+        validate_calibration_data_precision(header, saved)
         if (
             (set(header) - ({"precision"} if header.get("version") == 2 else set()))
             != {
@@ -557,6 +549,8 @@ def load_coma_measurements(path: str | Path) -> ComaCalibrationMeasurements:
         ):
             raise ValueError("invalid coma measurements schema/units/fields")
         photometry = header["photometry"]
+        settings = dict(header["settings"])
+        bootstrap_seed = settings.pop("bootstrap_seed", _BOOTSTRAP_SEED)
         return ComaCalibrationMeasurements(
             dtype=header.get("precision", np.float64),
             zenith_angle=header["zenith_angle_deg"] * u.deg,
@@ -571,5 +565,6 @@ def load_coma_measurements(path: str | Path) -> ComaCalibrationMeasurements:
                 photons_per_frame_zeropoint=photometry["photons_per_frame_zeropoint"]
                 * u.photon,
             ),
-            settings=ComaCalibrationSettings(**header["settings"]),
+            settings=ComaCalibrationSettings(**settings),
+            bootstrap_seed=bootstrap_seed,
         )

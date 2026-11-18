@@ -43,21 +43,19 @@ def test_package_root_exports_supported_contracts() -> None:
     calibration_names = {
         "SensingPrediction",
         "SensingResponseModel",
-        "SensingResponseCalibration",
+        "SensingResponseResult",
         "build_sensing_response",
         "SensingNoiseRequest",
         "SensingNoiseMeasurements",
         "simulate_sensing_noise",
         "save_sensing_noise",
         "load_sensing_noise",
-        "SensingCalibration",
+        "SensingModel",
         "SensingCalibrationResult",
         "build_sensing_calibration",
         "save_sensing_calibration",
         "load_sensing_calibration",
-        "WfsSensingStatistics",
         "SensingCalibrationMeasurements",
-        "estimate_sensing_statistics",
         "save_sensing_measurements",
         "load_sensing_measurements",
         "ComaCalibrationMeasurements",
@@ -83,8 +81,6 @@ def test_package_root_exports_supported_contracts() -> None:
         "build_reconstructor_calibration",
         "build_lo_reconstructor",
         "solve_lo_reconstructor",
-        "validate_covariance_reconstructor",
-        "reconstructor_calibration_inputs",
         "save_reconstructor_calibration",
         "load_reconstructor_calibration",
         "save_reconstructor_measurements",
@@ -112,11 +108,11 @@ def test_package_root_exports_supported_contracts() -> None:
         "ReconstructorCalibrationSettings",
         "E2ECalibrationConfiguration",
         "load_e2e_calibration_configuration",
-        "CalibrationFileIdentity",
-        "CalibrationProductIdentity",
-        "save_calibration_samples",
-        "load_calibration_samples",
-        "read_calibration_product_identity",
+        "CalibrationFile",
+        "CalibrationModelFiles",
+        "save_calibration_data",
+        "load_calibration_data",
+        "read_calibration_model_files",
     }
     assert set(hybrid_ao_psf.__all__) == core_names | calibration_names | set(
         interpolation.__all__
@@ -151,3 +147,26 @@ def test_interpolation_exports_only_generic_psf_names() -> None:
         )
         assert not hasattr(surface, "SciencePsfProvider")
         assert not hasattr(surface, "NgsMetricProvider")
+
+
+def test_sensing_types_have_no_calibration_name_aliases() -> None:
+    assert hybrid_ao_psf.SensingModel.__name__ == "SensingModel"
+    assert hybrid_ao_psf.SensingResponseResult.__name__ == "SensingResponseResult"
+    assert not hasattr(hybrid_ao_psf, "SensingCalibration")
+    assert not hasattr(hybrid_ao_psf, "SensingResponseCalibration")
+
+
+def test_former_calibration_file_names_are_not_public() -> None:
+    for name in (
+        "CalibrationProductIdentity",
+        "CalibrationFileIdentity",
+        "read_calibration_product_identity",
+    ):
+        assert name not in hybrid_ao_psf.__all__
+        assert not hasattr(hybrid_ao_psf, name)
+
+
+def test_former_calibration_data_names_are_not_public() -> None:
+    for name in ("save_calibration_samples", "load_calibration_samples"):
+        assert name not in hybrid_ao_psf.__all__
+        assert not hasattr(hybrid_ao_psf, name)

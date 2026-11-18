@@ -1,4 +1,4 @@
-"""Independent response observations and native-free coma law calibration."""
+"""Independent response measurements and native-free coma law calibration."""
 
 from dataclasses import replace
 
@@ -73,6 +73,7 @@ def test_offline_coma_build_preserves_scalar_matrix_and_noise_diagnostics(tmp_pa
         rtol=1e-8,
         atol=1e-9,
     )
+    assert result.diagnostics["joint"]["heldout"]["zenith"] == 30.0
     for fit in result.diagnostics["planes"].values():
         np.testing.assert_allclose(
             np.asarray(fit["jacobian"]),
@@ -103,22 +104,26 @@ def test_offline_coma_build_preserves_scalar_matrix_and_noise_diagnostics(tmp_pa
     assert model.a0.unit == u.mas / u.nm
 
 
-def test_measured_support_is_not_expanded():
+def test_measured_range_is_not_expanded():
     planes = [measurement(angle) for angle in (10, 20, 30)]
-    result = build_coma_calibration(planes, heldout_zenith=None, dtype=np.float64)
-    np.testing.assert_array_equal(result.model.zenith_support.value, [10, 30])
+    result = build_coma_calibration(planes, dtype=np.float64)
+    assert "heldout" not in result.diagnostics["joint"]
+    np.testing.assert_array_equal(result.model.zenith_range.value, [10, 30])
     with pytest.raises(ValueError, match="range"):
         result.model.predict(magnitude=10 * u.mag, zenith_angle=0 * u.deg)
     with pytest.raises(ValueError, match="three"):
         build_coma_calibration(planes[:2], dtype=np.float64)
 
 
-def test_bootstrap_override_reuses_paired_observations():
-    planes = [measurement(angle) for angle in (0, 20, 40)]
-    result = build_coma_calibration(
-        planes, bootstrap_seed=57, heldout_zenith=None, dtype=np.float64
-    )
-    assert result.diagnostics["bootstrap_seeds"] == (57, 57, 57)
-    assert all(plane.settings.bootstrap_seed == 901732 for plane in planes)
+def test_coma_build_uses_each_saved_bootstrap_seed(tmp_path):
+    planes = []
+    for angle, seed in zip((0, 20, 40), (0, 57, 901732), strict=True):
+        path = tmp_path / f"za{angle}.npz"
+        save_coma_measurements(replace(measurement(angle), bootstrap_seed=seed), path)
+        planes.append(load_coma_measurements(path))
+
+    result = build_coma_calibration(planes, dtype=np.float64)
+    assert result.diagnostics["bootstrap_seeds"] == (0, 57, 901732)
+    assert result.diagnostics["joint"]["accepted"]
     with pytest.raises(ValueError, match="bootstrap_seed"):
-        build_coma_calibration(planes, bootstrap_seed=-1, dtype=np.float64)
+        replace(planes[0], bootstrap_seed=-1)

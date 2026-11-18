@@ -1,4 +1,4 @@
-"""Physical fixed-spot observations and conditional paired-WFS statistics."""
+"""Physical fixed-spot measurements and conditional paired-WFS statistics."""
 
 from __future__ import annotations
 
@@ -19,7 +19,7 @@ from ._calibration_contracts import (
     _PhysicalRecord,
     _quantity,
 )
-from ._calibration_io import validate_observation_precision
+from ._calibration_io import validate_calibration_data_precision
 from ._calibration_products import (
     controller_header,
     photometry_header,
@@ -42,7 +42,7 @@ class WfsSensingStatistics(_PhysicalRecord):
         mean: Two-component mean measured tilt at zero imposed displacement.
         covariance: Full (2,2) angular-squared population noise covariance.
         white: Dimensionless paired zero draws, stored at the selected
-            bank precision, retaining both axes and their sample order.
+            interpolator precision, retaining both axes and their sample order.
         gain_matrix: Dimensionless (2,2) local response, output x/y by input x/y.
         gain_standard_error: Dimensionless (2,2) paired-batch standard errors.
         gain_blocks: Dimensionless (blocks,2,2) estimates for independent batches.
@@ -101,7 +101,7 @@ class WfsSensingStatistics(_PhysicalRecord):
         return np.trace(self.covariance) / 2
 
 
-def estimate_sensing_statistics(
+def _estimate_sensing_statistics(
     samples: SensingWfsMeasurements,
     *,
     displacement: u.Quantity,
@@ -228,9 +228,9 @@ class SensingCalibrationMeasurements(_PhysicalRecord):
 
         Returns:
             Conditional noise covariance and scalar and matrix gain estimates
-            computed from the retained draws, plus the simulation noise bank.
+            computed from the retained draws, plus the simulation noise samples.
         """
-        return estimate_sensing_statistics(
+        return _estimate_sensing_statistics(
             self.samples,
             displacement=self.displacement,
             block_draws=self.sampling.block_draws,
@@ -282,7 +282,7 @@ def save_sensing_measurements(
 
 
 def load_sensing_measurements(path: str | Path) -> SensingCalibrationMeasurements:
-    """Load strict physical WFS observations without any E2E files/software.
+    """Load strict physical WFS measurements without any E2E files/software.
 
     Args:
         path: Path to the saved NPZ file.
@@ -296,7 +296,7 @@ def load_sensing_measurements(path: str | Path) -> SensingCalibrationMeasurement
     """
     with np.load(Path(path), allow_pickle=False) as saved:
         header = json.loads(str(saved["__header__"]))
-        validate_observation_precision(header, saved)
+        validate_calibration_data_precision(header, saved)
         if (
             (set(header) - ({"precision"} if header.get("version") == 2 else set()))
             != {

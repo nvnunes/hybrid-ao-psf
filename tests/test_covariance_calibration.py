@@ -96,7 +96,7 @@ def measured():
         gain=0.3, delay=2, frame_rate=500 * u.Hz, dtype=np.float64
     )
     settings = CovarianceCalibrationSettings(
-        feedback=(0.5, 1.0, 1.5), bootstrap_draws=11
+        feedback=(0.5, 1.0, 1.5)
     )
     return record, measure_covariance_calibration(
         record, controller, settings=settings, dtype=np.float64
@@ -111,7 +111,7 @@ def test_six_functions_match_independent_recurrence_and_pooled_mean(measured):
             result.tables[name].value, values, rtol=1e-12, atol=1e-10
         )
     assert result.realizations == 3
-    assert result.diagnostics["precision"]["bootstrap_samples"] == 11
+    assert result.diagnostics["precision"]["bootstrap_samples"] == 200
     with pytest.raises(ValueError):
         result.tables["C_t_t"].value.flags.writeable = True
     with pytest.raises(ValueError):
@@ -145,9 +145,9 @@ def test_measurement_and_model_roundtrip_unequal_realizations(measured, tmp_path
         rtol=1e-12,
         atol=1e-10,
     )
-    with pytest.raises(ValueError, match="support"):
+    with pytest.raises(ValueError, match="range"):
         model.C_t_Tt(*args, 0.1, zenith_angle=20 * u.deg)
-    with pytest.raises(ValueError, match="support"):
+    with pytest.raises(ValueError, match="range"):
         model.C_t_t(*args, zenith_angle=50 * u.deg)
     with pytest.raises(ValueError):
         model.feedback.flags.writeable = True

@@ -167,7 +167,7 @@ def _scalar_decomposition(feedback: NDArray) -> _ScalarFeedback:
     """Resolve real projectors, preserving the accepted complex-B approximation.
 
     A defective or excessively ill-conditioned eigenbasis cannot represent the
-    calibrated scalar bank. B itself remains unchanged for noise propagation.
+    calibrated scalar covariance interpolators. B itself remains unchanged for noise propagation.
     """
     dtype = feedback.dtype
     eps = np.finfo(dtype).eps

@@ -1,4 +1,4 @@
-"""Independent physical-input, configuration, persistence and identity checks."""
+"""Independent physical-input, configuration, persistence and file checks."""
 
 import json
 from dataclasses import FrozenInstanceError
@@ -8,8 +8,8 @@ import pytest
 from astropy import units as u
 
 from hybrid_ao_psf import (
+    CalibrationModelFiles,
     CalibrationPhotometry,
-    CalibrationProductIdentity,
     ComaResponseMeasurements,
     ComaWavefronts,
     ComaWfsMeasurements,
@@ -20,10 +20,10 @@ from hybrid_ao_psf import (
     ReconstructorNoiseMeasurements,
     SensingSpot,
     SensingWfsMeasurements,
-    load_calibration_samples,
+    load_calibration_data,
     load_e2e_calibration_configuration,
-    read_calibration_product_identity,
-    save_calibration_samples,
+    read_calibration_model_files,
+    save_calibration_data,
 )
 
 
@@ -50,6 +50,44 @@ def ini(tmp_path, extra=""):
         + extra
     )
     return path
+
+
+def test_reconstructor_point_counts_in_ini_and_overrides(tmp_path):
+    path = ini(
+        tmp_path,
+        "[calibration.reconstructor]\n"
+        "signal_point_count = 5\nfwhm_point_count = 7\nee_point_count = 3\n",
+    )
+    config = load_e2e_calibration_configuration(path)
+    assert config.reconstructor.signal_point_count == 5
+    assert config.reconstructor.fwhm_point_count == 7
+    assert config.reconstructor.ee_point_count == 3
+    changed = config.with_overrides(reconstructor={"ee_point_count": 4})
+    assert changed.reconstructor.ee_point_count == 4
+
+    path = ini(tmp_path, "[calibration.reconstructor]\nsignal_nodes = 5\n")
+    with pytest.raises(ValueError, match="Unknown keys.*signal_nodes"):
+        load_e2e_calibration_configuration(path)
+
+
+@pytest.mark.parametrize("setting", ["holdouts", "seed"])
+def test_ini_rejects_reconstructor_interpolation_check_options(tmp_path, setting):
+    path = ini(tmp_path, f"[calibration.reconstructor]\n{setting} = 11\n")
+    with pytest.raises(ValueError, match=f"Unknown keys.*{setting}"):
+        load_e2e_calibration_configuration(path)
+
+
+@pytest.mark.parametrize("setting", ["bootstrap_draws", "seed"])
+def test_ini_rejects_covariance_bootstrap_options(tmp_path, setting):
+    path = ini(tmp_path, f"[calibration.covariance]\n{setting} = 11\n")
+    with pytest.raises(ValueError, match=f"Unknown keys.*{setting}"):
+        load_e2e_calibration_configuration(path)
+
+
+def test_ini_rejects_coma_bootstrap_seed(tmp_path):
+    path = ini(tmp_path, "[calibration.coma]\nbootstrap_seed = 57\n")
+    with pytest.raises(ValueError, match="Unknown keys.*bootstrap_seed"):
+        load_e2e_calibration_configuration(path)
 
 
 def test_packed_independent_realizations_and_immutable_unit_state():
@@ -142,10 +180,10 @@ def records():
 
 
 @pytest.mark.parametrize("record", records())
-def test_portable_samples_roundtrip_without_native_software(tmp_path, record):
+def test_calibration_data_roundtrip_without_native_software(tmp_path, record):
     path = tmp_path / "samples.npz"
-    save_calibration_samples(record, path)
-    result = load_calibration_samples(path)
+    save_calibration_data(record, path)
+    result = load_calibration_data(path)
     assert type(result) is type(record)
     for name in record.__dataclass_fields__:
         expected = getattr(record, name)
@@ -158,7 +196,7 @@ def test_portable_samples_roundtrip_without_native_software(tmp_path, record):
 
 def test_saved_wrong_unit_declaration_is_rejected(tmp_path):
     path = tmp_path / "sample.npz"
-    save_calibration_samples(telemetry(), path)
+    save_calibration_data(telemetry(), path)
     with np.load(path) as saved:
         arrays = {key: saved[key] for key in saved.files}
     header = json.loads(str(arrays["__header__"]))
@@ -166,25 +204,22 @@ def test_saved_wrong_unit_declaration_is_rejected(tmp_path):
     arrays["__header__"] = json.dumps(header)
     np.savez(path, **arrays)
     with pytest.raises(ValueError, match="units"):
-        load_calibration_samples(path)
+        load_calibration_data(path)
 
 
 def test_configuration_precedence_and_native_sections_are_not_opened(tmp_path):
     path = ini(
         tmp_path,
-        "[oomao]\nsource = /absent/native.mat\n[calibration.covariance]\nbootstrap_draws = 17\nfeedback = [0.2, 0.7, 2.0]\n[calibration.sensing]\nzero_draws = 8192\n",
+        "[oomao]\nsource = /absent/native.mat\n[calibration.covariance]\nfeedback = [0.2, 0.7, 2.0]\n[calibration.sensing]\nzero_draws = 8192\n",
     )
     config = load_e2e_calibration_configuration(path)
     assert not config.covariance_model.exists()
-    assert config.covariance.bootstrap_draws == 17
     assert config.covariance.feedback == (0.2, 0.7, 2.0)
     assert config.coma.samples == 512
-    assert config.covariance.seed == 20261013
-    changed = config.with_overrides(covariance={"bootstrap_draws": 23})
-    assert changed.covariance.bootstrap_draws == 23
+    changed = config.with_overrides(covariance={"feedback": (0.4, 1.4)})
+    assert changed.covariance.feedback == (0.4, 1.4)
     assert changed.sensing.zero_draws == 8192
-    assert config.covariance.bootstrap_draws == 17
-    assert config.with_overrides().covariance.bootstrap_draws == 17
+    assert config.with_overrides().covariance.feedback == (0.2, 0.7, 2.0)
     with pytest.raises(TypeError):
         config.with_overrides(covariance={"typo": 12})
     assert config.covariance_model == tmp_path / "products/covariance/model.json"
@@ -234,54 +269,57 @@ def test_photometry_is_generic_and_preserves_incident_count_convention():
         FixedGainIntegrator(gain=0.3, delay=True, frame_rate=500 * u.Hz)
 
 
-def test_fitted_identity_covers_json_and_payload_and_changed_valid_product(tmp_path):
+def test_model_files_cover_manifest_and_array_file_and_changed_valid_model(tmp_path):
     import hashlib
 
-    payload = tmp_path / "arrays.npz"
-    np.savez(payload, values=[1.0, 2.0])
+    array_file = tmp_path / "arrays.npz"
+    np.savez(array_file, values=[1.0, 2.0])
     path = tmp_path / "model.json"
     data = {
         "kind": "synthetic",
         "schema_version": 1,
-        "payload": "arrays.npz",
-        "payload_sha256": hashlib.sha256(payload.read_bytes()).hexdigest(),
+        "array_file": "arrays.npz",
+        "array_file_sha256": hashlib.sha256(array_file.read_bytes()).hexdigest(),
         "coefficient": 1.0,
     }
     path.write_text(json.dumps(data))
-    identity = read_calibration_product_identity(path)
-    assert isinstance(identity, CalibrationProductIdentity)
-    assert len(identity.payloads) == 1
-    identity.verify()
+    model_files = read_calibration_model_files(path)
+    assert isinstance(model_files, CalibrationModelFiles)
+    assert len(model_files.array_files) == 1
+    assert model_files.manifest.path == path.resolve()
+    assert not hasattr(model_files, "entrypoint")
+    assert not hasattr(model_files, "payloads")
+    model_files.verify()
     # Another valid generation at the same path is nevertheless not this binding.
-    np.savez(payload, values=[2.0, 3.0])
-    data["payload_sha256"] = hashlib.sha256(payload.read_bytes()).hexdigest()
+    np.savez(array_file, values=[2.0, 3.0])
+    data["array_file_sha256"] = hashlib.sha256(array_file.read_bytes()).hexdigest()
     path.write_text(json.dumps(data))
-    replacement = read_calibration_product_identity(path)
-    assert replacement != identity
+    replacement = read_calibration_model_files(path)
+    assert replacement != model_files
     with pytest.raises(ValueError, match="content changed"):
-        identity.verify()
+        model_files.verify()
     replacement.verify()
-    payload.unlink()
+    array_file.unlink()
     with pytest.raises(FileNotFoundError):
         replacement.verify()
 
 
-def test_json_only_identity_and_bad_payload_paths(tmp_path):
+def test_json_only_model_files_and_bad_array_file_paths(tmp_path):
     path = tmp_path / "model.json"
     path.write_text('{"coefficient": 1}')
-    identity = read_calibration_product_identity(path)
-    assert identity.payloads == ()
+    model_files = read_calibration_model_files(path)
+    assert model_files.array_files == ()
     for value in ("../elsewhere.npz", "/tmp/elsewhere.npz", "not-an-array.json"):
-        path.write_text(json.dumps({"payload": value, "payload_sha256": "0" * 64}))
+        path.write_text(json.dumps({"array_file": value, "array_file_sha256": "0" * 64}))
         with pytest.raises(ValueError, match="relative NPZ"):
-            read_calibration_product_identity(path)
+            read_calibration_model_files(path)
 
 
-def test_atomic_sample_write_preserves_previous_on_cancellation(tmp_path, monkeypatch):
+def test_atomic_data_write_preserves_previous_on_cancellation(tmp_path, monkeypatch):
     import hybrid_ao_psf._calibration_io as implementation
 
     path = tmp_path / "samples.npz"
-    save_calibration_samples(telemetry(), path)
+    save_calibration_data(telemetry(), path)
     original = path.read_bytes()
 
     def cancelled(*args, **kwargs):
@@ -289,7 +327,7 @@ def test_atomic_sample_write_preserves_previous_on_cancellation(tmp_path, monkey
 
     monkeypatch.setattr(implementation.np, "savez", cancelled)
     with pytest.raises(KeyboardInterrupt):
-        save_calibration_samples(telemetry(), path)
+        save_calibration_data(telemetry(), path)
     assert path.read_bytes() == original
     assert list(tmp_path.iterdir()) == [path]
 
@@ -340,3 +378,50 @@ def test_sensing_history_controls_load_from_ini(tmp_path):
     settings = load_e2e_calibration_configuration(path).sensing
     assert settings.noise_realizations == 3
     assert settings.noise_frames == 256
+
+
+@pytest.mark.parametrize("reference", [
+    {"payload": "arrays.npz"},
+    {"payload_sha256": "0" * 64},
+    {"payload": "arrays.npz", "payload_sha256": "0" * 64},
+])
+def test_model_files_reject_former_array_file_keys(tmp_path, reference):
+    path = tmp_path / "model.json"
+    path.write_text(json.dumps(reference))
+    with pytest.raises(ValueError, match="unsupported array file fields"):
+        read_calibration_model_files(path)
+
+
+@pytest.mark.parametrize("reference", [
+    {"array_file": "arrays.npz"},
+    {"array_file_sha256": "0" * 64},
+])
+def test_model_files_require_both_array_file_fields(tmp_path, reference):
+    path = tmp_path / "model.json"
+    path.write_text(json.dumps(reference))
+    with pytest.raises(ValueError, match="must appear together"):
+        read_calibration_model_files(path)
+
+
+@pytest.mark.parametrize("target", ["manifest", "array_file"])
+@pytest.mark.parametrize("mutation", ["change", "remove"])
+def test_model_files_detect_changed_or_missing_files(tmp_path, target, mutation):
+    import hashlib
+
+    array_file = tmp_path / "arrays.npz"
+    np.savez(array_file, values=[1.0, 2.0])
+    manifest = tmp_path / "model.json"
+    manifest.write_text(json.dumps({
+        "array_file": array_file.name,
+        "array_file_sha256": hashlib.sha256(array_file.read_bytes()).hexdigest(),
+    }))
+    model_files = read_calibration_model_files(manifest)
+    path = manifest if target == "manifest" else array_file
+    if mutation == "remove":
+        path.unlink()
+        with pytest.raises(FileNotFoundError):
+            model_files.verify()
+    else:
+        path.write_bytes(path.read_bytes() + b"\n")
+        with pytest.raises(ValueError, match="content changed"):
+            model_files.verify()

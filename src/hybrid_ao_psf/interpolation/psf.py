@@ -1222,7 +1222,7 @@ def save_psf_interpolator(
 ) -> None:
     """Write a versioned pickle with the fitted image grid and its metadata.
 
-    Create missing parent directories and publish the file atomically.
+    Create missing parent directories and save the file atomically.
 
     Args:
         interpolator: Fitted image provider to save.

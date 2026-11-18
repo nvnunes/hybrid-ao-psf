@@ -174,7 +174,7 @@ def settling_cut(
     maximum: int = 500,
     dtype=np.float64,
 ) -> tuple[int, float]:
-    """Find the common cut bounding initial-state propagation for every node."""
+    """Find the common cut bounding initial-state propagation for every feedback grid point."""
     states = [state_matrix(gain, delay, b, dtype=dtype) for b in strengths]
     if any(max(abs(np.linalg.eigvals(a))) >= 1 for a in states):
         raise ValueError("Unstable feedback grid")

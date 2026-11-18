@@ -12,10 +12,10 @@ from hybrid_ao_psf import (
     SensingCalibrationMeasurements,
     SensingWfsMeasurements,
     SensingWfsSampling,
-    estimate_sensing_statistics,
     load_sensing_measurements,
     save_sensing_measurements,
 )
+from hybrid_ao_psf._sensing_measurements import _estimate_sensing_statistics
 
 
 def samples():
@@ -41,7 +41,7 @@ def samples():
 
 def test_paired_gain_and_population_covariance_known_inputs():
     measured, expected = samples()
-    stats = estimate_sensing_statistics(
+    stats = _estimate_sensing_statistics(
         measured, displacement=10 * u.mas, block_draws=8, dtype=np.float64
     )
     np.testing.assert_allclose(
@@ -65,7 +65,7 @@ def test_paired_gain_and_population_covariance_known_inputs():
     assert np.linalg.norm(measured.zero.value.mean(0)) > 30
 
 
-def test_reusable_sensing_observations_preserve_raw_means_pairing_and_statistics(
+def test_reusable_sensing_measurements_preserve_raw_means_pairing_and_statistics(
     tmp_path,
 ):
     measured, _ = samples()
@@ -154,6 +154,8 @@ def test_complete_sensing_noise_simulation_shape_fit_and_roundtrip(tmp_path):
         magnitude_intervals=[[8, 10]] * u.mag,
         dtype=np.float64,
     )
+    assert response.measured_point_count == len(points)
+    assert not hasattr(response, "bank_count")
     prediction = response.model.predict(
         positions=[[0, 0]] * u.arcsec, magnitudes=9 * u.mag, zenith_angle=20 * u.deg
     )
@@ -176,7 +178,7 @@ def test_complete_sensing_noise_simulation_shape_fit_and_roundtrip(tmp_path):
                 telemetry,
                 controller,
                 settings=CovarianceCalibrationSettings(
-                    feedback=(0.5, 1, 1.5), bootstrap_draws=7
+                    feedback=(0.5, 1, 1.5)
                 ),
                 dtype=np.float64,
             )
@@ -225,7 +227,7 @@ def test_complete_sensing_noise_simulation_shape_fit_and_roundtrip(tmp_path):
             2, len(request.positions), 2
         ).transpose(1, 0, 2)
         for g in range(len(request.positions)):
-            white = response.draw_noise(
+            white = response._draw_noise(
                 position=request.positions[g],
                 magnitude=request.magnitudes[g],
                 zenith_angle=request.zenith_angle,

@@ -32,9 +32,9 @@ Precision resolves from float32 default, then `[e2e] precision`, then an explici
 `dtype` argument. `model.prepare(dtype=...)` converts immutable runtime state
 without changing saved products or recovering information lost during earlier
 rounding. Once prepared, prediction performs no file I/O. The read-only
-`product_identities` mapping exposes the four content-bound file identities
-and the NGS metric file identity for execution/reuse checks. Direct construction
-from loaded providers can omit file identities.
+`model_files` mapping records the paths and checksums for the four calibrated
+models and the NGS metric file, for execution and reuse checks. Direct construction
+from loaded providers can omit these records.
 
 ## Composition
 
@@ -46,9 +46,9 @@ NGS uses identity weights.
 
 The feedback matrix is `B = sum(g_g R_g)`. Its two eigenvalues and projectors
 combine the scalar covariance functions without commuting reconstructor blocks
-through the loop response. A complex-eigenvalue B uses `(B+B.T)/2` for covariance
-bank evaluation, with the approximation flag and relative matrix change in the
-result. Defective or excessively ill-conditioned bases raise. The stationary
+through the loop response. For covariance interpolation, a complex-eigenvalue B
+uses `(B+B.T)/2`. The result records the approximation flag and relative matrix
+change. Defective or excessively ill-conditioned bases raise. The stationary
 noise covariance always uses the actual B and the calibrated fixed-gain delayed
 integrator through the discrete Lyapunov calculation.
 
@@ -67,7 +67,7 @@ The weighted mixture covariance equals `total`. All covariance axes are physical
 x/y and angular covariances are in mas squared; coma response is in mas/nm OPD.
 
 Queries must lie within all applicable spatial, magnitude, zenith and feedback
-supports. No extrapolation, native acquisition, MASTSEL fallback or
+ranges. No extrapolation, native acquisition, MASTSEL fallback or
 PSF construction occurs in `model.predict()`. See the [Python reference](reference/api.md)
 for the result fields and constructor contracts.
 

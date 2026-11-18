@@ -43,11 +43,11 @@ class E2ELowOrderPrediction(_PhysicalRecord):
         noise_prior: Separate pre-filter reconstructor prior, (2N,2N).
         reconstructor: Absolute field-centre LO weights, (2,2N).
         feedback: Actual B=sum(g_g R_g), (2,2).
-        effective_feedback: B used for the scalar covariance bank, (2,2).
+        effective_feedback: B used for the scalar covariance interpolators, (2,2).
         strengths: Two real eigenvalues of effective_feedback.
         projectors: Corresponding, generally non-orthogonal (2,2,2) projections.
         symmetric_feedback_fallback: Whether the complex-eigenvalue symmetric
-            approximation was needed for bank evaluation only.
+            approximation was needed for covariance interpolation only.
         feedback_approximation_relative_error: Relative Frobenius change in B.
         eigenbasis_condition: Condition number of the chosen eigenvector basis.
         atmospheric_command: Cov(u_atm), (2,2).
@@ -248,7 +248,7 @@ def _validate_prediction_shapes(result: E2ELowOrderPrediction) -> None:
 
 
 def _validate_feedback(result: E2ELowOrderPrediction, tolerance: float) -> None:
-    """Verify actual feedback and the scalar decomposition used by the bank."""
+    """Verify actual feedback and the scalar decomposition used by the interpolator."""
     if not np.allclose(
         result.feedback,
         _feedback_matrix(result.reconstructor, result.gains.value),
