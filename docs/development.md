@@ -5,37 +5,22 @@ Git hook activation, and routine contributor workflow.
 
 ## Bootstrap
 
-Run bootstrap with the public AO Stats repository as the explicit dependency
-source:
+Run bootstrap from the repository root:
 
 ```bash
-HYBRID_AO_PSF_AO_STATS_SOURCE='git+https://github.com/nvnunes/ao-stats.git@main' \
-  ./scripts/bootstrap.sh
+./scripts/bootstrap.sh
 ```
 
 The script creates `./.conda`, installs the package with development and
 documentation dependencies, configures the versioned Git hook, runs the
-canonical checks, and builds the package.
+canonical checks, and builds the package. It first reinstalls AO Core from
+GitHub and verifies the PSF measurements, photometry and configuration imports.
 
-The AO Stats source override also accepts a local checkout for co-development:
-
-```bash
-HYBRID_AO_PSF_AO_STATS_SOURCE=../ao-stats ./scripts/bootstrap.sh
-```
-
-Bootstrap reinstalls AO Core from its public GitHub repository before
-installing Hybrid AO PSF. Hybrid requires an AO Core build with its
-photometry, shared configuration, control and reconstruction modules.
-Bootstrap checks the photometry import and the shared `Configuration` API.
-
-Set `HYBRID_AO_PSF_AO_CORE_SOURCE` to use a sibling checkout, wheel, or VCS
-URL. Bootstrap installs a local checkout editably. Use the sibling
-checkout during co-development:
+Set `HYBRID_AO_PSF_AO_CORE_SOURCE` to a sibling checkout, wheel or VCS URL.
+For co-development, a local checkout is installed editably:
 
 ```bash
-HYBRID_AO_PSF_AO_STATS_SOURCE='git+https://github.com/nvnunes/ao-stats.git@main' \
-HYBRID_AO_PSF_AO_CORE_SOURCE=../ao-core \
-  ./scripts/bootstrap.sh
+HYBRID_AO_PSF_AO_CORE_SOURCE=../ao-core ./scripts/bootstrap.sh
 ```
 
 ## Daily Commands

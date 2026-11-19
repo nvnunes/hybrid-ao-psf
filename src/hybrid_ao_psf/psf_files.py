@@ -7,7 +7,7 @@ from dataclasses import dataclass, replace
 from pathlib import Path
 
 import numpy as np
-from ao_stats import PsfMetadata
+from ao_core.stats import PsfMetadata
 from astropy import units as u
 from numpy.typing import DTypeLike
 

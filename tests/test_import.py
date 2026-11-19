@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from importlib import metadata
 
-import ao_stats
+from ao_core import stats
 from mastsel import MavisLO
 
 import hybrid_ao_psf
@@ -121,7 +121,7 @@ def test_package_root_exports_supported_contracts() -> None:
 
 
 def test_required_dependencies_are_available() -> None:
-    assert ao_stats.__version__
+    assert stats.PsfMetadata is not None
     assert metadata.version("mastsel")
     assert MavisLO is not None
 

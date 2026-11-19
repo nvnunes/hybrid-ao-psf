@@ -17,16 +17,6 @@ if [ ! -d "$env_prefix" ]; then
 fi
 
 echo "[bootstrap] Installing package with dev+docs extras..."
-if [ -n "${HYBRID_AO_PSF_AO_STATS_SOURCE:-}" ]; then
-  case "$HYBRID_AO_PSF_AO_STATS_SOURCE" in
-    git+*|http://*|https://*)
-      conda run --prefix "$env_prefix" python -m pip install "$HYBRID_AO_PSF_AO_STATS_SOURCE"
-      ;;
-    *)
-      conda run --prefix "$env_prefix" python -m pip install -e "$HYBRID_AO_PSF_AO_STATS_SOURCE"
-      ;;
-  esac
-fi
 ao_core_source="${HYBRID_AO_PSF_AO_CORE_SOURCE:-git+https://github.com/nvnunes/ao-core.git}"
 case "$ao_core_source" in
   git+*|http://*|https://*|*.whl)
@@ -37,7 +27,7 @@ case "$ao_core_source" in
     ;;
 esac
 conda run --prefix "$env_prefix" python -m pip install -e ".[dev,docs]"
-conda run --prefix "$env_prefix" python -c 'import ao_core.photometry
+conda run --prefix "$env_prefix" python -c 'import ao_core.photometry, ao_core.stats
 from ao_core.models.config import Configuration'
 
 echo "[bootstrap] Configuring Git hooks path..."

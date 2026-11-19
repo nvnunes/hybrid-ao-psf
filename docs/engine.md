@@ -94,4 +94,4 @@ feedback matrix/decomposition and symmetric-approximation diagnostics.
 count and fraction, and minimum, maximum, and mean angular-Ctot trace and
 determinant summaries. `diagnostics_level = debug` retains the same validation
 facts plus the potentially large pre-blur PSF cube. Final-PSF EE, FWHM, and
-Strehl remain optional AO Stats analyses performed by the caller.
+Strehl remain optional `ao_core.stats` analyses performed by the caller.

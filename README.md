@@ -7,8 +7,8 @@ from an INI file or use the typed Python API from a larger orchestration system.
 
 The project owns Hybrid-specific interpolation products, both low-order models,
 scientific execution, engine diagnostics, and standalone results. AO Core
-provides shared configuration, control, reconstruction and photometry.
-AO Stats provides shared PSF metadata and measurements.
+provides shared configuration, control, reconstruction, photometry, and
+PSF metadata and measurements.
 
 ## Status
 
@@ -19,15 +19,13 @@ regression suite on the minimum and current selected MASTSEL releases.
 
 ## Installation
 
-Install AO Stats and an AO Core build with `ao_core.models`. This example
-uses a sibling AO Core checkout.
+Install an AO Core build with `ao_core.models` and `ao_core.stats`.
+This example uses a sibling AO Core checkout.
 
 ```bash
-python -m pip install \
-  'ao-stats @ git+https://github.com/nvnunes/ao-stats.git@main'
 python -m pip install --force-reinstall --no-deps ../ao-core
 python -m pip install .
-python -c 'import ao_core.photometry; from ao_core.models.config import Configuration'
+python -c 'import ao_core.photometry, ao_core.stats; from ao_core.models.config import Configuration'
 ```
 
 For repository-local development and source overrides, see
@@ -53,11 +51,10 @@ stateless operation. MASTSEL is the default; see
 
 ## Development Setup
 
-Bootstrap the repository-local environment with the current AO Stats source:
+Bootstrap the repository-local environment:
 
 ```bash
-HYBRID_AO_PSF_AO_STATS_SOURCE='git+https://github.com/nvnunes/ao-stats.git@main' \
-  ./scripts/bootstrap.sh
+./scripts/bootstrap.sh
 ```
 
 The bootstrap installs development and documentation dependencies, activates

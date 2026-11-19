@@ -14,7 +14,7 @@ from pathlib import Path
 from typing import Any, Literal
 
 import numpy as np
-from ao_stats import (
+from ao_core.stats import (
     DEFAULT_EE_CENTER,
     DEFAULT_FWHM_METHOD,
     DEFAULT_FWHM_REFINEMENT_FACTOR,
@@ -1154,10 +1154,10 @@ def measure_psf_metrics(
         samples: Source PSFs with their wavelength, scale and aperture metadata.
         dtype: Measurement and output precision, either float32 or float64.
         preserve_normalization: Measure the images as supplied when true.
-            By default, AO Stats clips negative pixels and normalizes each
+            By default, AO Core clips negative pixels and normalizes each
             crop to unit sum.
-        fwhm_method: Width-estimation method passed to AO Stats.
-        fwhm_refinement_factor: Subpixel sampling refinement passed to AO Stats.
+        fwhm_method: Width-estimation method passed to AO Core.
+        fwhm_refinement_factor: Subpixel sampling refinement passed to AO Core.
         ee_center: Centre the energy aperture on the peak or image midpoint.
 
     Returns:

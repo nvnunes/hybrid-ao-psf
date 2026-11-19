@@ -7,7 +7,7 @@ from pathlib import Path
 
 import h5py
 import numpy as np
-from ao_stats import PsfMetadata
+from ao_core.stats import PsfMetadata
 from astropy import units as u
 
 from ._e2e_prediction import E2ELowOrderPrediction

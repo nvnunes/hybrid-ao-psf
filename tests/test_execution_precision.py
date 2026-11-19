@@ -5,7 +5,7 @@ from dataclasses import replace
 import h5py
 import numpy as np
 import pytest
-from ao_stats import compute_psf_fwhm
+from ao_core.stats import compute_psf_fwhm
 
 from hybrid_ao_psf import (
     PsfPrediction,

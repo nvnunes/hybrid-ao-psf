@@ -32,7 +32,7 @@ for example for fixed-spot WFS calibration. Both stored grids and provider
 predictions preserve the chosen precision; no flux normalization is applied.
 `PsfPrediction` and `PsfMetricPrediction` also accept an explicit
 `dtype` for custom providers. Metric measurement and interpolation accept
-the same option, including the AO Stats measurement step.
+the same option, including the `ao_core.stats` measurement step.
 
 Choose precision with `dtype` when building or loading an interpolator.
 Loading without `dtype` preserves stored precision. The interpolator retains
@@ -90,7 +90,7 @@ physical sampling, final Hybrid PSFs, and low-order covariance.
 
 Use `build_psf_metric_interpolator_from_psfs()` to measure EE, FWHM and
 Strehl and fit a metric provider in one call. To retain the measurements or
-use a specific AO Stats method, call `measure_psf_metrics()` first. Pass its
+use a specific PSF measurement method, call `measure_psf_metrics()` first. Pass its
 `PsfMetricSamples`, or measurements from another source, to
 `build_psf_metric_interpolator()`.
 

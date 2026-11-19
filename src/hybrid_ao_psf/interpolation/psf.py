@@ -14,7 +14,7 @@ from pathlib import Path
 from typing import Any
 
 import numpy as np
-from ao_stats import (
+from ao_core.stats import (
     EE_GEOMETRY_ENCIRCLED,
     PsfMetadata,
     compute_psf_ee,

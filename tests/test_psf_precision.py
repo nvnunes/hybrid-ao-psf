@@ -164,7 +164,7 @@ def test_float64_preserves_varying_airmass_and_wavelength_axes(tmp_path):
 
 @pytest.mark.parametrize("dtype", [np.float32, np.float64])
 def test_physical_metadata_precision_and_metrics(tmp_path, dtype):
-    from ao_stats import compute_psf_fwhm
+    from ao_core.stats import compute_psf_fwhm
 
     samples = _samples()
     samples = replace(

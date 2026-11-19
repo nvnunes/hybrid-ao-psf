@@ -9,7 +9,7 @@ from types import MappingProxyType
 from typing import TYPE_CHECKING, Protocol, runtime_checkable
 
 import numpy as np
-from ao_stats import PsfMetadata
+from ao_core.stats import PsfMetadata
 from astropy import units as u
 from numpy.typing import DTypeLike
 
@@ -57,7 +57,7 @@ class PsfPrediction:
             ``(N, y, x)`` order. Columns increase toward ``+x`` and rows
             toward ``+y`` in the request's Cartesian frame.
         pixel_scale: Scalar angular pixel scale shared by the returned PSFs.
-        metadata: Physical PSF metadata compatible with AO Stats.
+        metadata: Physical PSF metadata compatible with AO Core.
         dtype: PSF pixel precision, float32 by default. Explicit float64 retains
             double-precision source pixels; other precisions are rejected.
     """
@@ -1117,7 +1117,7 @@ def _readonly_metadata(
     metadata: PsfMetadata, *, num_psfs: int, dtype=float
 ) -> PsfMetadata:
     if not isinstance(metadata, PsfMetadata):
-        raise TypeError("metadata must be an ao_stats.PsfMetadata instance.")
+        raise TypeError("metadata must be an ao_core.stats.PsfMetadata instance.")
     wavelength = _shared_or_vector(
         metadata.wavelength, u.um, "metadata.wavelength", num_psfs, dtype=dtype
     )

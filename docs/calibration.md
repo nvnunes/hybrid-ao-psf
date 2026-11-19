@@ -256,7 +256,7 @@ spellings. Other precisions are rejected. Use the same dtype for source records
 and operations: promotion cannot recover values already rounded by a reader.
 Sensing and covariance calibration records accept controllers from either
 package and store them at the record's dtype. A float32 Hybrid record thus
-converts the default float64 AO Models controller to float32.
+converts the default float64 AO Core controller to float32.
 Integer indices, counters, boolean masks and native sampling seeds retain their
 nonfloating types. Population divisors, independent resets, equal realization
 weights, one pooled mean, settling requirements and feedback normalization are

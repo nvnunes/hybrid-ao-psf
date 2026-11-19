@@ -24,10 +24,10 @@ zeropoint. Hybrid converts magnitudes using MASTSEL geometry and AO Core.
 
 ## Dependencies
 
-The package uses AO Models for shared INI handling, delayed-integrator
+The package uses `ao_core.models` for shared INI handling, delayed-integrator
 arithmetic and reconstruction. Hybrid keeps its controller and reconstructor
-entry points and their float32 defaults. AO Stats provides PSF metadata and
-measurements. AO Core converts magnitudes to effective rates. The low-order
+entry points and their float32 defaults. `ao_core.stats` provides PSF metadata
+and measurements. `ao_core.photometry` converts magnitudes to effective rates. The low-order
 engine supports a tested range of MASTSEL
 releases. It has no dependency on an orchestration framework or instrument
 package.

@@ -59,7 +59,7 @@ for loading, support, units and the boundary with complete PSF simulation.
 ## Results
 
 `HybridResult` is the immutable standard result. It carries the final
-selected-precision PSF cube, neutral `ao_stats.PsfMetadata`, NGS
+selected-precision PSF cube, neutral `ao_core.stats.PsfMetadata`, NGS
 metrics, angular Ctot, frame rates, jitter, PSD-clipping mask, provenance, model
 identity and the applied `LowOrderDistribution` at `result.distribution`. Its
 weights and covariances have shapes `(component,)` and
@@ -73,7 +73,7 @@ are `None` for E2E, which instead retains magnitudes and a complete
 level it also carries the large pre-blur PSF cube.
 
 Result arrays and quantities are result-owned and read-only. Final-PSF
-statistics are deliberately absent; callers may apply AO Stats when wanted.
+statistics are deliberately absent; callers may use `ao_core.stats` when wanted.
 
 Use `save_result()` and `load_result()` for the versioned standalone HDF5
 contract described in [Result files](results.md).
