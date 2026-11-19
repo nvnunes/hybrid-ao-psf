@@ -98,9 +98,9 @@ use a specific PSF measurement method, call `measure_psf_metrics()` first. Pass 
 The resulting `PsfMetricInterpolator` evaluates field coordinates and, when
 sampled, airmass. Wavelength enters the measurement. The builder selects
 linear interpolation for a complete rectangular field grid and a scaled
-thin-plate-spline RBF for scattered field samples. The RBF uses smoothing 0.05
-and a linear polynomial. These numerical choices are fixed; callers supply
-samples rather than interpolation settings. The read-only `interpolation_type`
+thin-plate-spline RBF with a linear polynomial for scattered field samples.
+`rbf_smoothing` defaults to 0.05. Set it to zero to interpolate the supplied
+metric values at the sample positions. The read-only `interpolation_type`
 records the selected method. Grids, RBF evaluators and coordinate scaling are
 private interpolation data; callers use the provider's `evaluate()` operation.
 Duplicate field points or zenith-angle samples are rejected before fitting, and

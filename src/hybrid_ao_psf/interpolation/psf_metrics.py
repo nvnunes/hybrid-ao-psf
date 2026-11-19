@@ -38,6 +38,7 @@ from .._validation import (
 )
 from ..contracts import PsfMetricPrediction
 from ._core import (
+    DEFAULT_RBF_SMOOTHING,
     axis_index,
     cast_interpolator_value,
     clip_rectangular_field_coordinates,
@@ -542,6 +543,7 @@ def _sample_coordinates(
 def _fit_rbf_metrics(
     samples: PsfMetricSamples,
     coordinate_order: tuple[str, ...],
+    smoothing: float,
 ) -> dict[str, Any]:
     """Fit each metric using the same scaled coordinates of the source samples."""
     coordinates = _sample_coordinates(samples, coordinate_order)
@@ -549,7 +551,7 @@ def _fit_rbf_metrics(
         name: getattr(samples, name).to_value(unit).reshape(-1)
         for name, unit in _METRIC_UNITS.items()
     }
-    return fit_scaled_rbfs(coordinates, metrics)
+    return fit_scaled_rbfs(coordinates, metrics, smoothing=smoothing)
 
 
 def _fit_regular_grid_metrics(
@@ -1223,16 +1225,19 @@ def build_psf_metric_interpolator(
     samples: PsfMetricSamples,
     *,
     dtype: DTypeLike = np.float32,
+    rbf_smoothing: float = DEFAULT_RBF_SMOOTHING,
 ) -> PsfMetricInterpolator:
     """Fit a provider from supplied FWHM, encircled energy and Strehl samples.
 
     Complete rectangular field grids use linear interpolation. Scattered
-    field points use a scaled thin-plate-spline RBF with smoothing 0.05 and a
-    linear polynomial. Multiple unique zenith angles add an airmass coordinate.
+    field points use a scaled thin-plate-spline RBF with a linear polynomial.
+    Multiple unique zenith angles add an airmass coordinate.
 
     Args:
         samples: Measured metrics at each field point for each zenith angle.
         dtype: Evaluation precision, either float32 or float64.
+        rbf_smoothing: Finite nonnegative smoothing for scattered fits.
+            Zero interpolates the supplied metrics at their sample points.
 
     Returns:
         A read-only fitted metric provider ready to evaluate or save.
@@ -1243,6 +1248,8 @@ def build_psf_metric_interpolator(
             including duplicate field points or zenith-angle samples.
     """
 
+    if not np.isfinite(rbf_smoothing) or rbf_smoothing < 0:
+        raise ValueError("RBF smoothing must be finite and nonnegative.")
     dtype = validate_psf_dtype(dtype)
     source_samples = samples
     samples = _validate_and_convert_metric_samples(samples, dtype=dtype)
@@ -1253,7 +1260,7 @@ def build_psf_metric_interpolator(
     coordinate_order = _coordinate_order(interpolation_type, zenith_axis)
     if interpolation_type == PSF_METRIC_INTERPOLATION_TYPE_RBF:
         x, y = samples.x, samples.y
-        interpolation_data = _fit_rbf_metrics(samples, coordinate_order)
+        interpolation_data = _fit_rbf_metrics(samples, coordinate_order, rbf_smoothing)
     else:
         x, y, interpolation_data = _fit_regular_grid_metrics(
             samples, coordinate_order, zenith_axis
@@ -1285,7 +1292,7 @@ def build_psf_metric_interpolator_from_psfs(
     """Measure source images and select metric interpolation from their coordinates.
 
     Complete rectangular field grids use linear interpolation; scattered field
-    points use the fixed RBF method described by build_psf_metric_interpolator.
+    points use the default RBF method described by build_psf_metric_interpolator.
 
     Args:
         samples: Source PSFs with their field, wavelength and aperture metadata.

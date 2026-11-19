@@ -1195,6 +1195,22 @@ def test_psf_metric_selection_rejects_duplicate_zenith_samples(scattered):
         build_psf_metric_interpolator(replace(samples, zenith_angle=[20, 20] * u.deg))
 
 
+def test_zero_smoothing_preserves_scattered_metric_at_sample_point(tmp_path):
+    samples = _scattered_ngs_metric_samples()
+    ee = samples.ee.copy()
+    ee[0, -1] += 0.03 * u.one
+    samples = replace(samples, ee=ee)
+    exact = build_psf_metric_interpolator(samples, dtype=np.float64, rbf_smoothing=0.0)
+    default = build_psf_metric_interpolator(samples, dtype=np.float64)
+    query = {"zenith_angle": samples.zenith_angle[0], "x": samples.x[-1], "y": samples.y[-1]}
+
+    path = tmp_path / "exact.pkl"
+    save_psf_metric_interpolator(exact, path)
+    restored = load_psf_metric_interpolator(path)
+    np.testing.assert_allclose(restored.evaluate(**query).ee, ee[0, -1], atol=1e-12)
+    assert abs(default.evaluate(**query).ee - ee[0, -1]) > 1e-5 * u.one
+
+
 @pytest.mark.parametrize("reverse", [False, True])
 def test_rectangular_metric_selection_is_independent_of_sample_order(reverse):
     samples = _ngs_metric_samples()

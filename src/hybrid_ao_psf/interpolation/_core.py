@@ -17,7 +17,7 @@ from .._io import atomic_output_path
 from .._units import quantity_value
 
 _RBF_KERNEL = "thin_plate_spline"
-_RBF_SMOOTHING = 0.05
+DEFAULT_RBF_SMOOTHING = 0.05
 _RBF_POLYNOMIAL_DEGREE = 1
 _AXIS_ATOL = 1.0e-10
 
@@ -318,6 +318,8 @@ def clip_rectangular_field_coordinates(
 def fit_scaled_rbfs(
     coordinates: np.ndarray,
     values_by_name: Mapping[str, np.ndarray],
+    *,
+    smoothing: float,
 ) -> dict[str, Any]:
     """Fit scaled RBF evaluators and return their private interpolation data."""
 
@@ -353,7 +355,7 @@ def fit_scaled_rbfs(
                 scaled_coordinates,
                 values,
                 kernel=_RBF_KERNEL,
-                smoothing=_RBF_SMOOTHING,
+                smoothing=smoothing,
                 degree=_RBF_POLYNOMIAL_DEGREE,
             )
         )
