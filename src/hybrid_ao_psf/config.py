@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from configparser import ConfigParser
+from configparser import ConfigParser, SectionProxy
 from dataclasses import dataclass
 from io import StringIO
 from pathlib import Path
@@ -11,18 +11,28 @@ import numpy as np
 from ao_core.models.config import (
     parse_ini,
     polar_to_cartesian,
-    read_ini,
     read_ini_array,
     read_ini_scalar,
     resolve_ini_path,
 )
+from ao_core.photometry import photons_per_frame_to_magnitudes
 from astropy import units as u
 from numpy.typing import DTypeLike
 
 from ._calibration_config import _read_e2e_calibration_configuration
-from .contracts import DiagnosticsLevel, HybridRequest, LowOrderModel, NonPsdPolicy
+from ._mastsel import _mastsel_frame_rate, _mastsel_photometry
+from .contracts import (
+    DiagnosticsLevel,
+    HybridRequest,
+    LowOrderModel,
+    NonPsdPolicy,
+    _positive_scalar,
+)
 
-HYBRID_SECTION = "hybrid"
+_HYBRID_SECTION = "hybrid"
+
+_ZEROPOINT_UNIT = u.photon / (u.m**2 * u.s)
+_LEGACY_FLUX_ZEROPOINT = 1e10 * _ZEROPOINT_UNIT
 
 type _IniSections = tuple[tuple[str, tuple[tuple[str, str], ...]], ...]
 
@@ -41,6 +51,10 @@ class HybridConfiguration:
             whose metrics belong to the loaded calibrated model.
         output: Configured standalone result path.
         source: Absolute source INI path.
+        base_config: Original INI text, before resolving run overrides.
+        ngs_magnitude_zeropoint: MASTSEL zero-magnitude flux before WFS
+            area scaling, in photon per square metre per second.
+        ngs_mag_standard: Magnitude convention, if supplied in the INI.
         e2e_configuration: Shared calibration/model INI for E2E; None for MASTSEL.
             Loading configuration does not acquire native data or load fitted models.
     """
@@ -51,6 +65,9 @@ class HybridConfiguration:
     output: Path
     source: Path
     lo_model: LowOrderModel
+    base_config: str
+    ngs_magnitude_zeropoint: u.Quantity | None = None
+    ngs_mag_standard: str | None = None
     e2e_configuration: Path | None = None
     mastsel_ini: str | None = None
     non_psd_policy: NonPsdPolicy = NonPsdPolicy.ERROR
@@ -81,16 +98,17 @@ def load_configuration(
     source = Path(path).expanduser().resolve()
     if not source.is_file():
         raise FileNotFoundError(f"Hybrid AO PSF configuration not found: {source}")
-    source, parser = read_ini(source)
-    if not parser.has_section(HYBRID_SECTION):
+    base_config = source.read_text(encoding="utf-8")
+    parser = parse_ini(base_config)
+    if not parser.has_section(_HYBRID_SECTION):
         raise ValueError("Configuration requires [hybrid].")
     model = LowOrderModel(
-        parser[HYBRID_SECTION].get("lo_model", LowOrderModel.MASTSEL.value)
+        parser[_HYBRID_SECTION].get("lo_model", LowOrderModel.MASTSEL.value)
     )
     if model is LowOrderModel.E2E_CALIBRATED:
-        return _load_calibrated_configuration(parser, source, dtype)
+        return _load_calibrated_configuration(parser, source, base_config, dtype)
     for section in (
-        HYBRID_SECTION,
+        _HYBRID_SECTION,
         "telescope",
         "sources_science",
         "sources_LO",
@@ -99,7 +117,7 @@ def load_configuration(
         if not parser.has_section(section):
             raise ValueError(f"Configuration requires [{section}].")
 
-    hybrid = parser[HYBRID_SECTION]
+    hybrid = parser[_HYBRID_SECTION]
     for option in ("science_psf_file", "ngs_metric_file"):
         previous = option.removesuffix("_file") + "_artifact"
         if previous in hybrid:
@@ -131,17 +149,11 @@ def load_configuration(
     )
     if wavelength_values.size != 1:
         raise ValueError("sources_science.Wavelength must contain exactly one value.")
-    ngs_flux = read_ini_array(
-        hybrid, "ngs_flux_photon_per_s", label="hybrid.ngs_flux_photon_per_s"
-    )
-    if ngs_flux.shape != ngs_r.shape:
-        raise ValueError(
-            "hybrid.ngs_flux_photon_per_s must match sources_LO coordinates."
-        )
+    magnitudes, zeropoint, mag_standard = _read_mastsel_magnitudes(parser, ngs_r.shape)
     mastsel_sections = tuple(
         (section, tuple(parser.items(section, raw=True)))
         for section in parser.sections()
-        if section.casefold() != HYBRID_SECTION
+        if section.casefold() != _HYBRID_SECTION
     )
     stream = StringIO()
     _mastsel_parser(mastsel_sections).write(stream)
@@ -149,7 +161,7 @@ def load_configuration(
         dtype=hybrid.get("precision", "float32") if dtype is None else dtype,
         science_positions=np.column_stack((science_x, science_y)) * u.arcsec,
         ngs_positions=np.column_stack((ngs_x, ngs_y)) * u.arcsec,
-        ngs_flux=ngs_flux * (u.photon / u.s),
+        ngs_magnitude=magnitudes,
         wavelength=float(wavelength_values[0]) * u.m,
         zenith_angle=read_ini_scalar(
             parser["telescope"], "ZenithAngle", label="telescope.ZenithAngle"
@@ -176,12 +188,64 @@ def load_configuration(
         ),
         output=_resolved_path(hybrid, "output", source=source, must_exist=False),
         source=source,
+        base_config=base_config,
+        ngs_magnitude_zeropoint=zeropoint,
+        ngs_mag_standard=mag_standard,
     )
 
 
-def _load_calibrated_configuration(parser, source, dtype):
+def _read_mastsel_magnitudes(
+    parser: ConfigParser, ngs_shape: tuple[int, ...]
+) -> tuple[u.Quantity, u.Quantity, str | None]:
+    """Resolve magnitudes for current INIs and adapt legacy effective rates."""
+    hybrid = parser[_HYBRID_SECTION]
+    flux_key = "ngs_flux_photon_per_s"
+    has_magnitudes = "ngs_magnitude" in hybrid
+    if has_magnitudes == (flux_key in hybrid):
+        raise ValueError(
+            f"Specify exactly one of hybrid.ngs_magnitude and hybrid.{flux_key}."
+        )
+    key = "ngs_magnitude" if has_magnitudes else flux_key
+    values = read_ini_array(hybrid, key, label=f"hybrid.{key}")
+    if values.shape != ngs_shape:
+        raise ValueError(f"hybrid.{key} must match sources_LO coordinates.")
+    if has_magnitudes:
+        zeropoint = (
+            read_ini_scalar(
+                hybrid,
+                "ngs_magnitude_zeropoint",
+                label="hybrid.ngs_magnitude_zeropoint",
+            )
+            * _ZEROPOINT_UNIT
+        )
+        zeropoint = _positive_scalar(
+            zeropoint, _ZEROPOINT_UNIT, "ngs_magnitude_zeropoint", dtype=None
+        )
+        magnitudes = values * u.mag
+        standard = _read_mag_standard(hybrid)
+    else:
+        if np.any(values <= 0.0):
+            raise ValueError(f"hybrid.{key} must be positive.")
+        zeropoint = _LEGACY_FLUX_ZEROPOINT
+        frame_rate = _mastsel_frame_rate(parser)
+        photometry = _mastsel_photometry(parser, frame_rate, zeropoint)
+        magnitudes = photons_per_frame_to_magnitudes(
+            values * (u.photon / u.s) / frame_rate, photometry
+        )
+        standard = None
+    return magnitudes, zeropoint, standard
+
+
+def _read_mag_standard(section: SectionProxy) -> str | None:
+    standard = section.get("ngs_mag_standard")
+    if standard is not None and not standard.strip():
+        raise ValueError("hybrid.ngs_mag_standard must be nonempty when supplied.")
+    return standard
+
+
+def _load_calibrated_configuration(parser, source, base_config, dtype):
     """Parse Cartesian prediction inputs and the shared calibration INI paths."""
-    hybrid = parser[HYBRID_SECTION]
+    hybrid = parser[_HYBRID_SECTION]
     allowed = {
         "lo_model",
         "output",
@@ -190,6 +254,7 @@ def _load_calibrated_configuration(parser, source, dtype):
         "ngs_x_arcsec",
         "ngs_y_arcsec",
         "ngs_magnitude",
+        "ngs_mag_standard",
         "wavelength_um",
         "zenith_angle_deg",
         "diagnostics_level",
@@ -234,6 +299,8 @@ def _load_calibrated_configuration(parser, source, dtype):
         output=_resolved_path(hybrid, "output", source=source, must_exist=False),
         source=source,
         e2e_configuration=source,
+        base_config=base_config,
+        ngs_mag_standard=_read_mag_standard(hybrid),
     )
 
 
@@ -243,7 +310,9 @@ def _read_cartesian_positions(section, field: str) -> u.Quantity:
     x = read_ini_array(section, x_key, label=f"hybrid.{x_key}")
     y = read_ini_array(section, y_key, label=f"hybrid.{y_key}")
     if x.shape != y.shape:
-        raise ValueError(f"hybrid.{x_key} and hybrid.{y_key} must have the same length.")
+        raise ValueError(
+            f"hybrid.{x_key} and hybrid.{y_key} must have the same length."
+        )
     return np.column_stack((x, y)) * u.arcsec
 
 
@@ -262,4 +331,4 @@ def _mastsel_parser(sections: _IniSections) -> ConfigParser:
     return mastsel
 
 
-__all__ = ["HYBRID_SECTION", "HybridConfiguration", "load_configuration"]
+__all__ = ["HybridConfiguration", "load_configuration"]

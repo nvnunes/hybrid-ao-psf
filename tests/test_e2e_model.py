@@ -39,7 +39,7 @@ from hybrid_ao_psf import (
     save_reconstructor_calibration,
     save_sensing_calibration,
 )
-from hybrid_ao_psf._lo_model import _ReconstructorCovariances, _scalar_decomposition
+from hybrid_ao_psf._lo_model import _decompose_feedback, _ReconstructorCovariances
 
 
 def pooled(left, right):
@@ -175,13 +175,11 @@ def synthetic():
             zenith_angle=record.zenith_angle,
         ).gain.value
         feedback = sum(g * weights[:, 2 * i : 2 * i + 2] for i, g in enumerate(gains))
-        strengths.extend(_scalar_decomposition(feedback).strengths)
+        strengths.extend(_decompose_feedback(feedback).strengths)
     measured = measure_covariance_calibration(
         record,
         controller,
-        settings=CovarianceCalibrationSettings(
-            feedback=tuple(sorted(set(strengths)))
-        ),
+        settings=CovarianceCalibrationSettings(feedback=tuple(sorted(set(strengths)))),
         dtype=np.float64,
     )
     assert measured.discard == base.discard
@@ -202,11 +200,11 @@ def test_reconstructor_uses_one_evaluated_prior(
 ):
     model, record = synthetic
     priors = []
-    original_prior = ReconstructorNoiseModel.measurement_noise
+    original_prior = ReconstructorNoiseModel.build_measurement_noise_covariance
     original_tilt = CovarianceFunctions.C_t_t
     tilt_queries = []
 
-    def measurement_noise(self, **kwargs):
+    def build_measurement_noise_covariance(self, **kwargs):
         prior = original_prior(self, **kwargs)
         priors.append(prior)
         return prior
@@ -215,9 +213,14 @@ def test_reconstructor_uses_one_evaluated_prior(
         tilt_queries.append(args)
         return original_tilt(self, *args, **kwargs)
 
-    monkeypatch.setattr(ReconstructorNoiseModel, "measurement_noise", measurement_noise)
+    monkeypatch.setattr(
+        ReconstructorNoiseModel,
+        "build_measurement_noise_covariance",
+        build_measurement_noise_covariance,
+    )
     monkeypatch.setattr(CovarianceFunctions, "C_t_t", tilt_covariance)
     prediction = model.predict(
+        diagnostics_level="debug",
         ngs_positions=record.positions[indices],
         ngs_magnitude=np.full(len(indices), 9) * u.mag,
         science_positions=record.positions,
@@ -225,26 +228,28 @@ def test_reconstructor_uses_one_evaluated_prior(
     )
 
     assert len(priors) == 1
-    np.testing.assert_array_equal(prediction.reconstructor_noise_covariance, priors[0])
+    np.testing.assert_array_equal(
+        prediction.diagnostics.ngs.reconstructor_noise_covariance, priors[0]
+    )
     assert len(tilt_queries) == expected_tilt_queries
     if len(indices) == 1:
-        np.testing.assert_array_equal(prediction.reconstructor, np.eye(2))
+        np.testing.assert_array_equal(
+            prediction.diagnostics.control.reconstructor, np.eye(2)
+        )
 
 
-def test_low_order_base_rejects_reconstruction_for_wrong_ngs_count(synthetic):
+def test_control_solve_rejects_reconstruction_for_wrong_ngs_count(synthetic):
     model, _ = synthetic
     one_ngs_covariance = np.eye(2) * u.mas**2
     with pytest.raises(ValueError, match="two axes per NGS"):
-        model._predict_low_order(
+        model._solve_control(
             reconstruction_covariances=_ReconstructorCovariances(
                 ngs_covariance=one_ngs_covariance,
                 centre_ngs_covariance=one_ngs_covariance,
                 noise_prior=one_ngs_covariance,
             ),
             sensing_gains=np.array([0.4, 0.6]),
-            wfs_noise_variances=np.array([1.0, 2.0]),
             controller=model.covariance.controller,
-            evaluate_covariances=lambda _: pytest.fail("must reject before evaluation"),
         )
 
 
@@ -252,54 +257,57 @@ def test_low_order_base_rejects_reconstruction_for_wrong_ngs_count(synthetic):
 def test_complete_covariances_match_independent_loop_simulation(synthetic, indices):
     model, record = synthetic
     prediction = model.predict(
+        diagnostics_level="debug",
         ngs_positions=record.positions[indices],
         ngs_magnitude=np.full(len(indices), 9) * u.mag,
         science_positions=record.positions,
         zenith_angle=record.zenith_angle,
     )
-    weights = prediction.reconstructor
+    diagnostics = prediction.diagnostics
+    weights = diagnostics.control.reconstructor
     atm_input = sum(
         record.tilt.value[:, :, idx]
         @ weights[:, 2 * g : 2 * g + 2].T
-        * prediction.sensing_gains.value[g]
+        * diagnostics.ngs.sensing.gain.value[g]
         for g, idx in enumerate(indices)
     )
     ho_input = sum(
         record.coma.value[:, :, idx]
         @ weights[:, 2 * g : 2 * g + 2].T
-        * prediction.coma_response_coefficients.value[g]
+        * diagnostics.ngs.coma_response_coefficients.value[g]
         for g, idx in enumerate(indices)
     )
     controller = model.covariance.controller
     atm = simulate_matrix_loop(
-        atm_input, prediction.feedback_matrix, controller.gain, controller.delay
+        atm_input, diagnostics.control.feedback, controller.gain, controller.delay
     )[:, model.covariance.discard :]
     ho = simulate_matrix_loop(
-        ho_input, prediction.feedback_matrix, controller.gain, controller.delay
+        ho_input, diagnostics.control.feedback, controller.gain, controller.delay
     )[:, model.covariance.discard :]
     science = record.tilt.value[:, model.covariance.discard :]
-    for name, left, right in (
-        ("atmospheric_command_covariance", atm, atm),
-        ("ho_command_covariance", ho, ho),
-        ("atmospheric_ho_command_covariance", atm, ho),
+    terms = diagnostics.covariances.terms
+    for actual, left, right in (
+        (terms.atmospheric_command, atm, atm),
+        (terms.ho_command, ho, ho),
+        (terms.atmospheric_ho_command, atm, ho),
     ):
         np.testing.assert_allclose(
-            getattr(prediction, name).value, pooled(left, right), rtol=1e-10, atol=1e-10
+            actual.value, pooled(left, right), rtol=1e-10, atol=1e-10
         )
     for j in range(len(record.positions)):
-        for name, right in (
-            ("science_atmospheric_command_covariance", atm),
-            ("science_ho_command_covariance", ho),
+        for actual, right in (
+            (terms.science_atmospheric_command, atm),
+            (terms.science_ho_command, ho),
         ):
             np.testing.assert_allclose(
-                getattr(prediction, name).value[j],
+                actual.value[j],
                 pooled(science[:, :, j], right),
                 rtol=1e-10,
                 atol=1e-10,
             )
         science_tilt = science[:, :, j]
         np.testing.assert_allclose(
-            prediction.science_tilt_covariance.value[j],
+            diagnostics.covariances.terms.science_tilt.value[j],
             pooled(science_tilt, science_tilt),
             rtol=1e-10,
             atol=1e-10,
@@ -309,19 +317,19 @@ def test_complete_covariances_match_independent_loop_simulation(synthetic, indic
         residual = atmospheric_residual - ho
         noiseless_covariance = pooled(residual, residual)
         np.testing.assert_allclose(
-            prediction.atmospheric_residual_covariance.value[j],
+            diagnostics.covariances.atmospheric_residual.value[j],
             atmospheric_covariance,
             rtol=1e-10,
             atol=1e-10,
         )
         np.testing.assert_allclose(
-            prediction.ho_correction.value[j],
+            diagnostics.covariances.ho_correction.value[j],
             noiseless_covariance - atmospheric_covariance,
             rtol=1e-10,
             atol=1e-10,
         )
         np.testing.assert_allclose(
-            prediction.noiseless_covariance.value[j],
+            diagnostics.covariances.noiseless.value[j],
             noiseless_covariance,
             rtol=1e-10,
             atol=1e-10,
@@ -329,28 +337,20 @@ def test_complete_covariances_match_independent_loop_simulation(synthetic, indic
     if len(indices) == 1:
         np.testing.assert_array_equal(weights, np.eye(2))
     else:
-        assert np.ptp(prediction.sensing_gains.value) > 0.05
+        assert np.ptp(diagnostics.ngs.sensing.gain.value) > 0.05
         # This fixture must exercise matrix ordering, not commuting scalar weights.
         assert any(
             np.linalg.norm(p @ weights[:, :2] - weights[:, :2] @ p) > 0.01
-            for p in prediction.interpolation_feedback_projectors
+            for p in diagnostics.control.scalar_feedback.projectors
         )
-    assert isinstance(prediction.distribution, LowOrderDistribution)
+    assert isinstance(prediction.displacement_distribution, LowOrderDistribution)
     np.testing.assert_allclose(
-        prediction.distribution.covariance.value,
-        (prediction.noiseless_covariance + prediction.noise_command_covariance).value,
+        prediction.displacement_distribution.covariance.value,
+        (
+            diagnostics.covariances.noiseless + diagnostics.covariances.noise_command
+        ).value,
         rtol=1e-13,
         atol=1e-13,
-    )
-    np.testing.assert_allclose(
-        prediction.noise_command_covariance,
-        model.sensing.noise_covariance(
-            positions=record.positions[indices],
-            magnitudes=np.full(len(indices), 9) * u.mag,
-            zenith_angle=record.zenith_angle,
-            reconstructor=weights,
-        ),
-        rtol=1e-13,
     )
     assert np.linalg.norm(atm.mean((0, 1))) > 0.1
 
@@ -366,52 +366,33 @@ def test_precision_immutability_and_input_rejection(synthetic, dtype, indices):
         "science_positions": record.positions,
         "zenith_angle": record.zenith_angle,
     }
-    result = model.predict(**args)
+    result = model.predict(**args, diagnostics_level="debug")
+    diagnostics = result.diagnostics
     with pytest.raises(TypeError, match="unexpected keyword argument.*magnitudes"):
         model.predict(**(args | {"magnitudes": args["ngs_magnitude"]}))
-    for old_name in (
-        "strengths",
-        "projectors",
-        "symmetric_feedback_fallback",
-        "eigenbasis_condition",
-        "coma_response",
-        "noise_scales",
-        "feedback",
-        "effective_feedback",
-        "metrics",
-        "noise_prior",
-        "atmospheric_ho_command",
-        "science_atmospheric_command",
-        "science_ho_command",
-        "atmospheric_command",
-        "ho_command",
-        "gains",
-        "noise_variances",
-        "uncorrected",
-        "atmospheric",
-        "ho",
-        "noiseless",
-        "noise",
-        "total",
-    ):
-        assert not hasattr(result, old_name)
-    assert result.distribution.covariance.dtype == dtype
+    from dataclasses import fields
+
+    assert [item.name for item in fields(result)] == [
+        "displacement_distribution",
+        "diagnostics",
+    ]
+    assert result.displacement_distribution.covariance.dtype == dtype
     for value in (
-        result.science_tilt_covariance,
-        result.noiseless_covariance,
-        result.atmospheric_residual_covariance,
-        result.ho_correction,
-        result.noise_command_covariance,
-        result.distribution.weights,
-        result.distribution.covariances,
-        result.sensing_gains,
-        result.wfs_noise_variances,
-        result.reconstructor,
-        result.interpolation_feedback_projectors,
-        result.photons_per_frame,
-        result.ngs_metrics.ee,
-        result.ngs_metrics.fwhm,
-        result.ngs_metrics.sr,
+        diagnostics.covariances.terms.science_tilt,
+        diagnostics.covariances.noiseless,
+        diagnostics.covariances.atmospheric_residual,
+        diagnostics.covariances.ho_correction,
+        diagnostics.covariances.noise_command,
+        result.displacement_distribution.weights,
+        result.displacement_distribution.covariances,
+        diagnostics.ngs.sensing.gain,
+        diagnostics.ngs.sensing.variance,
+        diagnostics.control.reconstructor,
+        diagnostics.control.scalar_feedback.projectors,
+        diagnostics.ngs.photons_per_frame,
+        diagnostics.ngs.metrics.ee,
+        diagnostics.ngs.metrics.fwhm,
+        diagnostics.ngs.metrics.sr,
     ):
         assert value.dtype == dtype
         with pytest.raises(ValueError):
@@ -419,15 +400,15 @@ def test_precision_immutability_and_input_rejection(synthetic, dtype, indices):
                 value.value if isinstance(value, u.Quantity) else value
             ).flags.writeable = True
     for owner, name in (
-        (result, "science_tilt_covariance"),
-        (result, "noiseless_covariance"),
-        (result, "atmospheric_residual_covariance"),
-        (result, "ho_correction"),
-        (result, "noise_command_covariance"),
-        (result.distribution, "covariances"),
-        (result, "sensing_gains"),
-        (result, "wfs_noise_variances"),
-        (result, "photons_per_frame"),
+        (diagnostics.covariances.terms, "science_tilt"),
+        (diagnostics.covariances, "noiseless"),
+        (diagnostics.covariances, "atmospheric_residual"),
+        (diagnostics.covariances, "ho_correction"),
+        (diagnostics.covariances, "noise_command"),
+        (result.displacement_distribution, "covariances"),
+        (diagnostics.ngs.sensing, "gain"),
+        (diagnostics.ngs.sensing, "variance"),
+        (diagnostics.ngs, "photons_per_frame"),
     ):
         expected = getattr(owner, name).copy()
         backing = getattr(owner, name)
@@ -453,17 +434,17 @@ def test_precision_immutability_and_input_rejection(synthetic, dtype, indices):
 
 def test_feedback_limits_and_scalar_closed_form():
     for b in (0.5, 1.0, 1.7):
-        values = _scalar_decomposition(np.eye(2) * b)
+        values = _decompose_feedback(np.eye(2) * b)
         np.testing.assert_allclose(values.strengths, b)
         np.testing.assert_allclose(values.projectors.sum(0), np.eye(2))
         assert not values.symmetric_fallback
     feedback = np.array([[0.8, 0.2], [-0.2, 0.8]])
-    values = _scalar_decomposition(feedback)
+    values = _decompose_feedback(feedback)
     assert values.symmetric_fallback
     np.testing.assert_allclose(values.effective_feedback, np.eye(2) * 0.8)
     assert values.approximation_relative_error > 0.1
     with pytest.raises(ValueError, match="defective"):
-        _scalar_decomposition(np.array([[0.8, 1.0], [0, 0.8]]))
+        _decompose_feedback(np.array([[0.8, 1.0], [0, 0.8]]))
 
 
 @pytest.mark.parametrize(
@@ -491,7 +472,7 @@ def test_nonorthogonal_projectors_allow_matrix_product_roundoff(dtype, feedback)
         gain=0.3, delay=2, frame_rate=500 * u.Hz, dtype=dtype
     )
     assert np.max(np.abs(np.linalg.eigvals(controller.transition(feedback)))) < 1
-    decomposition = _scalar_decomposition(feedback)
+    decomposition = _decompose_feedback(feedback)
     projectors = decomposition.projectors
     tolerance = max(1e-10, 32 * np.finfo(dtype).eps)
     assert not decomposition.symmetric_fallback
@@ -543,8 +524,7 @@ def test_configured_native_free_loading_and_conflicts(synthetic, tmp_path, monke
 
     monkeypatch.setattr(builtins, "__import__", guarded)
     loaded = load_e2e_calibrated_model(ini)
-    assert len(loaded.model_files) == 5
-    assert not hasattr(loaded, "product_identities")
+    assert not hasattr(loaded, "model_files")
     args = {
         "ngs_positions": record.positions[[0, 8]],
         "ngs_magnitude": [9, 9] * u.mag,
@@ -552,11 +532,9 @@ def test_configured_native_free_loading_and_conflicts(synthetic, tmp_path, monke
         "zenith_angle": 20 * u.deg,
     }
     np.testing.assert_array_equal(
-        loaded.predict(**args).distribution.covariance,
-        model.predict(**args).distribution.covariance,
+        loaded.predict(**args).displacement_distribution.covariance,
+        model.predict(**args).displacement_distribution.covariance,
     )
-    with pytest.raises(TypeError):
-        loaded.model_files["other"] = None
     np.testing.assert_allclose(
         loaded.predict(
             **(
@@ -567,8 +545,8 @@ def test_configured_native_free_loading_and_conflicts(synthetic, tmp_path, monke
                     "zenith_angle": args["zenith_angle"].to(u.rad),
                 }
             )
-        ).distribution.covariance,
-        loaded.predict(**args).distribution.covariance,
+        ).displacement_distribution.covariance,
+        loaded.predict(**args).displacement_distribution.covariance,
         rtol=1e-12,
         atol=1e-12,
     )
@@ -586,7 +564,7 @@ import sys
 model = load_e2e_calibrated_model(sys.argv[1])
 result = model.predict(ngs_positions=[[-1,-1],[1,1]]*u.arcsec,
     ngs_magnitude=[9,9]*u.mag, science_positions=[[0,0]]*u.arcsec, zenith_angle=20*u.deg)
-assert result.distribution.covariance.shape == (1,2,2)
+assert result.displacement_distribution.covariance.shape == (1,2,2)
 """
     subprocess.run(
         [sys.executable, "-c", code, str(ini)],
@@ -617,27 +595,65 @@ assert result.distribution.covariance.shape == (1,2,2)
 def test_noise_covariance_matches_independent_impulse_sum(synthetic, indices):
     model, record = synthetic
     result = model.predict(
+        diagnostics_level="debug",
         ngs_positions=record.positions[indices],
         ngs_magnitude=np.full(len(indices), 9) * u.mag,
         science_positions=record.positions[[4]],
         zenith_angle=20 * u.deg,
     )
+    diagnostics = result.diagnostics
     gain, delay = model.covariance.controller.gain, model.covariance.controller.delay
     impulse = np.zeros((2048, 2, 2))
     for k in range(1, len(impulse)):
         impulse[k] = impulse[k - 1]
         if k >= delay:
-            impulse[k] -= gain * result.feedback_matrix @ impulse[k - delay]
+            impulse[k] -= gain * diagnostics.control.feedback @ impulse[k - delay]
         if k == delay:
             impulse[k] += gain * np.eye(2)
     innovation = sum(
         v
-        * result.reconstructor[:, 2 * g : 2 * g + 2]
-        @ result.reconstructor[:, 2 * g : 2 * g + 2].T
-        for g, v in enumerate(result.wfs_noise_variances.value)
+        * diagnostics.control.reconstructor[:, 2 * g : 2 * g + 2]
+        @ diagnostics.control.reconstructor[:, 2 * g : 2 * g + 2].T
+        for g, v in enumerate(diagnostics.ngs.sensing.variance.value)
     )
     expected = sum(a @ innovation @ a.T for a in impulse)
-    np.testing.assert_allclose(result.noise_command_covariance.value, expected, rtol=1e-12, atol=1e-12)
+    np.testing.assert_allclose(
+        diagnostics.covariances.noise_command.value, expected, rtol=1e-12, atol=1e-12
+    )
+
+
+def test_prediction_only_builds_debug_diagnostics_when_requested(
+    synthetic, monkeypatch
+):
+    model, record = synthetic
+    query = {
+        "ngs_positions": record.positions[[0, 8]],
+        "ngs_magnitude": [9, 9] * u.mag,
+        "science_positions": record.positions,
+        "zenith_angle": record.zenith_angle,
+    }
+    debug = model.predict(**query, diagnostics_level="debug")
+    assert debug.diagnostics is not None
+
+    def unexpected_diagnostics(**kwargs):
+        pytest.fail("Prediction built a debug record without a debug request.")
+
+    monkeypatch.setattr(
+        "hybrid_ao_psf._e2e_model.E2ELowOrderDiagnostics", unexpected_diagnostics
+    )
+    for prediction in (
+        model.predict(**query),
+        model.predict(**query, diagnostics_level="validation"),
+    ):
+        assert prediction.diagnostics is None
+        np.testing.assert_array_equal(
+            prediction.displacement_distribution.covariances,
+            debug.displacement_distribution.covariances,
+        )
+        np.testing.assert_array_equal(
+            prediction.displacement_distribution.weights,
+            debug.displacement_distribution.weights,
+        )
 
 
 def test_unsupported_spatial_and_zenith_queries_are_rejected(synthetic):
@@ -677,14 +693,18 @@ def test_complex_feedback_interpolation_uses_symmetric_part_but_noise_uses_actua
         lambda *args, **kwargs: weights,
     )
     result = model.predict(
+        diagnostics_level="debug",
         ngs_positions=record.positions[indices],
         ngs_magnitude=[9, 9] * u.mag,
         science_positions=record.positions,
         zenith_angle=20 * u.deg,
     )
-    assert result.used_symmetric_feedback_approximation
+    diagnostics = result.diagnostics
+    assert diagnostics.control.scalar_feedback.symmetric_fallback
     np.testing.assert_allclose(
-        result.interpolation_feedback_matrix, b * np.eye(2), atol=1e-15
+        diagnostics.control.scalar_feedback.effective_feedback,
+        b * np.eye(2),
+        atol=1e-15,
     )
     atm = sum(
         record.tilt.value[:, :, idx] @ weights[:, 2 * g : 2 * g + 2].T * gains[g]
@@ -693,23 +713,23 @@ def test_complex_feedback_interpolation_uses_symmetric_part_but_noise_uses_actua
     ho = sum(
         record.coma.value[:, :, idx]
         @ weights[:, 2 * g : 2 * g + 2].T
-        * result.coma_response_coefficients.value[g]
+        * diagnostics.ngs.coma_response_coefficients.value[g]
         for g, idx in enumerate(indices)
     )
     effective = simulate_matrix_loop(
-        atm + ho, result.interpolation_feedback_matrix, 0.3, 2
+        atm + ho, diagnostics.control.scalar_feedback.effective_feedback, 0.3, 2
     )[:, model.covariance.discard :]
     for j in range(len(record.positions)):
         residual = record.tilt.value[:, model.covariance.discard :, j] - effective
         np.testing.assert_allclose(
-            result.noiseless_covariance.value[j],
+            diagnostics.covariances.noiseless.value[j],
             pooled(residual, residual),
             rtol=1e-11,
             atol=1e-11,
         )
     innovation = sum(
         v * weights[:, 2 * g : 2 * g + 2] @ weights[:, 2 * g : 2 * g + 2].T
-        for g, v in enumerate(result.wfs_noise_variances.value)
+        for g, v in enumerate(diagnostics.ngs.sensing.variance.value)
     )
     impulse = np.zeros((2048, 2, 2))
     for k in range(1, len(impulse)):
@@ -719,9 +739,11 @@ def test_complex_feedback_interpolation_uses_symmetric_part_but_noise_uses_actua
         if k == 2:
             impulse[k] += 0.3 * np.eye(2)
     expected = sum(a @ innovation @ a.T for a in impulse)
-    np.testing.assert_allclose(result.noise_command_covariance.value, expected, rtol=1e-12, atol=1e-12)
+    np.testing.assert_allclose(
+        diagnostics.covariances.noise_command.value, expected, rtol=1e-12, atol=1e-12
+    )
     approximate = model.sensing.controller.noise_covariance(
-        result.interpolation_feedback_matrix, innovation * u.mas**2
+        diagnostics.control.scalar_feedback.effective_feedback, innovation * u.mas**2
     )
     assert np.linalg.norm(expected - approximate.value) > 0.001
 
@@ -840,14 +862,18 @@ def test_calibrated_models_use_grid_precision_without_former_names(
         with np.load(path.parent / header["array_file"]) as arrays:
             assert "measured_mask" in arrays.files
             assert "support" not in arrays.files
-            np.testing.assert_array_equal(arrays["measured_mask"], source.response.measured_mask)
+            np.testing.assert_array_equal(
+                arrays["measured_mask"], source.response.measured_mask
+            )
     header["support_precision"] = header.pop("grid_precision")
     path.write_text(json.dumps(header))
     with pytest.raises(ValueError):
         getattr(api, f"load_{family}_calibration")(path)
 
 
-def test_sensing_measured_mask_rejects_interpolation_through_unmeasured_points(synthetic):
+def test_sensing_measured_mask_rejects_interpolation_through_unmeasured_points(
+    synthetic,
+):
     model, _ = synthetic
     source = model.sensing.response
     with pytest.raises(ValueError):
@@ -855,17 +881,23 @@ def test_sensing_measured_mask_rejects_interpolation_through_unmeasured_points(s
     arrays = {name: values.copy() for name, values in source._arrays.items()}
     arrays["measured_mask"][0, 0, 0, 0] = False
     masked = type(source)._from_arrays(
-        arrays, source.controller, source.photometry,
-        source.field_radius, source.magnitude_intervals.value,
-        producer_dtype=source.producer_dtype, grid_precision=source.grid_precision,
+        arrays,
+        source.controller,
+        source.photometry,
+        source.field_radius,
+        source.magnitude_intervals.value,
+        producer_dtype=source.producer_dtype,
+        grid_precision=source.grid_precision,
     )
     # This query is inside all ranges but needs the missing grid point.
     with pytest.raises(ValueError, match="unmeasured grid points"):
         masked.predict(
             positions=[[-0.5, -0.5]] * u.arcsec,
-            magnitudes=9 * u.mag, zenith_angle=20 * u.deg,
+            magnitudes=9 * u.mag,
+            zenith_angle=20 * u.deg,
         )
     masked.predict(
         positions=[[1, 1]] * u.arcsec,
-        magnitudes=10 * u.mag, zenith_angle=20 * u.deg,
+        magnitudes=10 * u.mag,
+        zenith_angle=20 * u.deg,
     )

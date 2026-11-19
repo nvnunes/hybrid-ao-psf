@@ -11,15 +11,17 @@ from hybrid_ao_psf import interpolation
 
 def test_package_root_exports_supported_contracts() -> None:
     assert hybrid_ao_psf.__version__ == "0.1.0"
+    assert not hasattr(hybrid_ao_psf, "HYBRID_SECTION")
     core_names = {
-        "HYBRID_SECTION",
-        "RESULT_SCHEMA",
-        "RESULT_SCHEMA_VERSION",
+        "diagnostic_fields",
+        "diagnostic_values",
         "DiagnosticsLevel",
         "HybridConfiguration",
         "HybridCtotContext",
         "HybridCtotCorrection",
         "HybridDiagnostics",
+        "CovarianceDiagnostics",
+        "MastselDiagnostics",
         "HybridMastselStatistics",
         "HybridRequest",
         "HybridResult",
@@ -87,6 +89,7 @@ def test_package_root_exports_supported_contracts() -> None:
         "save_reconstructor_measurements",
         "load_reconstructor_measurements",
         "E2ECalibratedModel",
+        "E2ELowOrderDiagnostics",
         "E2ELowOrderPrediction",
         "load_e2e_calibrated_model",
         "E2ECalibration",

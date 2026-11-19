@@ -104,7 +104,7 @@ def noise_displacement_statistics(displacements_mas: NDArray, *, dtype=None) -> 
 
 
 def _bin_probability(model: NoiseBlurModel, count: int) -> NDArray:
-    narrow, broad = model.scales(count)
+    narrow, broad = model.compute_covariance_scales(count)
     weight = model.mixture_weight
     low = RADIAL_EDGES[:-1].astype(model.dtype)
     width = np.diff(RADIAL_EDGES.astype(model.dtype))
@@ -125,7 +125,7 @@ def _bin_probability_gradient(model: NoiseBlurModel, count: int) -> NDArray:
     low = RADIAL_EDGES[:-1].astype(model.dtype)
     width = np.diff(RADIAL_EDGES.astype(model.dtype))
     weight = model.mixture_weight
-    narrow, broad = model.scales(count)
+    narrow, broad = model.compute_covariance_scales(count)
 
     def component(scale):
         survival = np.exp(-low / (2 * scale))
@@ -245,7 +245,7 @@ def fit_noise_blur(
 def assess_noise_blur(model: NoiseBlurModel, case: NoiseDisplacementCase) -> dict:
     """Compare fitted and empirical CDFs and fourth moment on the same shape scale."""
     measured = case.statistics
-    narrow, broad = model.scales(case.ngs_count)
+    narrow, broad = model.compute_covariance_scales(case.ngs_count)
     weight = model.mixture_weight
     projection = weight * ndtr(PROJECTION_EDGES / np.sqrt(narrow)) + (
         1 - weight

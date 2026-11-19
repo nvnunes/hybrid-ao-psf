@@ -6,7 +6,7 @@ from collections.abc import Callable, Iterator, Mapping
 from configparser import BasicInterpolation, ConfigParser
 from contextlib import ExitStack, contextmanager
 from copy import deepcopy
-from dataclasses import dataclass, field, replace
+from dataclasses import dataclass, field
 from inspect import Parameter, signature
 from numbers import Real
 from pathlib import Path
@@ -14,12 +14,12 @@ from tempfile import TemporaryDirectory
 from typing import Any
 
 import numpy as np
-from ao_core.models.config import parse_ini
+from ao_core.models.config import parse_ini, read_ini_array, read_ini_scalar
+from ao_core.photometry import WFSPhotometryConfig
 from astropy import units as u
 
 from ._units import _PhysicalRecord
 from .contracts import (
-    HybridCtotContext,
     HybridCtotCorrection,
     HybridMastselStatistics,
     HybridRequest,
@@ -27,6 +27,7 @@ from .contracts import (
     PsfMetricPrediction,
     PsfMetricProvider,
     _positive_scalar,
+    _vector_with_length,
 )
 
 
@@ -54,6 +55,7 @@ class MastselModel(_PhysicalRecord):
     ngs_magnitude_zeropoint: u.Quantity | None = None
     non_psd_policy: NonPsdPolicy | str = NonPsdPolicy.ERROR
     ctot_correction: HybridCtotCorrection | None = None
+    _ngs_metric_file: Path | None = field(default=None, repr=False, compare=False)
     _parsed_ini: ConfigParser = field(init=False, repr=False, compare=False)
 
     def __post_init__(self) -> None:
@@ -78,15 +80,90 @@ class MastselModel(_PhysicalRecord):
         object.__setattr__(self, "non_psd_policy", NonPsdPolicy(self.non_psd_policy))
         object.__setattr__(self, "_parsed_ini", parse_ini(ini))
 
+    @property
+    def _input_files(self) -> dict[str, str]:
+        """Report the known NGS metric and correction files."""
+        files = (
+            dict(self.ctot_correction.input_files)
+            if self.ctot_correction is not None
+            else {}
+        )
+        if self._ngs_metric_file is not None:
+            files["ngs_metrics"] = str(self._ngs_metric_file)
+        return files
+
     def _copy_ini(self) -> ConfigParser:
         """Supply an independent parser for observation-specific overrides."""
         return deepcopy(self._parsed_ini)
+
+
+@dataclass(frozen=True, kw_only=True)
+class _MastselPrediction:
+    """Conditioned covariance and effective inputs for one MASTSEL calculation."""
+
+    ctot: u.Quantity
+    ctot_wavefront: u.Quantity
+    angle_to_wavefront_scale: u.Quantity
+    psd_clipped: np.ndarray
+    ngs_metrics: PsfMetricPrediction
+    ngs_flux: u.Quantity
+    frame_rate: u.Quantity
+    effective_ini: str
 
 
 @dataclass
 class _MastselCapture:
     covariance: tuple[np.ndarray, np.ndarray, np.ndarray] | None = None
     reconstructor: np.ndarray | None = None
+
+
+def _mastsel_frame_rate(parser: ConfigParser) -> u.Quantity:
+    """Read the positive shared LO sampling rate from the MASTSEL INI."""
+    key = "RTC.SensorFrameRate_LO"
+    if not parser.has_option("RTC", "SensorFrameRate_LO"):
+        raise ValueError(f"MASTSEL configuration requires {key}.")
+    try:
+        value = float(parser["RTC"]["SensorFrameRate_LO"])
+    except ValueError as exc:
+        raise ValueError(f"{key} must be a positive finite scalar.") from exc
+    if not np.isfinite(value) or value <= 0.0:
+        raise ValueError(f"{key} must be a positive finite scalar.")
+    return value * u.Hz
+
+
+def _mastsel_loop_settings(parser: ConfigParser) -> tuple[float | None, int | None]:
+    """Read fixed-gain settings from the effective MASTSEL configuration."""
+    try:
+        gain = parser.getfloat("RTC", "LoopGain_LO", fallback=None)
+    except ValueError:
+        gain = None
+    try:
+        delay = parser.getint("RTC", "LoopDelaySteps_LO", fallback=None)
+    except ValueError:
+        delay = None
+    return gain, delay
+
+
+def _mastsel_photometry(
+    parser: ConfigParser, frame_rate: u.Quantity, zeropoint: u.Quantity
+) -> WFSPhotometryConfig:
+    """Read the geometry used for both directions of the magnitude conversion."""
+    if not parser.has_option("telescope", "TelescopeDiameter"):
+        raise ValueError("MASTSEL configuration requires telescope.TelescopeDiameter for magnitudes.")
+    if not parser.has_option("sensor_LO", "NumberLenslets"):
+        raise ValueError("MASTSEL configuration requires sensor_LO.NumberLenslets for magnitudes.")
+    diameter = read_ini_scalar(
+        parser["telescope"], "TelescopeDiameter", label="telescope.TelescopeDiameter"
+    )
+    lenslets = read_ini_array(
+        parser["sensor_LO"], "NumberLenslets", label="sensor_LO.NumberLenslets"
+    )
+    return WFSPhotometryConfig(
+        telescope_diameter=diameter * u.m,
+        n_channels=float(lenslets[0]),
+        frame_rate=frame_rate,
+        zeropoint=zeropoint,
+    )
 
 
 def _cpu_array(value: object) -> np.ndarray:
@@ -141,15 +218,7 @@ class _MastselIniSection(Mapping[str, object]):
 
 
 @contextmanager
-def _prepare_mastsel_context(
-    request: HybridRequest,
-    metrics: PsfMetricPrediction,
-    parser: ConfigParser,
-    effective_ini: str,
-    ngs_frame_rate: u.Quantity,
-    ngs_flux: u.Quantity,
-    ngs_magnitude_zeropoint: u.Quantity | None,
-) -> Iterator[HybridCtotContext]:
+def _open_mastsel(parser: ConfigParser, effective_ini: str) -> Iterator[Any]:
     """Own the native runtime and any compatibility file for one prediction."""
     mavis_lo = _load_mavis_lo()
     decode = _load_mastsel_decoder()
@@ -176,35 +245,41 @@ def _prepare_mastsel_context(
             raise RuntimeError(
                 "MASTSEL failed to load the effective Hybrid configuration."
             )
-        mas2nm = getattr(mlo, "mas2nm", None)
-        if mas2nm is None:
-            raise ValueError("MASTSEL did not expose mas2nm conversion.")
-        yield HybridCtotContext(
-            mastsel=mlo,
-            mastsel_statistics=None,
-            angle_to_wavefront_scale=float(mas2nm) * u.nm / u.mas,
-            request=request,
-            ngs_metrics=metrics,
-            ngs_flux=ngs_flux,
-            ngs_magnitude_zeropoint=ngs_magnitude_zeropoint,
-            ngs_frame_rate=ngs_frame_rate,
-            effective_mastsel_ini=effective_ini,
-        )
+        yield mlo
 
 
-def _compute_mastsel_ctot(context: HybridCtotContext) -> u.Quantity:
+def _mastsel_angle_to_wavefront_scale(model: Any) -> u.Quantity:
+    """Read the native conversion in nm per mas of image displacement."""
+    mas2nm = getattr(model, "mas2nm", None)
+    if mas2nm is None:
+        raise ValueError("MASTSEL did not expose mas2nm conversion.")
+    return _positive_scalar(
+        float(mas2nm) * u.nm / u.mas, u.nm / u.mas, "angle_to_wavefront_scale"
+    )
+
+
+def _compute_mastsel_ctot(
+    model: Any,
+    request: HybridRequest,
+    metrics: PsfMetricPrediction,
+    lo_frame_rate: u.Quantity,
+    ngs_flux: u.Quantity,
+) -> u.Quantity:
     """Evaluate baseline Ctot once with the prepared runtime and resolved inputs."""
-    request, metrics = context.request, context.ngs_metrics
+    ngs_flux = _vector_with_length(
+        ngs_flux, u.photon / u.s, "ngs_flux", len(request.ngs_positions), positive=True
+    )
     # Keep native work arrays independent of the read-only request.
     science = request.science_positions.to_value(u.arcsec).copy()
     ngs = request.ngs_positions.to_value(u.arcsec).copy()
+    ngs_frame_rates = np.full(len(ngs), lo_frame_rate.to_value(u.Hz))
     return (
         np.asarray(
-            context.mastsel.computeTotalResidualMatrix(
+            model.computeTotalResidualMatrix(
                 science,
                 ngs,
-                context.ngs_flux.to_value(u.photon / u.s),
-                context.ngs_frame_rate.to_value(u.Hz),
+                ngs_flux.to_value(u.photon / u.s),
+                ngs_frame_rates,
                 metrics.sr.to_value(u.one),
                 metrics.ee.to_value(u.one),
                 metrics.fwhm.to_value(u.mas),
@@ -218,9 +293,8 @@ def _compute_mastsel_ctot(context: HybridCtotContext) -> u.Quantity:
 
 
 @contextmanager
-def _capture_mastsel(context: HybridCtotContext) -> Iterator[_MastselCapture]:
+def _capture_mastsel(model: Any) -> Iterator[_MastselCapture]:
     """Wrap only this runtime's two baseline methods and restore their bindings."""
-    model = context.mastsel
     names = ("computeCovMatrices", "buildReconstuctor2")
     original = {name: getattr(model, name) for name in names}
     bound = {name: model.__dict__[name] for name in names if name in model.__dict__}
@@ -254,7 +328,12 @@ def _capture_mastsel(context: HybridCtotContext) -> Iterator[_MastselCapture]:
                 delattr(model, name)
 
 
-def _measurement_noise(context: HybridCtotContext) -> u.Quantity | None:
+def _measurement_noise(
+    model: Any,
+    count: int,
+    lo_frame_rate: u.Quantity,
+    angle_to_wavefront_scale: u.Quantity,
+) -> u.Quantity | None:
     """Recover filtered noise only; retained nr also includes atmospheric servo.
 
     Reuse baseline bias and centroid variance. The grid, transfer function and
@@ -262,15 +341,14 @@ def _measurement_noise(context: HybridCtotContext) -> u.Quantity | None:
     re-evaluating detector moments or atmospheric spectra. Both axes use avar[0],
     as in baseline MASTSEL. Non-fixed gain has no supported noise-only output.
     """
-    model = context.mastsel
     gain = model.LoopGain_LO
     if not isinstance(gain, Real):
         return None
-    count = len(context.request.ngs_positions)
     if model.noNoise:
         return np.zeros((2 * count, 2 * count)) * u.nm**2
     values = []
-    for index, rate in enumerate(context.ngs_frame_rate.to_value(u.Hz)):
+    frame_rate = lo_frame_rate.to_value(u.Hz)
+    for index in range(count):
         detector_index = index if len(model.NumberLenslets) == count else 0
         variance = float(_cpu_array(model.avar[index][0]))
         variance *= (
@@ -281,29 +359,32 @@ def _measurement_noise(context: HybridCtotContext) -> u.Quantity | None:
             raise ValueError(
                 "MASTSEL sensor bias must be finite and nonzero for noise recovery."
             )
-        frequency = np.linspace(0.25, rate / 2, int(2 * rate))
+        frequency = np.linspace(0.25, frame_rate / 2, int(2 * frame_rate))
         if frequency.size < 2:
             raise ValueError(
                 "MASTSEL noise recovery requires at least two frequency samples."
             )
         effective_gain = bias * gain
-        z = np.exp(2j * np.pi * frequency / rate)
+        z = np.exp(2j * np.pi * frequency / frame_rate)
         delayed_gain = effective_gain * z ** (-model.loopDelaySteps_LO)
         hn = delayed_gain / (1 - z**-1 + delayed_gain)
         filtered = variance / bias**2 / (frequency.size - 1) * np.sum(abs(hn) ** 2)
         values.extend((filtered, filtered))
-    return np.diag(values) * context.angle_to_wavefront_scale**2 * u.mas**2
+    return np.diag(values) * angle_to_wavefront_scale**2 * u.mas**2
 
 
-def _complete_mastsel_context(
-    context: HybridCtotContext, captured: _MastselCapture
-) -> HybridCtotContext:
-    """Bind snapshots and centre covariance, without repeating the field baseline."""
+def _collect_mastsel_statistics(
+    model: Any,
+    captured: _MastselCapture,
+    request: HybridRequest,
+    lo_frame_rate: u.Quantity,
+    angle_to_wavefront_scale: u.Quantity,
+) -> HybridMastselStatistics:
+    """Prepare the baseline covariance and reconstructor data for a correction."""
     if captured.covariance is None or captured.reconstructor is None:
         raise RuntimeError(
             "MASTSEL baseline did not expose covariance and reconstructor returns."
         )
-    request = context.request
     count, size = len(request.ngs_positions), len(request.science_positions)
     _, cas, css = captured.covariance
     cas = cas.reshape(size, 2, 2 * count)
@@ -315,13 +396,14 @@ def _complete_mastsel_context(
         centre = cas[center_indices[0]]
     elif count > 1:
         ngs = request.ngs_positions.to_value(u.arcsec).copy()
-        _, centre, _ = context.mastsel.computeCovMatrices(np.zeros((1, 2)), ngs)
+        _, centre, _ = model.computeCovMatrices(np.zeros((1, 2)), ngs)
         centre = _cpu_array(centre)
-    statistics = HybridMastselStatistics(
+    return HybridMastselStatistics(
         ngs_covariance=css * u.nm**2,
         science_ngs_covariance=cas * u.nm**2,
         centre_ngs_covariance=None if centre is None else centre * u.nm**2,
         reconstructor=captured.reconstructor.reshape(size, 2, 2 * count),
-        measurement_noise=_measurement_noise(context),
+        measurement_noise=_measurement_noise(
+            model, count, lo_frame_rate, angle_to_wavefront_scale
+        ),
     )
-    return replace(context, mastsel_statistics=statistics)

@@ -20,11 +20,18 @@ The `[hybrid]` section requires:
 | `science_psf_file` | Loaded science-HO-PSF file path |
 | `ngs_metric_file` | Loaded NGS-HO-metric file path |
 | `output` | Standalone HDF5 result path |
-| `ngs_flux_photon_per_s` | One resolved photon-rate value per active NGS |
+| `ngs_magnitude` | One magnitude per active NGS |
+| `ngs_magnitude_zeropoint` | Pre-aperture zero-magnitude flux in photons per square metre per second |
 
 File and output paths are resolved relative to the INI file. The file
 paths must exist when the configuration is loaded; the output and its parent
 directory may be created later.
+
+Set `ngs_mag_standard` when the magnitudes have a known photometric convention.
+Hybrid converts magnitudes to effective WFS photon rates using the MASTSEL
+telescope diameter and lenslet count. A legacy INI with `ngs_flux_photon_per_s`
+supplies effective rates directly. The INI loader converts them to equivalent
+magnitudes using the reference zeropoint of `1e10 photon / (m2 s)`.
 
 `precision = float32|float64` selects shared numerical state, calculations and
 outputs; the default is float32. Python `load_configuration(..., dtype=...)` or
@@ -84,9 +91,10 @@ SensorFrameRate_LO = 500.0
 
 [hybrid]
 science_psf_file = products/science.pkl
-ngs_metric_file = products/ngs.pkl
+ngs_metric_file = products/ngs-metrics.pkl
 output = results/hybrid.h5
-ngs_flux_photon_per_s = [1200.0, 950.0, 1100.0]
+ngs_magnitude = [14.0, 15.0, 16.0]
+ngs_magnitude_zeropoint = 1e10
 non_psd_policy = error
 diagnostics_level = none
 ```
@@ -97,17 +105,21 @@ boundary rather than reclassifying them as Hybrid fields.
 
 ### Executable Sample
 
-The repository's `examples/hybrid.ini` contains a complete small MASTSEL
-configuration. From a bootstrapped checkout:
+The repository's `examples/mastsel/hybrid.ini` contains a complete small
+MASTSEL configuration. Run these commands from the repository root.
 
 ```bash
-./.conda/bin/python examples/build_sample_artifacts.py
-./.conda/bin/hybrid-ao-psf examples/hybrid.ini
+./.conda/bin/python examples/interpolation/generate_synthetic_ho_psfs.py \
+  --output-dir examples/interpolation/samples
+./examples/mastsel/run.sh
 ```
 
-The builder creates the two ready-to-evaluate products referenced by the INI.
-The command writes the configured `examples/results/hybrid.h5` result. The
-sample is also the Python-and-CLI real-MASTSEL end-to-end verification route.
+The runner builds `science.pkl` and `ngs-metrics.pkl` in
+`examples/mastsel/products/` and writes `examples/mastsel/results/hybrid.h5`.
+To use your own PSFs, set the
+builder's input paths in the run script to directories in the
+[example PSF library format](interpolation.md#example-psf-libraries).
+The sample is also the Python-and-CLI real-MASTSEL end-to-end verification route.
 
 ## E2E-Calibrated Configuration
 
@@ -155,3 +167,19 @@ are not imported or executed. Complete prediction opens `science_psf`, the four
 model products and `ngs_metrics`; it does not open `ngs_psf` or native sources.
 The requested wavelength, ZA, directions, magnitudes and feedback strengths
 must lie within the applicable provider/product supports.
+
+### Executable E2E-Calibrated Example
+
+Generate the sample PSFs and run the example from the repository root.
+
+```bash
+./.conda/bin/python examples/interpolation/generate_synthetic_ho_psfs.py \
+  --output-dir examples/interpolation/samples
+./examples/e2e-calibrated/run.sh
+```
+
+The runner builds the PSF interpolators and calls
+`generate_synthetic_calibration.py --output-dir products` from the example
+directory. Both steps write inputs under `examples/e2e-calibrated/products/`.
+The simulation uses those inputs and writes
+`examples/e2e-calibrated/results/hybrid.h5`.

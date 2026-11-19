@@ -108,7 +108,9 @@ def test_measure_offline_build_roundtrip_and_support(calibration, tmp_path, sepa
         atol=1e-14,
     )
     np.testing.assert_allclose(
-        model.measurement_noise(photons_per_frame=count, ee=fraction, fwhm=width).value,
+        model.build_measurement_noise_covariance(
+            photons_per_frame=count, ee=fraction, fwhm=width
+        ).value,
         np.diag(np.repeat(expected, 2)),
         rtol=1e-14,
     )

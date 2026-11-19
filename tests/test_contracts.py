@@ -7,12 +7,14 @@ from ao_core.stats import PsfMetadata
 from astropy import units as u
 
 from hybrid_ao_psf import (
+    CovarianceDiagnostics,
     DiagnosticsLevel,
     HybridCtotCorrection,
     HybridDiagnostics,
     HybridMastselStatistics,
     HybridRequest,
     HybridResult,
+    MastselDiagnostics,
     PsfMetricPrediction,
     PsfPrediction,
 )
@@ -27,18 +29,18 @@ def _metadata() -> PsfMetadata:
     )
 
 
-def test_correction_owns_immutable_metadata_and_validates_definition() -> None:
+def test_correction_owns_input_files_and_validates_definition() -> None:
     metadata = {"fit": "fit.json"}
     correction = HybridCtotCorrection(lambda ctot, context: None, metadata)
     metadata["fit"] = "changed.json"
-    assert correction.provenance["fit"] == "fit.json"
+    assert correction.input_files["fit"] == "fit.json"
     with pytest.raises(TypeError):
-        correction.provenance["fit"] = "other"
+        correction.input_files["fit"] = "other"
     with pytest.raises(FrozenInstanceError):
         correction.apply = lambda ctot, context: ctot
     with pytest.raises(TypeError, match="callable"):
         HybridCtotCorrection(None)
-    with pytest.raises(TypeError, match="string-to-string"):
+    with pytest.raises(TypeError, match="input_files"):
         HybridCtotCorrection(lambda ctot, context: None, {"fit": 1})
 
 
@@ -65,41 +67,34 @@ def test_mastsel_statistics_copy_and_freeze_arrays() -> None:
         replace(statistics, measurement_noise=np.eye(2) * u.nm**2)
 
 
-def make_result(*, diagnostics: bool = True) -> HybridResult:
+def make_result(*, diagnostics=True, debug=True) -> HybridResult:
     psfs = np.full((2, 4, 4), 1.0 / 16.0, dtype=np.float32)
-    ctot_wavefront = np.array([[[4.0, 1.0], [1.0, 3.0]]] * 2) * u.nm**2
-    ctot_angle = np.array([[[1.0, 0.25], [0.25, 0.75]]] * 2) * u.mas**2
+    ctot = np.array([[[1.0, 0.25], [0.25, 0.75]]] * 2, dtype=np.float32) * u.mas**2
+    output_diagnostics = None
+    if diagnostics:
+        output_diagnostics = HybridDiagnostics(
+            covariance=CovarianceDiagnostics(
+                ctot=ctot, psd_valid_mask=[True, True], psd_clipped=[False, True],
+            ),
+            mastsel=MastselDiagnostics(
+                ngs_metrics=PsfMetricPrediction(
+                    ee=[0.4, 0.5] * u.one,
+                    fwhm=[100.0, 110.0] * u.mas,
+                    sr=[0.1, 0.2] * u.one,
+                ),
+                frame_rate=500.0 * u.Hz,
+                ngs_flux=[1000.0, 2000.0] * u.photon / u.s,
+                angle_to_wavefront_scale=2.0 * u.nm / u.mas,
+                effective_ini="[telescope]\nZenithAngle = 30\n" if debug else None,
+            ),
+            psfs_ho=psfs if debug else None,
+        )
     return HybridResult(
+        positions=[[0, 0], [1, 0]] * u.arcsec,
         psfs=psfs,
-        metadata=_metadata(),
-        ngs_metrics=PsfMetricPrediction(
-            ee=np.array([0.4, 0.5]) * u.dimensionless_unscaled,
-            fwhm=np.array([100.0, 110.0]) * u.mas,
-            sr=np.array([0.1, 0.2]) * u.dimensionless_unscaled,
-        ),
-        ctot_wavefront=ctot_wavefront,
-        ctot_angle=ctot_angle,
-        angle_to_wavefront_scale=2.0 * u.nm / u.mas,
-        ngs_flux=np.array([1000.0, 2000.0]) * u.photon / u.s,
-        ngs_frame_rate=np.array([500.0, 500.0]) * u.Hz,
         jitter=np.full(2, np.sqrt(1.75)) * u.mas,
-        effective_mastsel_ini="[telescope]\nZenithAngle = 30\n",
-        psd_clipped=np.array([False, True]),
-        provenance={"science_psf_file": "science.pkl"},
-        diagnostics=(
-            HybridDiagnostics(
-                psd_valid_mask=np.array([True, True]),
-                ctot_angle_trace_min=1.75 * u.mas**2,
-                ctot_angle_trace_max=1.75 * u.mas**2,
-                ctot_angle_trace_mean=1.75 * u.mas**2,
-                ctot_angle_determinant_min=0.6875 * u.mas**4,
-                ctot_angle_determinant_max=0.6875 * u.mas**4,
-                ctot_angle_determinant_mean=0.6875 * u.mas**4,
-                pre_blur_psfs=psfs,
-            )
-            if diagnostics
-            else None
-        ),
+        metadata=_metadata(),
+        diagnostics=output_diagnostics,
     )
 
 
@@ -202,80 +197,35 @@ def test_provider_prediction_owns_inputs() -> None:
     assert not prediction.psfs.flags.writeable
 
 
+def test_result_contains_the_science_outputs_and_physical_metadata():
+    result = make_result(diagnostics=False)
+    assert [item.name for item in fields(HybridResult) if item.init] == [
+        "positions",
+        "psfs",
+        "jitter",
+        "metadata",
+        "diagnostics",
+    ]
+    np.testing.assert_array_equal(result.positions.to_value(u.arcsec), [[0, 0], [1, 0]])
+    assert result.diagnostics is None
+    with pytest.raises(TypeError, match="positions"):
+        replace(result, positions=None)
+    with pytest.raises(ValueError, match="positions must have shape"):
+        replace(result, positions=[[0, 0]] * u.arcsec)
+
+
 def test_result_validates_diagnostic_shape() -> None:
+    result = make_result()
+    diagnostics = replace(
+        result.diagnostics, psfs_ho=np.ones((2, 3, 4), dtype=np.float32)
+    )
     with pytest.raises(ValueError, match="must match psfs shape"):
-        result = make_result(diagnostics=False)
-        HybridResult(
-            **{
-                **result.__dict__,
-                "diagnostics": HybridDiagnostics(
-                    psd_valid_mask=np.array([True, True]),
-                    ctot_angle_trace_min=1.75 * u.mas**2,
-                    ctot_angle_trace_max=1.75 * u.mas**2,
-                    ctot_angle_trace_mean=1.75 * u.mas**2,
-                    ctot_angle_determinant_min=0.6875 * u.mas**4,
-                    ctot_angle_determinant_max=0.6875 * u.mas**4,
-                    ctot_angle_determinant_mean=0.6875 * u.mas**4,
-                    pre_blur_psfs=np.ones((1, 4, 4), dtype=np.float32),
-                ),
-            }
-        )
+        replace(result, diagnostics=diagnostics)
 
 
-def test_result_rejects_inconsistent_ctot_units() -> None:
-    result = make_result()
-
-    with pytest.raises(ValueError, match="ctot_angle must equal"):
-        replace(result, ctot_angle=result.ctot_angle * 2.0)
-
-
-def test_result_rejects_materially_non_psd_ctot() -> None:
-    result = make_result()
-    invalid_wavefront = np.array([[[-1.0, 0.0], [0.0, 1.0]]] * 2) * u.nm**2
-
-    with pytest.raises(ValueError, match="positive semidefinite"):
-        replace(
-            result,
-            ctot_wavefront=invalid_wavefront,
-            ctot_angle=invalid_wavefront.value / 4.0 * u.mas**2,
-        )
-
-
-def test_result_rejects_jitter_inconsistent_with_ctot() -> None:
-    result = make_result()
-
-    with pytest.raises(ValueError, match="jitter must equal"):
-        replace(result, jitter=np.array([999.0, 999.0]) * u.mas)
-
-
-def test_result_rejects_diagnostic_mask_inconsistent_with_ctot() -> None:
-    result = make_result()
-    assert result.diagnostics is not None
-
-    with pytest.raises(ValueError, match="psd_valid_mask must match"):
-        replace(
-            result,
-            diagnostics=replace(
-                result.diagnostics,
-                psd_valid_mask=np.array([True, False]),
-            ),
-        )
-
-
-def test_result_rejects_diagnostic_summary_inconsistent_with_ctot() -> None:
-    result = make_result()
-    assert result.diagnostics is not None
-
-    with pytest.raises(ValueError, match="ctot_angle_trace_min must match"):
-        replace(
-            result,
-            diagnostics=replace(
-                result.diagnostics,
-                ctot_angle_trace_min=2.0 * u.mas**2,
-                ctot_angle_trace_max=2.0 * u.mas**2,
-                ctot_angle_trace_mean=2.0 * u.mas**2,
-            ),
-        )
+def test_mastsel_diagnostics_require_a_scalar_frame_rate() -> None:
+    with pytest.raises(ValueError, match="frame_rate.*0D"):
+        replace(make_result().diagnostics.mastsel, frame_rate=[500.0, 500.0] * u.Hz)
 
 
 def test_request_accepts_validation_diagnostics_level() -> None:
@@ -295,8 +245,8 @@ def test_diagnostics_exposes_psd_summary_properties() -> None:
     diagnostics = make_result().diagnostics
 
     assert diagnostics is not None
-    assert diagnostics.psd_valid_count == 2
-    assert diagnostics.psd_valid_fraction == 1.0
+    assert diagnostics.covariance.psd_valid_count == 2
+    assert diagnostics.covariance.psd_valid_fraction == 1.0
 
 
 @pytest.mark.parametrize("dtype", [np.float32, np.float64, None])

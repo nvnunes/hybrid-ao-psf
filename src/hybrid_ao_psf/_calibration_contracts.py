@@ -91,7 +91,7 @@ class CalibrationPhotometry(_PhysicalRecord):
             raise ValueError("photons_per_frame_zeropoint must be positive")
         object.__setattr__(self, "photons_per_frame_zeropoint", count)
 
-    def photons_per_frame(self, magnitudes: u.Quantity) -> u.Quantity:
+    def magnitude_to_photons_per_frame(self, magnitudes: u.Quantity) -> u.Quantity:
         """Return incident counts for finite magnitude values in this convention.
 
         Args:

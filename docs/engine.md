@@ -21,8 +21,8 @@ For MASTSEL, one call:
    where permitted, conditions Ctot;
 6. applies the image-plane Gaussian OTF to a private selected-precision PSF copy using
    the provider-owned pixel scale and finite-field convention; and
-7. constructs the standard result, jitter, PSD facts, effective configuration,
-   provenance, and selected diagnostics.
+7. constructs the science result and any requested diagnostics from the
+   calculated covariance.
 
 `E2ECalibratedModel.predict()` returns the full low-order displacement
 mixture at the requested science positions for the supplied asterism.
@@ -34,10 +34,10 @@ Both paths use the provider-owned pixel scale, physical x/y axes and the same
 finite-field FFT/crop on a private selected-precision PSF copy. The crop is not renormalized. Energy blurred beyond the retained
 PSF support remains absent from the result.
 
-The optional `MastselModel.ctot_correction` receives baseline Ctot and a transient context
-with the same live MASTSEL instance. The engine owns the temporary configuration
-through calculation and correction, with unconditional cleanup. Its private
-MASTSEL adapter captures covariance/reconstructor returns during the baseline
+The optional `MastselModel.ctot_correction` receives baseline Ctot and the
+resolved numerical inputs for the correction. Hybrid owns the MASTSEL instance
+and its temporary configuration through calculation and correction. The
+adapter captures covariance and reconstructor returns during the baseline
 using instance-local wrappers restored before the callback. Capture is omitted
 without a correction definition. Fixed-gain noise is recovered from retained
 sensor response/variance using the native sampled transfer function; no detector
@@ -49,8 +49,7 @@ for the public callback and statistics contracts.
 Absent or no-op corrections preserve baseline Ctot. A replacement follows the
 same conditioning and single-Gaussian path; Ctot, jitter, PSD facts and diagnostic
 summaries all describe that final covariance. The hook returns neither kernels
-nor PSFs and adds no second convolution. Static metadata describes the configured
-correction, not whether a particular call changed Ctot.
+nor PSFs and adds no second convolution. File paths describe the configured correction.
 
 For comparisons that supply their own PSFs and conditioned Ctot,
 `blur_psfs_with_ctot()` exposes this same finite-field blur without running the
@@ -72,26 +71,27 @@ constant, not a researcher setting.
 
 For a materially non-positive-semidefinite matrix, `non_psd_policy = error`
 raises before blur and is the default. `non_psd_policy = clip` clips negative
-eigenvalues to zero. `HybridResult.psd_clipped` reports every science point
+eigenvalues to zero. `diagnostics.covariance.psd_clipped` reports every science point
 whose covariance required numerical or selected policy clipping.
 
 The E2E path uses the validated calibrated distribution unchanged. It rejects
-the `clip` policy, does not condition covariance components and reports an
-all-false clipping mask. Its covariance checks follow
+the `clip` policy, validates its covariance components and retains the calibrated distribution. Its checks follow
 [Calibrated LO prediction](e2e-model.md#composition).
 
 ## Diagnostics
 
-Both models retain identity, NGS metrics, angular Ctot, applied distribution,
-frame rates, jitter, coordinates, provenance and PSD-clipping facts. MASTSEL
-also retains wavefront Ctot, angular conversion, effective flux and INI, with
-magnitudes/zeropoint when supplied. E2E retains magnitudes and its complete
-`E2ELowOrderPrediction`, including component covariances, reconstructor,
-feedback matrix/decomposition and symmetric-approximation diagnostics.
+The standard result carries positions, final science PSFs, jitter and
+physical PSF metadata. The diagnostics level controls the additional
+calculation details available on the result.
 
-`diagnostics_level = none` adds nothing to that standard result.
-`diagnostics_level = validation` retains a per-field nonzero-PSD mask, its
-count and fraction, and minimum, maximum, and mean angular-Ctot trace and
-determinant summaries. `diagnostics_level = debug` retains the same validation
-facts plus the potentially large pre-blur PSF cube. Final-PSF EE, FWHM, and
-Strehl remain optional `ao_core.stats` analyses performed by the caller.
+- `none` returns the standard result.
+- `validation` adds `diagnostics.covariance` for both models. It contains the
+  applied angular covariance `ctot` in mas², the `psd_valid_mask` and the
+  PSD-valid count and fraction derived from the mask. MASTSEL also supplies
+  `covariance.psd_clipped` and a `mastsel` record with `ngs_metrics`, `ngs_flux`,
+  `frame_rate` and `angle_to_wavefront_scale`.
+- `debug` adds `psfs_ho` for both models. MASTSEL adds `mastsel.effective_ini`.
+  E2E-Calibrated adds its full prediction at `e2e_calibrated`, including
+  `displacement_distribution`.
+
+Final-PSF EE, FWHM and Strehl are measured with `ao_core.stats`.

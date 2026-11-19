@@ -39,6 +39,9 @@ Wavelength = [710e-9]
 Zenith = [10.0, 20.0]
 Azimuth = [0.0, 180.0]
 
+[sensor_LO]
+NumberLenslets = [1, 1]
+
 [RTC]
 SensorFrameRate_LO = 500.0
 
@@ -84,7 +87,22 @@ def test_load_configuration_resolves_paths_and_cartesian_coordinates(
     assert "[hybrid]" not in configuration.mastsel_ini.lower()
     assert "[telescope]" in configuration.mastsel_ini
     assert "SensorFrameRate_LO = 500.0" in configuration.mastsel_ini
-    assert not hasattr(configuration.request, "ngs_frame_rate")
+    assert not hasattr(configuration.request, "lo_frame_rate")
+
+
+def test_load_mastsel_magnitudes_with_supplied_zeropoint(tmp_path):
+    path = tmp_path / "simulation.ini"
+    _write_config(path)
+    text = path.read_text().replace(
+        "ngs_flux_photon_per_s = [1000, 2000]",
+        "ngs_magnitude = [12, 15]\nngs_magnitude_zeropoint = 2e10\nngs_mag_standard = R",
+    )
+    path.write_text(text)
+    configuration = load_configuration(path)
+    assert configuration.base_config == text
+    assert configuration.ngs_mag_standard == "R"
+    assert configuration.ngs_magnitude_zeropoint == 2e10 * u.photon / (u.m**2 * u.s)
+    np.testing.assert_array_equal(configuration.request.ngs_magnitude.value, [12.0, 15.0])
 
 
 def test_load_configuration_rejects_ngs_flux_shape(tmp_path: Path) -> None:
@@ -134,6 +152,7 @@ def test_mastsel_model_parses_once_and_isolates_each_run(tmp_path, monkeypatch):
     monkeypatch.setattr(_mastsel, "parse_ini", record_parse)
     model = MastselModel(
         mastsel_ini=configuration.mastsel_ini,
+        ngs_magnitude_zeropoint=configuration.ngs_magnitude_zeropoint,
         ngs_metrics=SimpleNamespace(evaluate=lambda **kwargs: None),
     )
     first, _, _, _ = engine._resolve_effective_mastsel(configuration.request, model)

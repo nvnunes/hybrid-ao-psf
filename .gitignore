@@ -1,4 +1,5 @@
 .DS_Store
+.vscode/settings.json
 .conda/
 .pytest_cache/
 .ruff_cache/
@@ -9,5 +10,8 @@ build/
 dist/
 examples/products/
 examples/results/
+examples/interpolation/samples/
+examples/*/products/
+examples/*/results/
 site/
 tmp

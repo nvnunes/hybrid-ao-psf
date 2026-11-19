@@ -256,12 +256,12 @@ def test_photometry_is_generic_and_preserves_incident_count_convention():
         magnitude_band="test band", photons_per_frame_zeropoint=1e8 * u.photon
     )
     np.testing.assert_allclose(
-        conversion.photons_per_frame([0, 5, 10] * u.mag).value,
+        conversion.magnitude_to_photons_per_frame([0, 5, 10] * u.mag).value,
         [1e8, 1e6, 1e4],
         rtol=1e-15,
     )
     with pytest.raises(ValueError, match="magnitudes must be real"):
-        conversion.photons_per_frame([10 + 2j] * u.mag)
+        conversion.magnitude_to_photons_per_frame([10 + 2j] * u.mag)
     q = conversion.photons_per_frame_zeropoint
     q._unit = u.electron
     assert conversion.photons_per_frame_zeropoint.unit == u.photon

@@ -366,7 +366,7 @@ class ReconstructorNoiseModel(_PhysicalRecord):
             * u.mas**2
         )
 
-    def measurement_noise(
+    def build_measurement_noise_covariance(
         self, *, photons_per_frame: u.Quantity, ee: u.Quantity, fwhm: u.Quantity
     ) -> u.Quantity:
         """Return block-diagonal C_eta for a nonempty one-dimensional NGS list.
@@ -753,7 +753,7 @@ def solve_lo_reconstructor(
     )
 
 
-def _reconstructor_atmospheric_covariances(
+def _evaluate_reconstructor_covariances(
     covariances: CovarianceFunctions,
     ngs_positions: u.Quantity,
     zenith_angle: u.Quantity,
@@ -837,10 +837,10 @@ def build_lo_reconstructor(
         raise ValueError(
             "multiple NGS require calibrated atmospheric and noise providers"
         )
-    ngs_covariance, centre_ngs_covariance = _reconstructor_atmospheric_covariances(
+    ngs_covariance, centre_ngs_covariance = _evaluate_reconstructor_covariances(
         covariances, positions, angle
     )
-    prior = noise.measurement_noise(
+    prior = noise.build_measurement_noise_covariance(
         photons_per_frame=counts * u.photon, ee=fractions * u.one, fwhm=widths * u.mas
     ).to_value(u.mas**2)
     return lo_reconstructor(

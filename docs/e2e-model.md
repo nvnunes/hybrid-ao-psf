@@ -8,17 +8,18 @@ statistics; `simulate()` combines the same model with science HO PSFs.
 
 ## Load And Evaluate
 
-Use the same [shared INI](calibration.md#shared-configuration) as calibration:
+Build the products for the [executable example](configuration.md#executable-e2e-calibrated-example)
+and run this from the repository root.
 
 ```python
 from astropy import units as u
 from hybrid_ao_psf import load_e2e_calibrated_model
 
-model = load_e2e_calibrated_model("e2e.ini")
+model = load_e2e_calibrated_model("examples/e2e-calibrated/hybrid.ini")
 result = model.predict(
-    ngs_positions=[[12, -24], [-24, 12]] * u.arcsec,
-    ngs_magnitude=[15, 17] * u.mag,
-    science_positions=[[0, 0], [12, 12]] * u.arcsec,
+    ngs_positions=[[30, 0], [-15, 25.98076211353316]] * u.arcsec,
+    ngs_magnitude=[15, 16] * u.mag,
+    science_positions=[[0, 0], [36, 0]] * u.arcsec,
     zenith_angle=20 * u.deg,
 )
 ```
@@ -31,59 +32,51 @@ in the INI govern calibration, not reinterpretation of fitted products.
 Precision resolves from float32 default, then `[e2e] precision`, then an explicit
 `dtype` argument. `model.prepare(dtype=...)` converts immutable runtime state
 without changing saved products or recovering information lost during earlier
-rounding. Once prepared, prediction performs no file I/O. The read-only
-`model_files` mapping records the paths and checksums for the four calibrated
-models and the NGS metric file, for execution and reuse checks. Direct construction
-from loaded providers can omit these records.
+rounding. Once prepared, prediction performs no file I/O. The loader verifies
+the calibrated model files and NGS metric interpolator. Standalone INI runs record their manifest and interpolator paths under
+`/simulation`. See [Result files](results.md#run-settings).
 
 ## Composition
 
 Saved photometry converts each magnitude to incident photons per frame.
-The prediction reports NGS HO EE, FWHM and Strehl in `ngs_metrics`. In NGS order,
-`coma_response_coefficients`, `sensing_gains` and `wfs_noise_variances` give
-the fitted coma response h, WFS gain g and per-axis WFS noise variance v.
-The model uses `reconstructor_noise_covariance` with the unfiltered tilt
-covariance to choose the absolute field-centre reconstructor weights.
-One NGS uses identity weights.
+Hybrid evaluates the fitted coma response, sensing gain and noise variance,
+and NGS spot metrics. The reconstructor uses the atmospheric covariances and
+the fitted pre-filter measurement-noise covariance. For one NGS, the
+reconstructor is the identity.
 
-`feedback_matrix` stores `B = sum(g_g R_g)`. The model combines the scalar
-covariance functions using `interpolation_feedback_eigenvalues` and
-`interpolation_feedback_projectors` from `interpolation_feedback_matrix`. The
-reconstructor blocks stay inside the loop response. When B has complex
-eigenvalues, the model uses `(B+B.T)/2` for interpolation and sets
-`used_symmetric_feedback_approximation`. The result also records the relative
-change in the feedback matrix and the `eigenbasis_condition_number`. Defective
-or excessively ill-conditioned bases raise. The discrete Lyapunov calculation
-uses `feedback_matrix` and the calibrated fixed-gain delayed integrator to
-compute the stationary noise covariance.
+The gain-weighted reconstructor determines the actual feedback matrix.
+The scalar decomposition determines which filtered covariance functions to
+evaluate. When needed, the interpolation uses the symmetric approximation
+to the feedback matrix. The discrete Lyapunov calculation uses the actual
+feedback matrix to propagate WFS noise.
 
-`result.science_tilt_covariance` describes the atmospheric tilt at science
-positions before low-order correction. `result.atmospheric_residual_covariance`
-describes the atmospheric motion that remains after correction.
-`result.ho_correction` combines the HO-command covariance and its cross terms
-with the remaining motion. It can be indefinite. Adding it to the atmospheric
-residual gives `result.noiseless_covariance`. `result.noise_command_covariance`
-gives the covariance of the noise-driven command.
-`atmospheric_command_covariance` and `ho_command_covariance` describe the
-commands driven by atmospheric tilt and HO-induced apparent tilt, respectively.
-`atmospheric_ho_command_covariance` gives the cross-covariance between these
-commands. `science_atmospheric_command_covariance` and
-`science_ho_command_covariance` give the cross-covariances of atmospheric tilt
-at the science positions with each command.
-No covariance component is independently clipped. A noiseless eigenvalue below
--1e-8 mas squared raises; smaller roundoff remains visible.
+The atmospheric residual and HO correction add to the noiseless covariance.
+The displacement mixture adds a scaled noise-command covariance to each
+Gaussian component. A noiseless eigenvalue below `-1e-8 mas2` raises.
 
-`result.distribution` is a `LowOrderDistribution` with narrow and broad
-Gaussian components. The `covariances` array adds the noise covariance scaled
-by `noise_covariance_scales` to the noiseless covariance. Its shape is
-`(science, component, 2, 2)`.
-Use `result.distribution.covariance` for the total image-displacement covariance.
-It is the weighted covariance of the Gaussian mixture and agrees with
-`result.noiseless_covariance + result.noise_command_covariance` within numerical
-precision.
-`simulate()` reports the applied angular covariance at `HybridResult.ctot_angle`.
-Covariance axes are physical x/y in mas squared.
-Coma response is in mas/nm OPD.
+## Prediction Result
+
+`predict()` returns a `displacement_distribution` with narrow and broad
+Gaussian components. The covariance array has shape
+`(science, component, 2, 2)`. Use `prediction.displacement_distribution.covariance`
+for the weighted total image-displacement covariance.
+
+With `diagnostics_level="debug"`, the prediction also retains:
+
+- `diagnostics.ngs` with photon counts, spot metrics, coma coefficients, sensing
+  gain and variance, and the reconstructor noise prior.
+- `diagnostics.control` with the reconstructor, actual feedback and
+  `scalar_feedback`. The latter contains the effective feedback, strengths and
+  projectors used for covariance interpolation.
+- `diagnostics.covariances` with the science-tilt and command covariances in
+  `terms`, the atmospheric residual, HO correction, noiseless covariance and
+  noise-command covariance. The HO correction can be indefinite.
+- `diagnostics.noise_covariance_scales` with the narrow and broad noise multipliers.
+
+All angular covariances use physical x/y axes and mas squared. Coma response
+uses mas per nm OPD. `simulate()` reports angular covariance at
+`result.diagnostics.covariance.ctot` at Validation and Debug levels. Debug
+also exposes the prediction at `result.diagnostics.e2e_calibrated`.
 
 Queries must lie within all applicable spatial, magnitude, zenith and feedback
 ranges. No extrapolation, native acquisition, MASTSEL fallback or
@@ -95,19 +88,14 @@ for the result fields and constructor contracts.
 Pass the loaded model to the same engine used for MASTSEL:
 
 ```python
-from hybrid_ao_psf import HybridRequest, load_psf_interpolator, simulate
+from hybrid_ao_psf import load_configuration, load_psf_interpolator, simulate
 
-science = load_psf_interpolator("science.pkl")
-request = HybridRequest(
-    science_positions=[[0, 0], [12, 12]] * u.arcsec,
-    ngs_positions=[[12, -24], [-24, 12]] * u.arcsec,
-    ngs_magnitude=[15, 17] * u.mag,
-    zenith_angle=20 * u.deg,
-    wavelength=2.179 * u.um,
-)
-result = simulate(request, science, lo_model=model)
+configuration = load_configuration("examples/e2e-calibrated/hybrid.ini")
+science = load_psf_interpolator(configuration.science_psf_file)
+result = simulate(configuration.request, science, lo_model=model)
 ```
 
-The supplied model owns the NGS metrics and photometry. The result retains
-the applied distribution and fitted LO diagnostics. See [Engine](engine.md),
-[Configuration](configuration.md) and [Result files](results.md).
+The supplied model owns the NGS metrics and photometry. At debug level,
+the result retains the applied distribution and the intermediate quantities
+used to calculate it. See [Engine](engine.md), [Configuration](configuration.md)
+and [Result files](results.md).

@@ -91,7 +91,7 @@ class NoiseBlurModel:
             )
         }
 
-    def scales(self, ngs_count: int) -> tuple[float, float]:
+    def compute_covariance_scales(self, ngs_count: int) -> tuple[float, float]:
         """Return narrow/broad covariance multipliers for a positive NGS count.
 
         One NGS uses the single scale; every larger count uses the multi scale.
@@ -132,7 +132,7 @@ class NoiseBlurModel:
         radius = np.asarray(squared_radius, dtype=self.dtype)
         if np.isnan(radius).any() or np.any(radius < 0):
             raise ValueError("Squared radius must be nonnegative.")
-        narrow, broad = self.scales(ngs_count)
+        narrow, broad = self.compute_covariance_scales(ngs_count)
         weight = self.mixture_weight
         return weight * -np.expm1(-radius / (2 * narrow)) + (1 - weight) * -np.expm1(
             -radius / (2 * broad)
@@ -162,7 +162,7 @@ class NoiseBlurModel:
             TypeError: If covariance or pixel scale lacks an Astropy quantity.
             ValueError: If covariance, count, grid or scale is invalid.
         """
-        self.scales(ngs_count)
+        self.compute_covariance_scales(ngs_count)
         if not isinstance(covariance, u.Quantity) or not isinstance(
             pixel_scale, u.Quantity
         ):

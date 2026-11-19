@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-from collections.abc import Callable
 from dataclasses import dataclass
 
 import numpy as np
@@ -11,6 +10,7 @@ from astropy import units as u
 from numpy.typing import DTypeLike, NDArray
 
 from ._calibration_numerics import lo_reconstructor
+from ._units import _PhysicalRecord, quantity_from_value
 
 
 @dataclass(frozen=True, kw_only=True, eq=False)
@@ -53,8 +53,8 @@ class _ControlSolution:
 
 
 @dataclass(frozen=True, kw_only=True, eq=False)
-class _TiltCommandCovariances:
-    """Science tilt and filtered commands in canonical numerical units.
+class _TiltCommandCovariances(_PhysicalRecord):
+    """Science tilt and filtered command covariances.
 
     Each matrix is in mas² and uses x/y on both axes. Terms involving science
     tilt have shape (science, 2, 2); command-only terms have shape (2, 2).
@@ -62,28 +62,28 @@ class _TiltCommandCovariances:
     asymmetric.
     """
 
-    science_tilt: NDArray
-    atmospheric_command: NDArray
-    ho_command: NDArray
-    atmospheric_ho_command: NDArray
-    science_atmospheric_command: NDArray
-    science_ho_command: NDArray
+    science_tilt: u.Quantity
+    atmospheric_command: u.Quantity
+    ho_command: u.Quantity
+    atmospheric_ho_command: u.Quantity
+    science_atmospheric_command: u.Quantity
+    science_ho_command: u.Quantity
 
-    def residual_covariances(self) -> tuple[NDArray, NDArray]:
+    def assemble_residual_covariances(self) -> tuple[NDArray, NDArray]:
         """Assemble atmospheric residual covariance and the HO contribution."""
-        science_atmospheric_command = self.science_atmospheric_command
+        science_atmospheric_command = self.science_atmospheric_command.value
         atmospheric_residual_covariance = (
-            self.science_tilt
-            + self.atmospheric_command
+            self.science_tilt.value
+            + self.atmospheric_command.value
             - science_atmospheric_command
             - science_atmospheric_command.swapaxes(-1, -2)
         )
         # Cov(t_atm - u_atm, u_HO) retains the order of its two arguments.
         residual_ho_cross_covariance = (
-            self.science_ho_command - self.atmospheric_ho_command
+            self.science_ho_command.value - self.atmospheric_ho_command.value
         )
         ho_covariance_contribution = (
-            self.ho_command
+            self.ho_command.value
             - residual_ho_cross_covariance
             - residual_ho_cross_covariance.swapaxes(-1, -2)
         )
@@ -98,25 +98,61 @@ class _TiltCommandCovariances:
 
 
 @dataclass(frozen=True, kw_only=True, eq=False)
-class _LowOrderCovariances:
-    """Closed-loop terms and residual image-motion covariance in physical x/y."""
+class _LowOrderCovariances(_PhysicalRecord):
+    """Terms used to assemble the angular residual covariance, in mas²."""
 
-    control: _ControlSolution
     terms: _TiltCommandCovariances
-    atmospheric_residual_covariance: u.Quantity
-    ho_covariance_contribution: u.Quantity
-    noiseless_covariance: u.Quantity
-    noise_command_covariance: u.Quantity
-    total_covariance: u.Quantity
+    atmospheric_residual: u.Quantity
+    ho_correction: u.Quantity
+    noiseless: u.Quantity
+    noise_command: u.Quantity
+
+    @property
+    def total(self) -> u.Quantity:
+        """Total angular covariance from the noiseless and noise terms."""
+        return self.noiseless + self.noise_command
+
+
+def _check_psd_covariance(matrix: NDArray, name: str) -> None:
+    """Require a finite, symmetric covariance with the model's PSD tolerance."""
+    tolerance = max(1e-10, 32 * np.finfo(matrix.dtype).eps)
+    if (
+        not np.isfinite(matrix).all()
+        or not np.allclose(matrix, matrix.swapaxes(-1, -2), rtol=tolerance, atol=1e-8)
+        or np.linalg.eigvalsh(matrix).min() < -1e-8
+    ):
+        raise ValueError(f"{name} must be symmetric positive semidefinite")
 
 
 def _reconstructor_blocks(reconstructor: NDArray) -> NDArray:
     return reconstructor.reshape(2, -1, 2).transpose(1, 0, 2)
 
 
-def _feedback_matrix(reconstructor: NDArray, sensing_gains: NDArray) -> NDArray:
+def _compute_feedback_matrix(reconstructor: NDArray, sensing_gains: NDArray) -> NDArray:
     """Compute B from the gain-weighted reconstructor blocks."""
     return np.einsum("g,gab->ab", sensing_gains, _reconstructor_blocks(reconstructor))
+
+
+def _compute_noise_command_covariance(
+    controller: FixedGainIntegrator,
+    feedback: NDArray,
+    reconstructor_blocks: NDArray,
+    wfs_noise_variances: NDArray,
+) -> u.Quantity:
+    """Propagate reconstructed WFS noise through the actual matrix feedback.
+
+    Reconstructor blocks are in (NGS, x/y, x/y) order. The independent
+    per-axis WFS variances and the returned command covariance are in mas².
+    """
+    if wfs_noise_variances.shape != (len(reconstructor_blocks),):
+        raise ValueError("WFS noise variances must align with the reconstructor")
+    reconstructed_noise = np.einsum(
+        "g,gab,gcb->ac",
+        wfs_noise_variances,
+        reconstructor_blocks,
+        reconstructor_blocks,
+    )
+    return controller.noise_covariance(feedback, reconstructed_noise * u.mas**2)
 
 
 def _validate_scalar_decomposition(
@@ -163,7 +199,7 @@ def _validate_scalar_decomposition(
         raise ValueError("feedback scalar decomposition requires idempotent projectors")
 
 
-def _scalar_decomposition(feedback: NDArray) -> _ScalarFeedback:
+def _decompose_feedback(feedback: NDArray) -> _ScalarFeedback:
     """Resolve real projectors, preserving the accepted complex-B approximation.
 
     A defective or excessively ill-conditioned eigenbasis cannot represent the
@@ -209,54 +245,37 @@ def _scalar_decomposition(feedback: NDArray) -> _ScalarFeedback:
 class _LowOrderModel:
     """Share the control solve and residual covariance assembly across models.
 
-    The concrete model supplies the reconstructor inputs, WFS response,
-    controller, and a command-covariance evaluator. It owns the displacement
-    distribution formed from the resulting angular covariances.
+    Concrete models evaluate command covariances using the solved control
+    response and build the displacement distribution from the angular residual.
     """
 
     dtype: DTypeLike
 
-    def _predict_low_order(
+    def _solve_control(
         self,
         *,
         reconstruction_covariances: _ReconstructorCovariances | None,
         sensing_gains: NDArray,
-        wfs_noise_variances: NDArray,
         controller: FixedGainIntegrator,
-        evaluate_covariances: Callable[[_ControlSolution], _TiltCommandCovariances],
-    ) -> _LowOrderCovariances:
-        """Solve the loop, then assemble the noiseless residual and noise covariance.
+    ) -> _ControlSolution:
+        """Solve the reconstructor and validate both feedback responses.
 
         Args:
-            reconstruction_covariances: Atmospheric covariance and noise prior
-                for the reconstructor. One NGS uses identity weights and
-                requires no reconstruction covariances.
+            reconstruction_covariances: Atmospheric covariances and noise prior
+                for the reconstructor. One NGS uses identity weights.
             sensing_gains: One dimensionless gain per NGS.
-            wfs_noise_variances: One per-axis variance in mas² per NGS.
-            controller: Fixed integrator used for feedback and noise propagation.
-            evaluate_covariances: Model-specific evaluator called once with
-                the solved reconstructor, feedback matrix, and scalar
-                decomposition. It borrows that solution without modifying it
-                and returns atmospheric and HO terms in mas².
+            controller: Integrator used to check the stability of actual and
+                effective feedback.
 
         Returns:
-            The solved control response, model covariance terms, and assembled
-            residual covariances. Noise propagation uses the actual matrix feedback.
+            The reconstructor, actual feedback and scalar feedback response.
 
         Raises:
-            ValueError: If the inputs, feedback, or noiseless covariance are
-                invalid, or the evaluator rejects an unsupported query.
+            ValueError: If reconstruction inputs or feedback are invalid.
         """
-        if (
-            sensing_gains.ndim != 1
-            or not sensing_gains.size
-            or wfs_noise_variances.shape != sensing_gains.shape
-        ):
-            raise ValueError(
-                "sensing gains and WFS variances must be aligned NGS vectors"
-            )
+        if sensing_gains.ndim != 1 or not sensing_gains.size:
+            raise ValueError("sensing gains must be a nonempty NGS vector")
 
-        # Solve the reconstructor and the feedback response.
         ngs_count = len(sensing_gains)
         if ngs_count == 1:
             reconstructor = np.eye(2, dtype=self.dtype)
@@ -274,21 +293,52 @@ class _LowOrderModel:
                 covariances.noise_prior.to_value(u.mas**2),
                 dtype=self.dtype,
             )
-        feedback = _feedback_matrix(reconstructor, sensing_gains)
+        feedback = _compute_feedback_matrix(reconstructor, sensing_gains)
         controller.transition(feedback)
-        scalar_feedback = _scalar_decomposition(feedback)
+        scalar_feedback = _decompose_feedback(feedback)
         controller.transition(scalar_feedback.effective_feedback)
-        control = _ControlSolution(
+        return _ControlSolution(
             reconstructor=reconstructor,
             feedback=feedback,
             scalar_feedback=scalar_feedback,
         )
 
-        # Combine the model's atmospheric and HO terms into the noiseless residual.
-        terms = evaluate_covariances(control)
+    @staticmethod
+    def _assemble_low_order_covariances(
+        *,
+        command_covariances: _TiltCommandCovariances,
+        control: _ControlSolution,
+        wfs_noise_variances: NDArray,
+        controller: FixedGainIntegrator,
+    ) -> _LowOrderCovariances:
+        """Assemble the angular residual and propagate WFS measurement noise.
+
+        Args:
+            command_covariances: Science tilt and filtered command terms in mas².
+            control: Solved reconstructor and feedback for the same asterism.
+            wfs_noise_variances: One per-axis variance in mas² per NGS.
+            controller: Integrator used to propagate noise with actual feedback.
+
+        Returns:
+            Atmospheric, HO, noiseless and noise-command covariance terms in mas².
+
+        Raises:
+            ValueError: If the variances do not align with the reconstructor or
+                the covariance terms are nonphysical.
+        """
         atmospheric_residual_covariance, ho_covariance_contribution = (
-            terms.residual_covariances()
+            command_covariances.assemble_residual_covariances()
         )
+        for name, matrix in (
+            ("science_tilt_covariance", command_covariances.science_tilt.value),
+            (
+                "atmospheric_command_covariance",
+                command_covariances.atmospheric_command.value,
+            ),
+            ("ho_command_covariance", command_covariances.ho_command.value),
+            ("atmospheric_residual_covariance", atmospheric_residual_covariance),
+        ):
+            _check_psd_covariance(matrix, name)
         noiseless_covariance = (
             atmospheric_residual_covariance + ho_covariance_contribution
         )
@@ -297,24 +347,24 @@ class _LowOrderModel:
                 "calibrated noiseless covariance is not positive semidefinite"
             )
 
-        # Propagate reconstructed WFS noise with the actual matrix feedback.
-        reconstructor_blocks = control.reconstructor_blocks
-        reconstructed_noise_covariance = np.einsum(
-            "g,gab,gcb->ac",
+        noise_command_covariance = _compute_noise_command_covariance(
+            controller,
+            control.feedback,
+            control.reconstructor_blocks,
             wfs_noise_variances,
-            reconstructor_blocks,
-            reconstructor_blocks,
         )
-        noise_command_covariance = controller.noise_covariance(
-            feedback, reconstructed_noise_covariance * u.mas**2
+        _check_psd_covariance(
+            noise_command_covariance.value, "noise_command_covariance"
         )
-        noiseless_covariance = noiseless_covariance * u.mas**2
+        _check_psd_covariance(
+            noiseless_covariance + noise_command_covariance.value, "total_covariance"
+        )
         return _LowOrderCovariances(
-            control=control,
-            terms=terms,
-            atmospheric_residual_covariance=atmospheric_residual_covariance * u.mas**2,
-            ho_covariance_contribution=ho_covariance_contribution * u.mas**2,
-            noiseless_covariance=noiseless_covariance,
-            noise_command_covariance=noise_command_covariance,
-            total_covariance=noiseless_covariance + noise_command_covariance,
+            terms=command_covariances,
+            atmospheric_residual=quantity_from_value(
+                atmospheric_residual_covariance, u.mas**2
+            ),
+            ho_correction=quantity_from_value(ho_covariance_contribution, u.mas**2),
+            noiseless=quantity_from_value(noiseless_covariance, u.mas**2),
+            noise_command=noise_command_covariance,
         )

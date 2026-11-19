@@ -26,7 +26,15 @@ from hybrid_ao_psf import (
     blur_psfs_with_ctot,
     engine,
     image_plane_gaussian_otf,
+    load_result,
 )
+
+from .test_result_io import save_simulation
+
+
+def _wavefront_covariance(result):
+    diagnostics = result.diagnostics
+    return diagnostics.covariance.ctot * diagnostics.mastsel.angle_to_wavefront_scale**2
 
 
 @dataclass(frozen=True)
@@ -59,7 +67,9 @@ def _request(
     )
 
 
-def _model(ngs_metrics, *, frame_rate="500.0", **model_options) -> MastselModel:
+def _model(
+    ngs_metrics, *, frame_rate="500.0", loop_gain="0.3", **model_options
+) -> MastselModel:
     return MastselModel(
         ngs_metrics=ngs_metrics,
         **model_options,
@@ -81,6 +91,8 @@ NumberLenslets = [1]
 
 [RTC]
 SensorFrameRate_LO = {frame_rate}
+LoopGain_LO = {loop_gain}
+LoopDelaySteps_LO = 2
 """,
     )
 
@@ -158,7 +170,7 @@ def hook_runtime(stub_mastsel):
     return Runtime, instances
 
 
-def test_noop_preserves_complete_result_and_runtime_lifetime(hook_runtime):
+def test_noop_preserves_complete_result_and_runtime_lifetime(hook_runtime, tmp_path):
     _, instances = hook_runtime
     science, ngs = _providers()
     baseline = engine.simulate(_request(), science, lo_model=_model(ngs))
@@ -166,9 +178,9 @@ def test_noop_preserves_complete_result_and_runtime_lifetime(hook_runtime):
 
     def noop(ctot, context):
         calls.append(context)
-        assert context.mastsel is instances[-1]
-        assert context.mastsel.config["telescope"]["ZenithAngle"] == 30
-        assert "ZenithAngle = 30" in context.effective_mastsel_ini
+        assert instances[-1].config["telescope"]["ZenithAngle"] == 30
+        assert context.loop_gain == 0.3
+        assert context.loop_delay == 2
         assert not ctot.flags.writeable
         statistics = context.mastsel_statistics
         np.testing.assert_array_equal(
@@ -178,9 +190,11 @@ def test_noop_preserves_complete_result_and_runtime_lifetime(hook_runtime):
             statistics.centre_ngs_covariance, statistics.science_ngs_covariance[0]
         )
         assert statistics.measurement_noise.shape == (4, 4)
-        assert "computeCovMatrices" not in context.mastsel.__dict__
+        assert "computeCovMatrices" not in instances[-1].__dict__
 
-    actual = engine.simulate(
+    path = tmp_path / "noop.h5"
+    actual = save_simulation(
+        path,
         _request(),
         science,
         lo_model=_model(
@@ -188,9 +202,15 @@ def test_noop_preserves_complete_result_and_runtime_lifetime(hook_runtime):
         ),
     )
     assert len(calls) == 1 and len(instances) == 2
-    for name in ("psfs", "ctot_wavefront", "ctot_angle", "jitter", "psd_clipped"):
-        np.testing.assert_array_equal(getattr(actual, name), getattr(baseline, name))
-    assert actual.provenance["fit"] == "fit.json"
+    assert "ZenithAngle = 30" in actual.diagnostics.mastsel.effective_ini
+    np.testing.assert_array_equal(actual.psfs, baseline.psfs)
+    np.testing.assert_array_equal(actual.jitter, baseline.jitter)
+    for name in ("ctot", "psd_clipped"):
+        np.testing.assert_array_equal(
+            getattr(actual.diagnostics.covariance, name),
+            getattr(baseline.diagnostics.covariance, name),
+        )
+    np.testing.assert_array_equal(load_result(path).psfs, actual.psfs)
     assert instances[-1].calls == {"total": 1, "covariance": 1, "reconstructor": 1}
 
 
@@ -210,8 +230,8 @@ def test_legacy_mastsel_keeps_ini_during_correction_and_cleans_up(
     observed_paths = []
 
     def correct(ctot, context):
-        path = context.mastsel.ini_path
-        assert path.read_text(encoding="utf-8") == context.effective_mastsel_ini
+        path = instances[-1].ini_path
+        assert "ZenithAngle = 30" in path.read_text(encoding="utf-8")
         observed_paths.append(path)
         if fail:
             raise RuntimeError("legacy correction failed")
@@ -245,20 +265,20 @@ def test_doubling_uses_one_effective_covariance_for_blur_and_diagnostics(hook_ru
             ),
         ),
     )
-    np.testing.assert_allclose(actual.ctot_wavefront, 2 * baseline.ctot_wavefront)
+    np.testing.assert_allclose(_wavefront_covariance(actual), 2 * _wavefront_covariance(baseline))
     np.testing.assert_allclose(actual.jitter, np.sqrt(2) * baseline.jitter)
     np.testing.assert_allclose(
-        actual.ctot_angle.to_value(u.mas**2).trace(axis1=1, axis2=2), [250, 350]
+        actual.diagnostics.covariance.ctot.to_value(u.mas**2).trace(axis1=1, axis2=2), [250, 350]
     )
     expected = blur_psfs_with_ctot(
         science.prediction.psfs,
-        actual.ctot_wavefront,
+        _wavefront_covariance(actual),
         pixel_scale=science.prediction.pixel_scale,
-        angle_to_wavefront_scale=baseline.angle_to_wavefront_scale,
+        angle_to_wavefront_scale=baseline.diagnostics.mastsel.angle_to_wavefront_scale,
         dtype=np.float64,
     )
     np.testing.assert_array_equal(actual.psfs, expected)
-    assert actual.diagnostics.ctot_angle_trace_mean == 300 * u.mas**2
+    assert np.trace(actual.diagnostics.covariance.ctot, axis1=1, axis2=2).mean() == 300 * u.mas**2
     assert instances[-1].calls["total"] == 1
 
 
@@ -300,8 +320,8 @@ def test_corrected_covariance_obeys_existing_psd_policy(hook_runtime, policy):
             engine.simulate(_request(), science, lo_model=model)
     else:
         result = engine.simulate(_request(), science, lo_model=model)
-        np.testing.assert_array_equal(result.psd_clipped, [True, True])
-        np.testing.assert_array_equal(result.ctot_wavefront.value[:, 0, 0], [0, 0])
+        np.testing.assert_array_equal(result.diagnostics.covariance.psd_clipped, [True, True])
+        np.testing.assert_array_equal(_wavefront_covariance(result).value[:, 0, 0], [0, 0])
 
 
 @pytest.mark.parametrize("stage", ["baseline", "correction"])
@@ -370,6 +390,8 @@ def test_nonfixed_gain_does_not_disable_generic_hook(hook_runtime):
     runtime.LoopGain_LO = "optimize"
 
     def double(ctot, context):
+        assert context.loop_gain is None
+        assert context.loop_delay == 2
         assert context.mastsel_statistics.measurement_noise is None
         return 2 * ctot
 
@@ -377,25 +399,16 @@ def test_nonfixed_gain_does_not_disable_generic_hook(hook_runtime):
     result = engine.simulate(
         _request(),
         science,
-        lo_model=_model(ngs, ctot_correction=HybridCtotCorrection(double)),
+        lo_model=_model(
+            ngs, loop_gain="'optimize'", ctot_correction=HybridCtotCorrection(double)
+        ),
     )
-    np.testing.assert_array_equal(result.ctot_wavefront.value[:, 0, 0], [200, 400])
+    np.testing.assert_array_equal(_wavefront_covariance(result).value[:, 0, 0], [200, 400])
 
 
-def test_provenance_collision_and_invalid_hook_fail_before_runtime(hook_runtime):
+def test_invalid_hook_fails_before_runtime(hook_runtime):
     _, instances = hook_runtime
-    science, ngs = _providers()
-    with pytest.raises(ValueError, match="collides"):
-        engine.simulate(
-            _request(),
-            science,
-            lo_model=_model(
-                ngs,
-                ctot_correction=HybridCtotCorrection(
-                    lambda ctot, context: None, {"science_psfs": "other"}
-                ),
-            ),
-        )
+    _, ngs = _providers()
     with pytest.raises(TypeError, match="ctot_correction"):
         _model(ngs, ctot_correction=lambda ctot, context: None)
     assert not instances
@@ -456,7 +469,8 @@ Label = 50% transmission
     np.testing.assert_allclose(args[1], [[10.0, 0.0], [-5.0, 5.0 * np.sqrt(3.0)]])
     np.testing.assert_allclose(args[2], [1000.0, 2000.0])
     np.testing.assert_allclose(args[3], [500.0, 500.0])
-    np.testing.assert_allclose(result.ngs_frame_rate.to_value(u.Hz), [500.0, 500.0])
+    assert result.diagnostics.mastsel.frame_rate.isscalar
+    assert result.diagnostics.mastsel.frame_rate == 500.0 * u.Hz
     assert calls["kwargs"] == {"aNGS_FWHM_DL_mas": None, "doAll": True}
     assert result.psfs.dtype == np.float32
     assert result.psfs.shape == (2, 9, 9)
@@ -474,21 +488,16 @@ Label = 50% transmission
     np.testing.assert_allclose(result.jitter.to_value(u.mas), [np.sqrt(200.0), 20.0])
     assert result.diagnostics is not None
     np.testing.assert_array_equal(
-        result.diagnostics.pre_blur_psfs, science.prediction.psfs
+        result.diagnostics.psfs_ho, science.prediction.psfs
     )
-    np.testing.assert_array_equal(result.diagnostics.psd_valid_mask, [True, True])
-    assert result.diagnostics.psd_valid_count == 2
-    assert result.diagnostics.ctot_angle_trace_min == 200.0 * u.mas**2
-    assert result.diagnostics.ctot_angle_trace_max == 400.0 * u.mas**2
-    assert result.diagnostics.ctot_angle_determinant_min.to_value(u.mas**4) == (
-        pytest.approx(10000.0)
-    )
-    assert result.diagnostics.ctot_angle_determinant_max.to_value(u.mas**4) == (
-        pytest.approx(40000.0)
-    )
-    assert not np.any(result.psd_clipped)
-    assert "zenithangle = 30" in result.effective_mastsel_ini.lower()
-    assert "zenith = [0, 1]" in result.effective_mastsel_ini.lower()
+    np.testing.assert_array_equal(result.diagnostics.covariance.psd_valid_mask, [True, True])
+    assert result.diagnostics.covariance.psd_valid_count == 2
+    ctot = result.diagnostics.covariance.ctot.to_value(u.mas**2)
+    np.testing.assert_array_equal(np.trace(ctot, axis1=1, axis2=2), [200, 400])
+    np.testing.assert_allclose(np.linalg.det(ctot), [1e4, 4e4], rtol=1e-6)
+    assert not np.any(result.diagnostics.covariance.psd_clipped)
+    assert "zenithangle = 30" in result.diagnostics.mastsel.effective_ini.lower()
+    assert "zenith = [0, 1]" in result.diagnostics.mastsel.effective_ini.lower()
 
 
 def test_magnitude_request_resolves_the_same_flux_and_psf_as_direct_flux(
@@ -542,15 +551,9 @@ def test_magnitude_request_resolves_the_same_flux_and_psf_as_direct_flux(
     np.testing.assert_allclose(calls[0], expected_flux.to_value(u.photon / u.s))
     np.testing.assert_array_equal(calls[0], calls[1])
     np.testing.assert_array_equal(
-        magnitude_result.ctot_wavefront.value, direct_result.ctot_wavefront.value
+        _wavefront_covariance(magnitude_result).value, _wavefront_covariance(direct_result).value
     )
     np.testing.assert_array_equal(magnitude_result.psfs, direct_result.psfs)
-    assert magnitude_result.ngs_magnitude is not None
-    np.testing.assert_array_equal(
-        magnitude_result.ngs_magnitude.value, magnitudes.value
-    )
-    assert magnitude_result.ngs_magnitude_zeropoint == zeropoint
-    assert direct_result.ngs_magnitude is None
 
 
 def test_directional_field_pairs_and_covariance_axes_reach_mastsel(
@@ -594,7 +597,7 @@ def test_directional_field_pairs_and_covariance_axes_reach_mastsel(
 
     np.testing.assert_array_equal(calls["science"], [[12.0, -3.0], [-4.0, 8.0]])
     np.testing.assert_array_equal(calls["ngs"], [[9.0, 2.0], [-7.0, -6.0]])
-    np.testing.assert_array_equal(result.ctot_wavefront.to_value(u.nm**2), ctot)
+    np.testing.assert_array_equal(_wavefront_covariance(result).to_value(u.nm**2), ctot)
     expected = blur_psfs_with_ctot(
         directional_psfs,
         ctot * u.nm**2,
@@ -625,7 +628,7 @@ def test_simulate_uses_frame_rate_from_ini(stub_mastsel) -> None:
     )
 
     np.testing.assert_allclose(calls["frame_rate"], [250.0, 250.0])
-    np.testing.assert_allclose(result.ngs_frame_rate.to_value(u.Hz), [250.0, 250.0])
+    assert result.diagnostics.mastsel.frame_rate == 250.0 * u.Hz
 
 
 @pytest.mark.parametrize("frame_rate", ["0", "-1", "nan", "invalid"])
@@ -669,8 +672,8 @@ def test_validation_diagnostics_omit_pre_blur_psfs(
     )
 
     assert result.diagnostics is not None
-    assert result.diagnostics.pre_blur_psfs is None
-    np.testing.assert_array_equal(result.diagnostics.psd_valid_mask, [True, True])
+    assert result.diagnostics.psfs_ho is None
+    np.testing.assert_array_equal(result.diagnostics.covariance.psd_valid_mask, [True, True])
 
 
 def test_none_diagnostics_omits_diagnostics(
@@ -727,9 +730,9 @@ def test_rotated_roundoff_ctot_remains_active_after_conditioning(
         lo_model=_model(ngs),
     )
 
-    np.testing.assert_array_equal(result.psd_clipped, [True, True])
+    np.testing.assert_array_equal(result.diagnostics.covariance.psd_clipped, [True, True])
     assert result.diagnostics is not None
-    np.testing.assert_array_equal(result.diagnostics.psd_valid_mask, [True, True])
+    np.testing.assert_array_equal(result.diagnostics.covariance.psd_valid_mask, [True, True])
     assert not np.array_equal(result.psfs, science.prediction.psfs)
 
 

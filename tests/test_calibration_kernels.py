@@ -99,7 +99,7 @@ def test_weight_solver_preserves_absolute_response_and_one_ngs_identity():
 @pytest.mark.parametrize("count", [1, 3])
 def test_noise_blur_has_requested_covariance(count):
     model = NoiseBlurModel(0.7, 0.35, 0.65)
-    narrow, broad = model.scales(count)
+    narrow, broad = model.compute_covariance_scales(count)
     assert model.mixture_weight * narrow + (
         1 - model.mixture_weight
     ) * broad == pytest.approx(1)

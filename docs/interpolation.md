@@ -54,14 +54,15 @@ and image orientation. The example FITS reader is
 ```python
 from pathlib import Path
 
-from hybrid_ao_psf import PsfFileProvider, simulate
+from hybrid_ao_psf import MastselModel, PsfFileProvider, simulate
 from psf_fits import read_psf_samples
 
 science_psfs = PsfFileProvider(
     files=sorted(Path("samples/science-psfs").glob("*.fits")),
     reader=read_psf_samples,
 )
-result = simulate(request, science_psfs=science_psfs, ngs_metrics=ngs_interpolator)
+model = MastselModel(mastsel_ini=ini_text, ngs_metrics=ngs_interpolator)
+result = simulate(request, science_psfs, lo_model=model)
 ```
 
 The `psf_fits` import in this example is available when running from
@@ -116,6 +117,49 @@ data, units and precision. Loading preserves the saved fit; it does not select
 another method or refit the samples. RBF files retain ready-to-evaluate SciPy
 evaluators protected by a read-only wrapper. Both interpolator families must come
 from trusted sources because pickle reconstruction can execute Python code.
+
+## Example PSF Libraries
+
+`examples/interpolation/generate_synthetic_ho_psfs.py` writes the HO PSF
+libraries to the `science-psfs` and `ngs-psfs` directories. Science has one
+FITS cube per zenith angle and wavelength. NGS has one FITS cube per zenith
+angle at the sensing wavelength. The synthetic images mix an annular-aperture
+diffraction core with a Moffat halo. One science model fits all science
+cubes jointly, and one NGS model fits all NGS cubes jointly. Both the core
+fraction and halo FWHM depend on airmass and vary linearly with field radius
+from the centre to 60 arcsec. The science core fraction also depends on
+wavelength. The core and saved pupil use the same central obstruction.
+Both libraries use the same rectangular field grid. Points farther than
+60 arcsec from the centre use the fitted values at 60 arcsec. Each saved
+image is normalized to unit sum.
+
+`examples/interpolation/build_interpolators.py` reads the FITS cubes in each
+directory and gets their zenith angles and wavelengths from the primary headers.
+Each primary HDU stores a PSF cube.
+The `XFIELD` and `YFIELD` image extensions give the Cartesian coordinates
+in arcseconds, in the same order as the PSFs. The `PUPIL` image extension
+contains the 2D dimensionless pupil mask. The primary header holds the
+metadata shared by the cube.
+
+| Keyword | Value |
+| --- | --- |
+| `WAVELEN` | Wavelength in micrometres |
+| `PIXSCALE` | Angular pixel scale in milliarcseconds per pixel |
+| `ZENITH` | Zenith angle in degrees |
+| `TELDIAM` | Telescope diameter in metres |
+
+Within each library, the cubes share field positions, image dimensions,
+aperture diameter and pupil mask. Supply a complete rectangular field grid
+for both libraries. Science needs a cube for each zenith angle and
+wavelength combination. NGS cubes share one sensing wavelength. The
+builder writes the science and NGS image interpolators to `science.pkl`
+and `ngs.pkl` in the requested products directory. It also measures FWHM,
+Strehl ratio and encircled energy from the NGS images and saves their
+interpolator as `ngs-metrics.pkl`. The MASTSEL run script passes
+`--skip-ngs-psf` to omit the full NGS image interpolator.
+The example INIs specify where to evaluate these interpolators. Adjust the
+requested coordinates, wavelength and zenith angle to sampled coordinate
+ranges when supplying your own data.
 
 ## Validation And Comparison
 

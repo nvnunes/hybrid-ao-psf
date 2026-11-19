@@ -75,7 +75,7 @@ def test_blur_preserves_covariance_and_matches_gaussian_characteristic_function(
     model = NoiseBlurModel(0.72, 0.32, 0.63, dtype=np.float64)
     covariance = np.array([[4.0, 1.0], [1.0, 2.0]])
     before = covariance.copy()
-    narrow, broad = model.scales(count)
+    narrow, broad = model.compute_covariance_scales(count)
     assert model.mixture_weight * narrow + (
         1 - model.mixture_weight
     ) * broad == pytest.approx(1)

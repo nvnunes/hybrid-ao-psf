@@ -1,9 +1,8 @@
 """Peer-model execution, independent mixture convolution and offline results."""
 
-import json
 import subprocess
 import sys
-from dataclasses import fields, replace
+from dataclasses import replace
 
 import h5py
 import numpy as np
@@ -19,6 +18,7 @@ from hybrid_ao_psf import (
     PsfPrediction,
     PsfSamples,
     build_psf_interpolator,
+    diagnostic_values,
     load_configuration,
     load_result,
     run_configuration,
@@ -27,13 +27,13 @@ from hybrid_ao_psf import (
     save_psf_interpolator,
     save_psf_metric_interpolator,
     save_reconstructor_calibration,
-    save_result,
     save_sensing_calibration,
     simulate,
+    simulate_configuration,
 )
 
-from .test_contracts import make_result
 from .test_e2e_model import synthetic as _synthetic
+from .test_result_io import save_simulation
 
 synthetic = _synthetic
 
@@ -106,19 +106,29 @@ def test_calibrated_engine_matches_independent_mixture_and_roundtrip(
     synthetic, dtype, indices, tmp_path, monkeypatch
 ):
     model, record = synthetic
-    source = Science(dtype)
+    source = Science(np.float64)
 
     def forbidden(*args, **kwargs):
         raise AssertionError("MASTSEL forbidden")
 
-    monkeypatch.setattr("hybrid_ao_psf.engine._prepare_mastsel_context", forbidden)
-    result = simulate(request(record, indices, dtype), source, lo_model=model)
-    assert result.distribution is result.e2e_prediction.distribution
+    monkeypatch.setattr("hybrid_ao_psf.engine._open_mastsel", forbidden)
+    path = tmp_path / "result.h5"
+    result = save_simulation(path, request(record, indices, dtype), source, lo_model=model)
+    prediction = result.diagnostics.e2e_calibrated
+    np.testing.assert_array_equal(
+        prediction.displacement_distribution.covariance,
+        result.diagnostics.covariance.ctot,
+    )
     assert not hasattr(result, "lo_distribution")
+    assert result.diagnostics.psfs_ho.dtype == dtype
+    np.testing.assert_array_equal(
+        result.diagnostics.psfs_ho,
+        np.repeat(source.image.astype(dtype)[None], len(result.psfs), axis=0),
+    )
     expected = independent_blur(
-        result.diagnostics.pre_blur_psfs,
-        result.distribution.weights,
-        result.distribution.covariances.value,
+        result.diagnostics.psfs_ho,
+        prediction.displacement_distribution.weights,
+        prediction.displacement_distribution.covariances.value,
         1.0,
     )
     np.testing.assert_allclose(
@@ -127,125 +137,55 @@ def test_calibrated_engine_matches_independent_mixture_and_roundtrip(
         rtol=2e-6 if dtype == np.float32 else 2e-13,
         atol=1e-9 if dtype == np.float32 else 1e-15,
     )
-    assert result.lo_model is LowOrderModel.E2E_CALIBRATED
-    assert (
-        result.ctot_wavefront
-        is result.angle_to_wavefront_scale
-        is result.effective_mastsel_ini
-        is result.ngs_flux
-        is None
-    )
-    assert not result.psd_clipped.any()
+    assert result.diagnostics.mastsel is None
+    assert result.diagnostics.covariance.psd_clipped is None
     assert result.psfs.dtype == dtype
     assert np.all(result.psfs.sum((1, 2)) < source.image.sum())
     np.testing.assert_array_equal(
         source.image, source.evaluate(x=[0] * u.arcsec).psfs[0]
     )
-    path = save_result(tmp_path / "result.h5", result)
     with h5py.File(path) as root:
-        assert root.attrs["lo_model"] == "e2e-calibrated"
-        assert "effective_mastsel_ini" not in root["configuration"]
-        assert "wavefront" not in root["result/ctot"]
-        stored_prediction = root["result/e2e_prediction"]
-        prediction = result.e2e_prediction
-        total = prediction.noiseless_covariance + prediction.noise_command_covariance
-        for name, expected in (
-            ("coma_response", prediction.coma_response_coefficients),
-            ("noise_prior", prediction.reconstructor_noise_covariance),
-            ("gains", prediction.sensing_gains),
-            ("noise_variances", prediction.wfs_noise_variances),
-            ("atmospheric_command", prediction.atmospheric_command_covariance),
-            ("ho_command", prediction.ho_command_covariance),
-            ("atmospheric_ho_command", prediction.atmospheric_ho_command_covariance),
-            (
-                "science_atmospheric_command",
-                prediction.science_atmospheric_command_covariance,
-            ),
-            ("science_ho_command", prediction.science_ho_command_covariance),
-            ("uncorrected", prediction.science_tilt_covariance),
-            ("noiseless", prediction.noiseless_covariance),
-            ("atmospheric", prediction.atmospheric_residual_covariance),
-            ("ho", prediction.ho_correction),
-            ("noise", prediction.noise_command_covariance),
-            ("total", total),
-        ):
-            assert stored_prediction[name].attrs["unit"] == expected.unit.to_string()
-            np.testing.assert_array_equal(stored_prediction[name][...], expected.value)
-        for name, expected in (
-            ("feedback", prediction.feedback_matrix),
-            ("effective_feedback", prediction.interpolation_feedback_matrix),
-            ("strengths", prediction.interpolation_feedback_eigenvalues),
-            ("projectors", prediction.interpolation_feedback_projectors),
-            ("noise_scales", prediction.noise_covariance_scales),
-        ):
-            np.testing.assert_array_equal(stored_prediction[name][...], expected)
-        assert stored_prediction.attrs["symmetric_feedback_fallback"] == (
-            prediction.used_symmetric_feedback_approximation
-        )
-        assert stored_prediction.attrs["eigenbasis_condition"] == (
-            prediction.eigenbasis_condition_number
-        )
-        assert "used_symmetric_feedback_approximation" not in stored_prediction.attrs
-        assert "eigenbasis_condition_number" not in stored_prediction.attrs
-        assert not {
-            "interpolation_feedback_eigenvalues",
-            "interpolation_feedback_projectors",
-            "noise_covariance_scales",
-            "coma_response_coefficients",
-            "feedback_matrix",
-            "interpolation_feedback_matrix",
-            "reconstructor_noise_covariance",
-            "ngs_metrics",
-            "atmospheric_ho_command_covariance",
-            "science_atmospheric_command_covariance",
-            "science_ho_command_covariance",
-            "atmospheric_command_covariance",
-            "ho_command_covariance",
-            "sensing_gains",
-            "wfs_noise_variances",
-            "science_tilt_covariance",
-            "noiseless_covariance",
-            "atmospheric_residual_covariance",
-            "ho_correction",
-            "noise_command_covariance",
-            "_total",
-        } & stored_prediction.keys()
-        assert "flux" not in root["result/ngs"]
+        assert "diagnostics/mastsel" not in root
+        assert set(root["diagnostics"]) == {"covariance", "e2e_calibrated", "psfs_ho"}
+        stored_prediction = root["diagnostics/e2e_calibrated"]
+        assert "_total" not in stored_prediction
+        assert set(stored_prediction["displacement_distribution"]) == {"weights", "covariances"}
+        assert stored_prediction["sensing_gains"].attrs["units"] == "1"
     loaded = load_result(path)
     np.testing.assert_array_equal(loaded.psfs, result.psfs)
-    np.testing.assert_array_equal(
-        loaded.distribution.covariances, result.distribution.covariances
+    expected_diagnostics = diagnostic_values(result.diagnostics)
+    read_diagnostics = diagnostic_values(loaded.diagnostics)
+    assert expected_diagnostics.keys() == read_diagnostics.keys()
+    for path, value in expected_diagnostics.items():
+        np.testing.assert_equal(read_diagnostics[path], value, err_msg=path)
+    np.testing.assert_allclose(
+        loaded.positions.to_value(u.arcsec), result.positions.to_value(u.arcsec),
+        rtol=0, atol=4 * np.finfo(dtype).eps * np.max(np.abs(result.positions.value)),
     )
-    for name in ("ee", "fwhm", "sr"):
-        np.testing.assert_array_equal(
-            getattr(loaded.e2e_prediction.ngs_metrics, name),
-            getattr(result.e2e_prediction.ngs_metrics, name),
-        )
-    loaded_distribution = loaded.e2e_prediction.distribution
-    predicted_distribution = result.e2e_prediction.distribution
-    np.testing.assert_array_equal(
-        loaded_distribution.weights, predicted_distribution.weights
-    )
-    np.testing.assert_array_equal(
-        loaded_distribution.covariances, predicted_distribution.covariances
-    )
-    for field in fields(result.e2e_prediction):
-        if field.name in ("ngs_metrics", "distribution"):
-            continue
-        np.testing.assert_equal(
-            getattr(loaded.e2e_prediction, field.name),
-            getattr(result.e2e_prediction, field.name),
-        )
-    np.testing.assert_array_equal(loaded.science_positions, result.science_positions)
-    np.testing.assert_array_equal(loaded.ngs_positions, result.ngs_positions)
-    assert loaded.zenith_angle == result.zenith_angle
-    assert dict(loaded.provenance) == dict(result.provenance)
-    assert result.e2e_prediction.dtype == dtype
+    assert result.diagnostics.e2e_calibrated.displacement_distribution.dtype == dtype
     # The calibrated law is observable, rather than just a second route to Ctot.
     gaussian = independent_blur(
-        result.diagnostics.pre_blur_psfs, [1], result.ctot_angle.value[:, None], 1.0
+        result.diagnostics.psfs_ho, [1], result.diagnostics.covariance.ctot.value[:, None], 1.0
     )
     assert np.linalg.norm(result.psfs - gaussian) / np.linalg.norm(result.psfs) > 1e-6
+
+
+def test_e2e_validation_reports_covariance_and_psd_without_debug(synthetic, tmp_path):
+    model, record = synthetic
+    path = tmp_path / "validation.h5"
+    save_simulation(
+        path, request(record, [0], diagnostics="validation"),
+        Science(np.float64), lo_model=model,
+    )
+    with h5py.File(path) as root:
+        assert set(root["diagnostics"]) == {"covariance"}
+    result = load_result(path)
+    diagnostics = result.diagnostics
+    assert diagnostics.covariance.ctot.shape == (len(result.positions), 2, 2)
+    assert diagnostics.covariance.psd_clipped is None
+    assert diagnostics.mastsel is None
+    assert diagnostics.e2e_calibrated is None
+    assert diagnostics.psfs_ho is None
 
 
 def test_model_selection_is_explicit(synthetic):
@@ -269,25 +209,24 @@ def test_model_selection_is_explicit(synthetic):
 
 
 @pytest.mark.parametrize(
-    "corrupt", ["weights", "mixture", "gain", "missing", "model", "precision"]
+    "corrupt", ["weights", "mixture", "gain", "missing", "precision"]
 )
 def test_result_rejects_corrupted_calibrated_state(synthetic, tmp_path, corrupt):
     model, record = synthetic
-    result = simulate(request(record, [0]), Science(np.float64), lo_model=model)
-    path = save_result(tmp_path / "result.h5", result)
+    path = tmp_path / "result.h5"
+    save_simulation(path, request(record, [0]), Science(np.float64), lo_model=model)
     with h5py.File(path, "r+") as root:
+        state = root["diagnostics/e2e_calibrated"]
         if corrupt == "weights":
-            root["result/lo_distribution/weights"][...] = [0.4, 0.6]
+            state["displacement_distribution/weights"][...] = [0.4, 0.6]
         if corrupt == "mixture":
-            root["result/e2e_prediction/mixture_covariances"][...] *= 2
+            state["displacement_distribution/covariances"][...] *= 2
         if corrupt == "gain":
-            root["result/e2e_prediction/gains"][...] = [-1]
+            state["sensing_gains"][...] = [-1]
         if corrupt == "missing":
-            del root["result/e2e_prediction/reconstructor"]
-        if corrupt == "model":
-            del root.attrs["lo_model"]
+            del state["reconstructor"]
         if corrupt == "precision":
-            root.attrs["precision"] = "float32"
+            root["simulation/precision"][()] = "float32"
     with pytest.raises((ValueError, TypeError)):
         load_result(path)
 
@@ -296,27 +235,26 @@ def test_result_rejects_corrupted_calibrated_state(synthetic, tmp_path, corrupt)
 @pytest.mark.parametrize(
     "corrupt,error",
     [
-        ("feedback", "feedback_matrix must equal"),
-        ("effective_feedback", "effective feedback"),
-        ("projectors", "scalar decomposition"),
-        ("strengths", "scalar decomposition"),
-        ("total", "total covariance must equal noiseless plus noise"),
+        ("feedback_matrix", "feedback_matrix must equal"),
+        ("interpolation_feedback_matrix", "effective feedback"),
+        ("interpolation_feedback_projectors", "scalar decomposition"),
+        ("interpolation_feedback_eigenvalues", "scalar decomposition"),
         (
-            "noise_prior_negative",
+            "reconstructor_noise_covariance_negative",
             "reconstructor_noise_covariance must be symmetric positive semidefinite",
         ),
         (
-            "atmospheric_command_negative",
+            "atmospheric_command_covariance_negative",
             "atmospheric_command_covariance must be symmetric positive semidefinite",
         ),
         (
-            "ho_command_negative",
+            "ho_command_covariance_negative",
             "ho_command_covariance must be symmetric positive semidefinite",
         ),
-        ("science_atmospheric_command", "atmospheric residual covariance disagrees"),
-        ("science_ho_command", "HO covariance contribution disagrees"),
+        ("science_atmospheric_command_covariance", "atmospheric residual covariance disagrees"),
+        ("science_ho_command_covariance", "HO covariance contribution disagrees"),
         (
-            "noise_prior_asymmetric",
+            "reconstructor_noise_covariance_asymmetric",
             "reconstructor_noise_covariance must be symmetric positive semidefinite",
         ),
     ],
@@ -325,18 +263,18 @@ def test_result_rejects_inconsistent_scientific_diagnostics(
     synthetic, tmp_path, dtype, corrupt, error
 ):
     model, record = synthetic
-    result = simulate(request(record, [0, 8], dtype), Science(dtype), lo_model=model)
-    path = save_result(tmp_path / "diagnostics.h5", result)
+    path = tmp_path / "diagnostics.h5"
+    save_simulation(path, request(record, [0, 8], dtype), Science(dtype), lo_model=model)
     with h5py.File(path, "r+") as root:
-        state = root["result/e2e_prediction"]
-        if corrupt in ("feedback", "projectors"):
+        state = root["diagnostics/e2e_calibrated"]
+        if corrupt in ("feedback_matrix", "interpolation_feedback_projectors"):
             state[corrupt][...] = 0
-        elif corrupt in ("effective_feedback", "strengths", "total"):
+        elif corrupt in ("interpolation_feedback_matrix", "interpolation_feedback_eigenvalues"):
             state[corrupt][...] *= 2
-        elif corrupt == "noise_prior_negative":
-            state["noise_prior"][...] = -0.1 * np.eye(4)
-        elif corrupt == "noise_prior_asymmetric":
-            state["noise_prior"][0, 1] += 0.1
+        elif corrupt == "reconstructor_noise_covariance_negative":
+            state["reconstructor_noise_covariance"][...] = -0.1 * np.eye(4)
+        elif corrupt == "reconstructor_noise_covariance_asymmetric":
+            state["reconstructor_noise_covariance"][0, 1] += 0.1
         elif corrupt.endswith("_negative"):
             state[corrupt.removesuffix("_negative")][...] = -100 * np.eye(2)
         elif corrupt.startswith("science_"):
@@ -345,15 +283,29 @@ def test_result_rejects_inconsistent_scientific_diagnostics(
         load_result(path)
 
 
+def test_result_rejects_saved_calibrated_clipping(synthetic, tmp_path):
+    path = tmp_path / "result.h5"
+    model, record = synthetic
+    save_simulation(path, request(record, [0]), Science(np.float64), lo_model=model)
+    with h5py.File(path, "r+") as root:
+        root["diagnostics/covariance"].create_dataset("psd_clipped", data=[True, True])
+        specs = root["simulation/diagnostic_fields/covariance"].create_group("psd_clipped")
+        specs.create_dataset("dtype", data="bool")
+        specs.create_dataset("shape", data=["num_sci"], dtype=h5py.string_dtype())
+
+    with pytest.raises(ValueError, match="do not apply covariance clipping"):
+        load_result(path)
+
+
 @pytest.mark.parametrize("dtype", [np.float32, np.float64])
 def test_result_rejects_nonprojectors_at_repeated_strengths(synthetic, tmp_path, dtype):
     model, record = synthetic
-    result = simulate(request(record, [0], dtype), Science(dtype), lo_model=model)
-    eigenvalues = result.e2e_prediction.interpolation_feedback_eigenvalues
+    path = tmp_path / "nonprojectors.h5"
+    result = save_simulation(path, request(record, [0], dtype), Science(dtype), lo_model=model)
+    eigenvalues = result.diagnostics.e2e_calibrated.diagnostics.control.scalar_feedback.strengths
     np.testing.assert_array_equal(eigenvalues, np.repeat(eigenvalues[0], 2))
-    path = save_result(tmp_path / "nonprojectors.h5", result)
     with h5py.File(path, "r+") as root:
-        root["result/e2e_prediction/projectors"][...] = [2 * np.eye(2), -np.eye(2)]
+        root["diagnostics/e2e_calibrated/interpolation_feedback_projectors"][...] = [2 * np.eye(2), -np.eye(2)]
     with pytest.raises(ValueError, match="idempotent projectors"):
         load_result(path)
 
@@ -413,14 +365,32 @@ def test_standalone_and_cli_are_native_free_and_analysis_is_self_contained(
         config.request.ngs_positions.to_value(u.arcsec), [[-1, -1], [1, 1]]
     )
     assert load_configuration(configured, dtype=np.float32).request.dtype == np.float32
+    memory_result = simulate_configuration(config)
+    assert not config.output.exists()
     direct = run_configuration(configured)
-    model_files = json.loads(direct.provenance["e2e_model_inputs"])
-    for name in ("reconstructor", "covariance", "sensing"):
-        assert len(model_files[name]["array_files"]) == 1
-        assert model_files[name]["manifest"].endswith("/model.json")
-        assert "entrypoint" not in model_files[name]
-        assert "payloads" not in model_files[name]
-    assert model_files["coma"]["array_files"] == []
+    np.testing.assert_array_equal(memory_result.psfs, direct.psfs)
+    saved = load_result(config.output)
+    np.testing.assert_array_equal(direct.jitter, saved.jitter)
+    expected_files = {
+        "science_ho_psf_interpolator_path": str(tmp_path / "science.pkl"),
+        "ngs_ho_metric_interpolator_path": str(tmp_path / "metrics.pkl"),
+        **{
+            f"{family}_model_path": str(tmp_path / family / "model.json")
+            for family in ("covariance", "coma", "sensing", "reconstructor")
+        },
+    }
+    with h5py.File(config.output) as output:
+        assert output["simulation/name"].asstr()[()] == "e2e-calibrated"
+        assert output["simulation/base_config"].asstr()[()] == configured.read_text()
+        assert "diagnostics" not in output
+        assert {
+            key: output["simulation"][key].asstr()[()] for key in expected_files
+        } == expected_files
+        assert output["options/zenith_angle"][()] == 20.0
+        np.testing.assert_allclose(output["options/ngs_r"], [np.sqrt(2), np.sqrt(2)])
+        np.testing.assert_array_equal(output["options/ngs_theta"], [225.0, 45.0])
+        np.testing.assert_array_equal(output["options/ngs_magnitude"], [9.0, 9.0])
+        assert "ngs_flux" not in output["options"]
     code = """
 import builtins,sys
 original=builtins.__import__
@@ -444,8 +414,8 @@ main([sys.argv[1],'--output',sys.argv[2]])
     (tmp_path / "science.pkl").unlink()
     (tmp_path / "metrics.pkl").unlink()
     np.testing.assert_array_equal(
-        load_result(tmp_path / "cli.h5").distribution.covariances,
-        loaded.distribution.covariances,
+        load_result(tmp_path / "cli.h5").psfs,
+        loaded.psfs,
     )
 
 
@@ -464,29 +434,6 @@ def test_distribution_owns_values_and_units():
             value = value.base
 
 
-@pytest.mark.parametrize("version", [1, 2])
-def test_legacy_mastsel_loads_without_model_or_distribution(version, tmp_path):
-    expected = replace(make_result(), dtype=np.float64)
-    path = save_result(tmp_path / "legacy.h5", expected)
-    with h5py.File(path, "r+") as root:
-        root.attrs["schema_version"] = version
-        del root.attrs["lo_model"]
-        del root["result/lo_distribution"]
-        del root["result/coordinates"]
-        if version == 1:
-            del root.attrs["precision"]
-    loaded = load_result(path)
-    assert loaded.lo_model is LowOrderModel.MASTSEL
-    assert loaded.e2e_prediction is None
-    assert loaded.science_positions is None
-    assert loaded.dtype == (None if version == 1 else np.dtype("float64"))
-    np.testing.assert_array_equal(loaded.psfs, expected.psfs)
-    np.testing.assert_array_equal(loaded.ctot_wavefront, expected.ctot_wavefront)
-    np.testing.assert_array_equal(
-        loaded.distribution.covariance, expected.ctot_angle
-    )
-
-
 @pytest.mark.parametrize(
     "field", ["precision", "ngs_flux_photon_per_s", "ngs_metric_file"]
 )
@@ -502,11 +449,9 @@ def test_engine_result_owned_backing_and_unit_metadata(synthetic):
     result = simulate(request(record, [0]), Science(np.float64), lo_model=model)
     for owner, name in (
         (result, "psfs"),
-        (result, "ctot_angle"),
-        (result, "science_positions"),
-        (result, "zenith_angle"),
-        (result.diagnostics, "pre_blur_psfs"),
-        (result.diagnostics, "ctot_angle_trace_min"),
+        (result.diagnostics.covariance, "ctot"),
+        (result, "positions"),
+        (result.diagnostics, "psfs_ho"),
     ):
         original = getattr(owner, name)
         expected = original.copy()
@@ -519,5 +464,3 @@ def test_engine_result_owned_backing_and_unit_metadata(synthetic):
                 assert getattr(owner, name).unit == expected.unit
             value = value.base
         np.testing.assert_array_equal(getattr(owner, name), expected)
-    with pytest.raises(ValueError, match="do not apply covariance clipping"):
-        replace(result, psd_clipped=np.ones(len(result.psfs), dtype=bool))

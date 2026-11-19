@@ -574,7 +574,7 @@ class E2ECalibration(ABC):
                 seed=settings.seed,
             )
         photometry = self.photometry(zenith_angle)
-        expected = photometry.photons_per_frame(magnitude)
+        expected = photometry.magnitude_to_photons_per_frame(magnitude)
         if expected.ndim or not np.isclose(
             expected.to_value(u.photon),
             spot.photons_per_frame.to_value(u.photon),
@@ -673,7 +673,7 @@ class E2ECalibration(ABC):
                 image=prediction.psfs[0],
                 pixel_scale=prediction.pixel_scale,
                 wavelength=wavelength,
-                photons_per_frame=photometry.photons_per_frame(magnitude),
+                photons_per_frame=photometry.magnitude_to_photons_per_frame(magnitude),
                 displacements=np.array([[0, 0], [1, 0], [-1, 0], [0, 1], [0, -1]])
                 * delta,
                 dtype=self.configuration.dtype,

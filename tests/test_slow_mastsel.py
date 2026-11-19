@@ -6,10 +6,10 @@ from dataclasses import replace
 from io import StringIO
 from pathlib import Path
 
+import h5py
 import numpy as np
 import pytest
 from ao_core.models.config import parse_ini
-from ao_core.photometry import WFSPhotometryConfig, photons_per_frame_to_magnitudes
 from astropy import units as u
 
 from hybrid_ao_psf import (
@@ -106,18 +106,28 @@ def test_real_mastsel_engine_matches_retained_hybrid_golden(tmp_path: Path) -> N
     assert result.psfs.shape == (3, PSF_SIZE, PSF_SIZE)
     assert result.psfs.dtype == np.float64
     assert result.diagnostics is not None
-    assert not np.any(result.psd_clipped)
-    assert result.provenance["configuration"] == str(configuration_path)
+    assert not np.any(result.diagnostics.covariance.psd_clipped)
+    with h5py.File(tmp_path / "results" / "hybrid.h5") as saved:
+        settings = saved["simulation"]
+        assert settings["name"].asstr()[()] == "mastsel"
+        assert settings["base_config"].asstr()[()] == configuration_path.read_text()
+        assert settings["science_ho_psf_interpolator_path"].asstr()[()] == str(science_path)
+        assert settings["ngs_ho_metric_interpolator_path"].asstr()[()] == str(ngs_path)
+        assert saved["setup/ngs_magnitude_zeropoint"][()] == 1e10
+        assert saved["options/ngs_magnitude"].shape == (3,)
+        assert saved["options/ngs_r"].shape == (3,)
+        flux_shape = settings["diagnostic_fields/mastsel/ngs_flux/shape"].asstr()[...]
+        np.testing.assert_array_equal(flux_shape, ["num_ngs"])
     np.testing.assert_array_equal(persisted.psfs, result.psfs)
     np.testing.assert_array_equal(cli_result.psfs, result.psfs)
     np.testing.assert_allclose(
-        result.ngs_metrics.ee.to_value(u.one),
-        np.array([0.42, 0.40, 0.38], dtype=result.ngs_metrics.dtype),
+        result.diagnostics.mastsel.ngs_metrics.ee.to_value(u.one),
+        np.array([0.42, 0.40, 0.38], dtype=result.diagnostics.mastsel.ngs_metrics.dtype),
         rtol=0.0,
         atol=1e-12,
     )
     np.testing.assert_allclose(
-        result.ctot_angle.to_value(u.mas**2), golden["ctot_mas2"], rtol=1e-5, atol=1e-7
+        result.diagnostics.covariance.ctot.to_value(u.mas**2), golden["ctot_mas2"], rtol=1e-5, atol=1e-7
     )
     np.testing.assert_allclose(
         result.jitter.to_value(u.mas), golden["jitter"], rtol=1e-5, atol=1e-7
@@ -133,42 +143,31 @@ def test_real_mastsel_engine_matches_retained_hybrid_golden(tmp_path: Path) -> N
         atol=1e-7,
     )
 
-    # The same MASTSEL-only INI and loaded providers also work through the
-    # public Python magnitude path, independently of AO Predict.
+    # Compare the compatibility conversion against a direct effective rate.
     configuration = load_configuration(configuration_path, dtype=np.float64)
-    zeropoint = 1.0e10 * u.photon / (u.m**2 * u.s)
-    photometry = WFSPhotometryConfig(
-        telescope_diameter=TELESCOPE_DIAMETER_M * u.m,
-        n_channels=1.0,
-        frame_rate=500.0 * u.Hz,
-        zeropoint=zeropoint,
-    )
-    magnitudes = photons_per_frame_to_magnitudes(
-        configuration.request.ngs_flux / (500.0 * u.Hz), photometry
-    )
     science = load_psf_interpolator(science_path)
     model = MastselModel(
         mastsel_ini=configuration.mastsel_ini,
         ngs_metrics=load_psf_metric_interpolator(ngs_path),
+        ngs_magnitude_zeropoint=configuration.ngs_magnitude_zeropoint,
         non_psd_policy=configuration.non_psd_policy,
-        ngs_magnitude_zeropoint=zeropoint,
     )
-    magnitude_result = simulate(
+    direct_flux_result = simulate(
         replace(
             configuration.request,
-            ngs_flux=None,
-            ngs_magnitude=magnitudes,
+            ngs_flux=np.full(3, 7.744945e7) * u.photon / u.s,
+            ngs_magnitude=None,
         ),
         science,
         lo_model=model,
     )
     np.testing.assert_allclose(
-        magnitude_result.ngs_flux.value, result.ngs_flux.value, rtol=1e-14
+        direct_flux_result.diagnostics.mastsel.ngs_flux.value, result.diagnostics.mastsel.ngs_flux.value, rtol=1e-14
     )
     np.testing.assert_allclose(
-        magnitude_result.ctot_wavefront.value, result.ctot_wavefront.value, rtol=1e-12
+        direct_flux_result.diagnostics.covariance.ctot.value, result.diagnostics.covariance.ctot.value, rtol=1e-12
     )
-    np.testing.assert_allclose(magnitude_result.psfs, result.psfs, rtol=1e-6, atol=1e-7)
+    np.testing.assert_allclose(direct_flux_result.psfs, result.psfs, rtol=1e-6, atol=1e-7)
 
     observed = []
 
@@ -180,18 +179,17 @@ def test_real_mastsel_engine_matches_retained_hybrid_golden(tmp_path: Path) -> N
         science,
         lo_model=replace(model, ctot_correction=HybridCtotCorrection(noop)),
     )
-    np.testing.assert_array_equal(no_op.ctot_wavefront, result.ctot_wavefront)
+    np.testing.assert_array_equal(no_op.diagnostics.covariance.ctot, result.diagnostics.covariance.ctot)
     np.testing.assert_array_equal(no_op.psfs, result.psfs)
     assert len(observed) == 1
     assert observed[0].measurement_noise is not None
 
 
 @pytest.mark.slow_mastsel
-@pytest.mark.parametrize("count", [1, 2, 3])
-def test_capture_noise_matches_native_fixed_gain_expression(count):
+@pytest.mark.parametrize(("count", "frame_rate"), [(1, 500), (2, 450), (3, 400)])
+def test_capture_noise_matches_native_fixed_gain_expression(count, frame_rate):
     """Compare recovered noise with native zero-atmosphere expressions per NGS."""
     ngs_x, ngs_y = _ngs_cartesian()
-    rates = np.array([500, 450, 400])[:count] * u.Hz
     flux = np.array([25000, 16000, 10000])[:count] * u.photon / u.s
     request = HybridRequest(
         science_positions=[[0, 0], [30, 0], [0, 30]] * u.arcsec,
@@ -206,16 +204,9 @@ def test_capture_noise_matches_native_fixed_gain_expression(count):
         np.full(count, 0.24) * u.one,
     )
     ini = _reference_ini()
-    with _mastsel._prepare_mastsel_context(
-        request,
-        metrics,
-        parse_ini(ini),
-        ini,
-        rates,
-        flux,
-        None,
-    ) as context:
-        model = context.mastsel
+    with _mastsel._open_mastsel(parse_ini(ini), ini) as model:
+        scale = _mastsel._mastsel_angle_to_wavefront_scale(model)
+        lo_frame_rate = frame_rate * u.Hz
         native = model.computeNoiseResidual
         expected = []
 
@@ -234,19 +225,24 @@ def test_capture_noise_matches_native_fixed_gain_expression(count):
             return result
 
         model.computeNoiseResidual = record_native
-        baseline = _mastsel._compute_mastsel_ctot(context)
+        baseline = _mastsel._compute_mastsel_ctot(
+            model, request, metrics, lo_frame_rate, flux
+        )
         expected.clear()
-        with _mastsel._capture_mastsel(context) as captured:
-            repeated = _mastsel._compute_mastsel_ctot(context)
-        completed = _mastsel._complete_mastsel_context(context, captured)
+        with _mastsel._capture_mastsel(model) as captured:
+            repeated = _mastsel._compute_mastsel_ctot(
+                model, request, metrics, lo_frame_rate, flux
+            )
+        statistics = _mastsel._collect_mastsel_statistics(
+            model, captured, request, lo_frame_rate, scale
+        )
         np.testing.assert_array_equal(repeated, baseline)
         np.testing.assert_allclose(
-            np.diag(completed.mastsel_statistics.measurement_noise.value),
+            np.diag(statistics.measurement_noise.value),
             expected,
             rtol=2e-13,
             atol=1e-13,
         )
-        assert completed.mastsel is model
         assert "computeCovMatrices" not in model.__dict__
         assert "buildReconstuctor2" not in model.__dict__
 

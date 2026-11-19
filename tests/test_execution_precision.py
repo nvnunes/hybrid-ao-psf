@@ -11,11 +11,11 @@ from hybrid_ao_psf import (
     PsfPrediction,
     load_result,
     save_result,
-    simulate,
 )
 
 from .test_contracts import make_result
 from .test_engine import _model, _providers, _request, _ScienceProvider
+from .test_result_io import save_simulation
 
 
 @pytest.mark.parametrize("dtype", [np.float32, np.float64])
@@ -43,7 +43,8 @@ def test_complete_blur_statistics_and_result_keep_selected_values(
             source, old.prediction.pixel_scale, old.prediction.metadata, dtype=dtype
         )
     )
-    result = simulate(request, science, lo_model=_model(ngs))
+    path = tmp_path / "result.h5"
+    result = save_simulation(path, request, science, lo_model=_model(ngs))
     # Independent NumPy double FFT reference, with explicitly rounded inputs
     # in float32 mode; no engine OTF or padding helpers are used here.
     cov = (
@@ -69,64 +70,42 @@ def test_complete_blur_statistics_and_result_keep_selected_values(
         rtol=8e-7 if dtype == np.float32 else 2e-14,
         atol=2e-7 if dtype == np.float32 else 2e-15,
     )
-    assert result.dtype == dtype and result.psfs.dtype == dtype
+    assert result.psfs.dtype == dtype
     for quantity in (
-        result.ctot_wavefront,
-        result.ctot_angle,
+        result.diagnostics.covariance.ctot,
         result.jitter,
-        result.ngs_flux,
+        result.diagnostics.mastsel.ngs_flux,
         result.metadata.pixel_scale,
-        result.ngs_metrics.fwhm,
+        result.diagnostics.mastsel.ngs_metrics.fwhm,
     ):
         assert quantity.dtype == dtype
-    assert result.diagnostics.pre_blur_psfs.dtype == dtype
+    assert result.diagnostics.psfs_ho.dtype == dtype
     if dtype == np.float64:
-        assert result.diagnostics.pre_blur_psfs[0, 4, 4] == 1.0 + 1e-8
-        assert result.diagnostics.pre_blur_psfs[0, 4, 4] != np.float32(1.0 + 1e-8)
+        assert result.diagnostics.psfs_ho[0, 4, 4] == 1.0 + 1e-8
+        assert result.diagnostics.psfs_ho[0, 4, 4] != np.float32(1.0 + 1e-8)
     metric = compute_psf_fwhm(result.psfs, result.metadata, dtype=dtype)
     assert metric.dtype == dtype
-    path = save_result(tmp_path / "result.h5", result)
     loaded = load_result(path)
-    assert loaded.dtype == dtype
+    assert loaded.diagnostics.covariance.ctot.dtype == dtype
+    assert loaded.psfs.dtype == dtype
     np.testing.assert_array_equal(loaded.psfs, result.psfs)
     np.testing.assert_array_equal(
         compute_psf_fwhm(loaded.psfs, loaded.metadata, dtype=dtype), metric
     )
 
 
-def test_legacy_mixed_result_keeps_every_stored_floating_array(tmp_path):
-    result = replace(make_result(), dtype=np.float64)
-    path = save_result(tmp_path / "legacy.h5", result)
-    stored = {}
+def test_result_rejects_mixed_precision_declaration_on_load(tmp_path):
+    path = save_result(tmp_path / "mixed.h5", make_result())
     with h5py.File(path, "r+") as root:
-        root.attrs["schema_version"] = 1
-        del root.attrs["precision"]
-        ee = root["result/ngs_metrics/ee"][...].astype(np.float32)
-        del root["result/ngs_metrics/ee"]
-        ds = root.create_dataset("result/ngs_metrics/ee", data=ee)
-        ds.attrs["unit"] = ""
-        pixels = root["result/psfs"][...].astype(np.float32)
-        del root["result/psfs"]
-        root.create_dataset("result/psfs", data=pixels)
+        root["simulation/precision"][()] = "mixed"
 
-        def snapshot(name, item):
-            if isinstance(item, h5py.Dataset) and item.dtype.kind == "f":
-                stored[name] = item[...]
-
-        root.visititems(snapshot)
-    loaded = load_result(path)
-    assert loaded.dtype is None
-    assert loaded.psfs.dtype == np.float32 and loaded.ctot_angle.dtype == np.float64
-    rewritten = save_result(tmp_path / "rewritten.h5", loaded)
-    with h5py.File(rewritten) as root:
-        for name, values in stored.items():
-            assert root[name].dtype == values.dtype
-            np.testing.assert_array_equal(root[name][...], values)
+    with pytest.raises(ValueError, match="precision|float32 or float64"):
+        load_result(path)
 
 
 def test_result_declared_precision_mismatch_is_rejected(tmp_path):
     path = save_result(tmp_path / "bad.h5", make_result())
     with h5py.File(path, "r+") as root:
-        root.attrs["precision"] = "float64"
-    with pytest.raises(ValueError, match="precision mismatch"):
+        root["simulation/precision"][()] = "float64"
+    with pytest.raises(ValueError, match="must have dtype float64"):
         load_result(path)

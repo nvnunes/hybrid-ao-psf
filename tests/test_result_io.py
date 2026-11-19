@@ -5,17 +5,24 @@ from pathlib import Path
 import h5py
 import numpy as np
 import pytest
+from ao_core.io import collect_schema_issues, read_result
 from astropy import units as u
 
 from hybrid_ao_psf import (
-    RESULT_SCHEMA,
-    RESULT_SCHEMA_VERSION,
     load_result,
     result_io,
     save_result,
+    simulate,
 )
 
 from .test_contracts import make_result
+
+
+def save_simulation(path, request, science, *, lo_model):
+    """Write the result from a publicly configured in-memory simulation."""
+    result = simulate(request, science, lo_model=lo_model)
+    save_result(path, result)
+    return result
 
 
 def test_result_hdf5_round_trip(tmp_path: Path) -> None:
@@ -23,134 +30,135 @@ def test_result_hdf5_round_trip(tmp_path: Path) -> None:
     path = save_result(tmp_path / "nested" / "result.h5", expected)
 
     with h5py.File(path, "r") as root:
-        assert root.attrs["schema"] == RESULT_SCHEMA
-        assert root.attrs["schema_version"] == RESULT_SCHEMA_VERSION
-        assert "result/source_metadata" not in root
-        assert "configuration/effective_mastsel_ini" in root
-        assert "diagnostics/psd_valid_mask" in root
-        assert "diagnostics/ctot_angle_trace_mean" in root
-        assert "diagnostics/ctot_angle_determinant_mean" in root
-        assert "diagnostics/pre_blur_psfs" in root
+        assert not collect_schema_issues(root)
+        assert read_result(root)["stats"]["jitter"].unit == u.mas
+        assert set(root) == {
+            "setup",
+            "options",
+            "simulation",
+            "meta",
+            "psfs",
+            "stats",
+            "diagnostics",
+        }
+        np.testing.assert_array_equal(root["setup/sci_r"], [0.0, 1.0])
+        np.testing.assert_array_equal(root["setup/sci_theta"], [0.0, 0.0])
+        assert root["options/wavelength"].attrs["units"] == "um"
+        assert root["simulation/precision"].asstr()[()] == "float32"
+        assert root["meta/tel_pupil"].attrs["units"] == "1"
+        assert root["psfs/data"].shape == (2, 4, 4)
+        assert root["stats/jitter"].attrs["units"] == "mas"
+        rates = root["diagnostics/mastsel/frame_rate"]
+        assert rates.dtype == expected.psfs.dtype and rates.attrs["units"] == "Hz"
+        assert rates.shape == () and rates[()] == 500.0
+        assert "diagnostics/covariance/psd_valid_mask" in root
+        assert "diagnostics/mastsel/effective_ini" in root
+        assert "diagnostics/psfs_ho" in root
 
     actual = load_result(path)
+    assert actual.diagnostics.mastsel.frame_rate.isscalar
+    assert (
+        actual.diagnostics.mastsel.frame_rate == expected.diagnostics.mastsel.frame_rate
+    )
     np.testing.assert_array_equal(actual.psfs, expected.psfs)
     np.testing.assert_array_equal(
         actual.metadata.tel_pupil, expected.metadata.tel_pupil
     )
     np.testing.assert_allclose(
-        actual.ctot_wavefront.to_value(u.nm**2), expected.ctot_wavefront.value
+        actual.diagnostics.mastsel.ngs_metrics.fwhm.to_value(u.mas),
+        expected.diagnostics.mastsel.ngs_metrics.fwhm.value,
     )
-    np.testing.assert_allclose(
-        actual.ngs_metrics.fwhm.to_value(u.mas), expected.ngs_metrics.fwhm.value
+    np.testing.assert_array_equal(
+        actual.diagnostics.covariance.psd_clipped,
+        expected.diagnostics.covariance.psd_clipped,
     )
-    np.testing.assert_array_equal(actual.psd_clipped, expected.psd_clipped)
-    assert actual.effective_mastsel_ini == expected.effective_mastsel_ini
-    assert dict(actual.provenance) == dict(expected.provenance)
+    assert (
+        actual.diagnostics.mastsel.effective_ini
+        == expected.diagnostics.mastsel.effective_ini
+    )
     assert actual.diagnostics is not None
     assert expected.diagnostics is not None
     np.testing.assert_array_equal(
-        actual.diagnostics.psd_valid_mask,
-        expected.diagnostics.psd_valid_mask,
-    )
-    assert (
-        actual.diagnostics.ctot_angle_trace_mean
-        == expected.diagnostics.ctot_angle_trace_mean
-    )
-    assert (
-        actual.diagnostics.ctot_angle_determinant_mean
-        == expected.diagnostics.ctot_angle_determinant_mean
+        actual.diagnostics.covariance.psd_valid_mask,
+        expected.diagnostics.covariance.psd_valid_mask,
     )
     np.testing.assert_array_equal(
-        actual.diagnostics.pre_blur_psfs,
-        expected.diagnostics.pre_blur_psfs,
+        actual.diagnostics.covariance.ctot, expected.diagnostics.covariance.ctot
+    )
+    np.testing.assert_array_equal(
+        actual.diagnostics.psfs_ho,
+        expected.diagnostics.psfs_ho,
     )
     assert not actual.psfs.flags.writeable
 
 
-def test_version_three_result_with_source_metadata_still_loads(tmp_path: Path) -> None:
-    expected = make_result()
-    path = save_result(tmp_path / "result-v3.h5", expected)
+def test_load_result_rejects_v6_layout_without_polar_grid(tmp_path: Path) -> None:
+    path = save_result(tmp_path / "result.h5", make_result(diagnostics=False))
     with h5py.File(path, "r+") as root:
-        root.attrs["schema_version"] = 3
-        source_metadata = root["result"].create_group("source_metadata")
-        value = source_metadata.create_dataset("old_value", data=expected.dtype.type(1))
-        value.attrs["unit"] = "1"
+        root.attrs["schema"] = "hybrid-ao-psf-result"
+        root.attrs["schema_version"] = 6
+        del root["setup/sci_r"]
+        del root["setup/sci_theta"]
+        root["setup"].create_dataset("science_positions", data=[[0, 0], [1, 0]])
 
+    with pytest.raises(ValueError, match="science"):
+        load_result(path)
+
+
+@pytest.mark.parametrize("dtype", [np.float32, np.float64])
+def test_polar_storage_preserves_order_and_cartesian_positions(tmp_path, dtype):
+    positions = np.array([[0, 0], [-14, -0.24]], dtype=dtype) * u.arcsec
+    result = replace(
+        make_result(diagnostics=False),
+        positions=positions,
+        psfs=np.arange(1, 33, dtype=dtype).reshape(2, 4, 4),
+    )
+    path = save_result(tmp_path / "result.h5", result)
     loaded = load_result(path)
-    np.testing.assert_array_equal(loaded.psfs, expected.psfs)
-    assert loaded.metadata.pixel_scale == expected.metadata.pixel_scale
-
-
-def test_correction_identity_round_trips_without_runtime_state(tmp_path):
-    expected = replace(
-        make_result(),
-        provenance={"ctot_corrections": "example", "fit_path": "/fits/fit.json"},
+    assert loaded.positions.dtype == dtype
+    tolerance = 4 * np.finfo(dtype).eps * np.max(np.abs(positions.value))
+    np.testing.assert_allclose(
+        loaded.positions.value, positions.value, rtol=0, atol=tolerance
     )
-    path = save_result(tmp_path / "corrected.h5", expected)
+    np.testing.assert_array_equal(loaded.psfs, result.psfs)
+    np.testing.assert_array_equal(loaded.jitter, result.jitter)
+
+
+def test_minimal_result_contains_no_diagnostics(tmp_path):
+    expected = make_result(diagnostics=False)
+    path = save_result(tmp_path / "result.h5", expected)
+
+    with h5py.File(path, "r") as root:
+        assert set(root) == {"setup", "options", "simulation", "meta", "psfs", "stats"}
+        assert set(root["options"]) == {"wavelength"}
+        assert root["simulation/diagnostics_level"].asstr()[()] == "none"
+        assert root["simulation/extra_stat_fields/jitter"].asstr()[()] == "mas"
     actual = load_result(path)
-    assert dict(actual.provenance) == dict(expected.provenance)
-    with h5py.File(path) as root:
-        assert "mastsel_statistics" not in root and "ctot_correction" not in root
-
-
-def test_magnitude_provenance_round_trip(tmp_path: Path) -> None:
-    expected = replace(
-        make_result(),
-        ngs_magnitude=np.array([12.0, 15.0]) * u.mag,
-        ngs_magnitude_zeropoint=6_277_173_913.043478 * u.photon / (u.m**2 * u.s),
-    )
-    path = save_result(tmp_path / "magnitude.h5", expected)
-    with h5py.File(path) as root:
-        assert "result/ngs/magnitude" in root
-        assert "result/ngs/magnitude_zeropoint" in root
-    actual = load_result(path)
-    np.testing.assert_array_equal(
-        actual.ngs_magnitude.value, expected.ngs_magnitude.value
-    )
-    assert actual.ngs_magnitude_zeropoint == expected.ngs_magnitude_zeropoint
-
-
-def test_direct_flux_result_omits_magnitude_provenance(tmp_path: Path) -> None:
-    path = save_result(tmp_path / "flux.h5", make_result())
-    with h5py.File(path) as root:
-        assert "result/ngs/magnitude" not in root
-        assert "result/ngs/magnitude_zeropoint" not in root
-    actual = load_result(path)
-    assert actual.ngs_magnitude is None
-    assert actual.ngs_magnitude_zeropoint is None
+    assert actual.diagnostics is None
+    np.testing.assert_array_equal(actual.psfs, expected.psfs)
+    np.testing.assert_array_equal(actual.jitter, expected.jitter)
 
 
 def test_validation_result_round_trip_omits_debug_psfs(tmp_path: Path) -> None:
-    expected = make_result()
-    assert expected.diagnostics is not None
-    expected = replace(
-        expected,
-        diagnostics=replace(expected.diagnostics, pre_blur_psfs=None),
-    )
+    expected = make_result(debug=False)
 
     path = save_result(tmp_path / "validation.h5", expected)
 
     with h5py.File(path, "r") as root:
-        assert "diagnostics/psd_valid_mask" in root
-        assert "diagnostics/pre_blur_psfs" not in root
+        assert "diagnostics/covariance/psd_valid_mask" in root
+        assert "diagnostics/psfs_ho" not in root
     actual = load_result(path)
     assert actual.diagnostics is not None
-    assert actual.diagnostics.pre_blur_psfs is None
+    assert actual.diagnostics.psfs_ho is None
+    assert actual.diagnostics.mastsel.effective_ini is None
 
 
-def test_load_result_rejects_diagnostics_inconsistent_with_ctot(
-    tmp_path: Path,
-) -> None:
+def test_load_result_rejects_jitter_inconsistent_with_ctot(tmp_path: Path) -> None:
     path = save_result(tmp_path / "result.h5", make_result())
     with h5py.File(path, "r+") as root:
-        for name in (
-            "ctot_angle_trace_min",
-            "ctot_angle_trace_max",
-            "ctot_angle_trace_mean",
-        ):
-            root[f"diagnostics/{name}"][...] = 2.0
+        root["stats/jitter"][...] *= 2
 
-    with pytest.raises(ValueError, match="ctot_angle_trace_min must match"):
+    with pytest.raises(ValueError, match="jitter must equal"):
         load_result(path)
 
 
@@ -183,7 +191,7 @@ def test_load_result_rejects_unknown_schema(tmp_path: Path) -> None:
         root.attrs["schema"] = "other"
         root.attrs["schema_version"] = 99
 
-    with pytest.raises(ValueError, match="Unsupported"):
+    with pytest.raises(ValueError, match="options/wavelength"):
         load_result(path)
 
 

@@ -330,7 +330,9 @@ class _CovarianceInterpolator:
 
     def __init__(self, arrays, grid_precision=None):
         self.grid_precision = (
-            arrays["C_t_t"].dtype if grid_precision is None else np.dtype(grid_precision)
+            arrays["C_t_t"].dtype
+            if grid_precision is None
+            else np.dtype(grid_precision)
         )
         self.dtype = validate_psf_dtype(arrays["C_t_t"].dtype)
         self.arrays = {name: _readonly(value) for name, value in arrays.items()}
@@ -547,7 +549,9 @@ class CovarianceFunctions:
                 raise ValueError(f"invalid normalized covariance table {name}")
         result = object.__new__(cls)
         object.__setattr__(result, "_grid_precision", grid_precision)
-        object.__setattr__(result, "_interpolator", _CovarianceInterpolator(arrays, grid_precision))
+        object.__setattr__(
+            result, "_interpolator", _CovarianceInterpolator(arrays, grid_precision)
+        )
         object.__setattr__(
             result, "_controller", _controller_at_precision(controller, dtype)
         )
@@ -613,7 +617,9 @@ class CovarianceFunctions:
         """
         return MappingProxyType(
             {
-                name: u.Quantity(self._interpolator.arrays[name], u.Unit(unit), copy=False)
+                name: u.Quantity(
+                    self._interpolator.arrays[name], u.Unit(unit), copy=False
+                )
                 for name, (_, _, unit) in FUNCTIONS.items()
             }
         )
@@ -661,9 +667,9 @@ class CovarianceFunctions:
             for value in [*args, zenith_angle.value]
         ):
             raise ValueError("covariance coordinates and feedback must be real")
-        return self._interpolator.evaluate(name, args, zenith_angle.to_value(u.deg)) * u.Unit(
-            FUNCTIONS[name][2]
-        )
+        return self._interpolator.evaluate(
+            name, args, zenith_angle.to_value(u.deg)
+        ) * u.Unit(FUNCTIONS[name][2])
 
     def C_t_t(
         self,
@@ -977,12 +983,16 @@ def build_covariance_calibration(
                 if right:
                     args.append(plane.settings.feedback[-1])
                     index.append(len(plane.settings.feedback) - 1)
-                actual = model._interpolator.evaluate(name, args, plane.zenith_angle.value)
+                actual = model._interpolator.evaluate(
+                    name, args, plane.zenith_angle.value
+                )
                 expected = plane.tables[name].value[tuple(index)]
                 scale = max(float(np.linalg.norm(expected)), np.finfo(float).tiny)
                 maximum = max(maximum, float(np.linalg.norm(actual - expected) / scale))
             if maximum > max(1e-12, 16 * np.finfo(first.dtype).eps):
-                raise ValueError(f"interpolation did not reproduce grid values for {name}")
+                raise ValueError(
+                    f"interpolation did not reproduce grid values for {name}"
+                )
             errors[f"za{plane.zenith_angle.value:g}_{name}"] = maximum
     return CovarianceCalibrationResult(
         model=model,

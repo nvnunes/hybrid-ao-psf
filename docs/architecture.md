@@ -71,31 +71,31 @@ evaluation; validation helpers are private. Public comparison operations measure
 interpolation errors against reference samples. The engine converts built-in
 providers internally when the request requires another precision. The combined
 configuration boundary is `HybridConfiguration` plus `load_configuration()`;
-standalone results use `save_result()` and `load_result()`.
+standalone runs write results through `run_configuration()`.
 
-`HybridCtotCorrection` pairs a callable with immutable static provenance.
-`HybridCtotContext` borrows the live runtime and resolved inputs;
-`HybridMastselStatistics` exposes read-only mathematical baseline quantities.
+`HybridCtotCorrection` pairs a callable with optional input file paths.
+`HybridCtotContext` passes resolved observation and controller inputs with
+the read-only baseline quantities in `HybridMastselStatistics`.
 The private MASTSEL adapter owns runtime construction, instance-local capture
 and fixed-gain noise recovery. It does not modify MASTSEL itself. Correction
 models and calibration selection stay with the caller. The engine invokes the
-callback before conditioning and its single Gaussian blur; it persists only the
-supplied static provenance. See the [API guide](api.md#covariance-corrections).
+callback before conditioning and its single Gaussian blur. See the [API guide](api.md#covariance-corrections).
 
 `simulate()` borrows its immutable providers, dispatches the supplied
 `MastselModel` or `E2ECalibratedModel` and returns a new result.
-`simulate_configuration()` constructs the model selected by the INI and calls
-the same operation for Python and CLI execution.
-The MASTSEL path reads the active NGS frame rate from `RTC.SensorFrameRate_LO` in the
-effective MASTSEL configuration and reports the applied rates in the result.
+`simulate_configuration()` constructs the model selected by the INI and runs
+it in memory. The CLI uses `run_configuration()`, which saves the result and
+records the observation inputs and file paths.
+The MASTSEL path reads the scalar LO frame rate from `RTC.SensorFrameRate_LO` in the
+effective configuration and expands it to one value per NGS for the native call.
 For magnitude requests it also reads `telescope.TelescopeDiameter` and the
 first `sensor_LO.NumberLenslets` value, converts once before MASTSEL, and
 reports the WFS-effective photon rates, supplied magnitudes and zeropoint.
-The MASTSEL INI contains no instrument zeropoint; the standalone command
-supplies the photon rates through its `[hybrid]` section.
+The standalone `[hybrid]` section supplies magnitudes and their zeropoint.
+Hybrid converts them through AO Core photometry.
 Hybrid passes the effective configuration in memory on MASTSEL releases
 that accept it. Earlier supported releases read the same configuration
-through their file interface. The effective INI is saved in both cases.
+through their file interface. Both paths expose the effective INI in debug diagnostics.
 The E2E path receives a prepared `E2ECalibratedModel` with its own metrics,
 photometry and controller settings. It convolves the science PSFs with the full
 calibrated Gaussian mixture; it does not construct MASTSEL or accept its INI,
@@ -152,10 +152,8 @@ assign celestial north or east to either Cartesian axis.
 
 ## Saved File Contracts
 
-Interpolator files and standalone HDF5 results use project-owned schema
-identities and explicit versions. Loaders accept only the current supported
-Hybrid AO PSF contracts. Conversion from other file formats occurs outside
-the canonical loaders.
+Interpolator files use project-owned schema identities and explicit versions.
+Standalone HDF5 results use the shared AO Core format.
 
 PSF image interpolation data uses a version-3 pickle with identity
 `hybrid_ao_psf_science_ho_psf_interpolator` and a SciPy regular-grid evaluator.
@@ -177,11 +175,8 @@ scaled RBF for scattered samples; callers do not configure numerical methods.
 New files respect the process umask, and replacements preserve the
 destination's existing mode.
 
-The standalone result keeps quantities, provenance, effective configuration,
-and optional diagnostics together without imposing a batch dataset structure.
-Its root schema identity is `hybrid-ao-psf-result`, currently at version 4. It
-records explicit model identity, effective precision, the applied distribution
-and model-specific scientific state. The loader also accepts version 3 and
-interprets versions 1 and 2 as MASTSEL results. Legacy mixed arrays retain
-their stored precision. Results load without fitted products or native sources. See
-[Result files](results.md) for the layout and validation contract.
+Standalone results store one science field using AO Core’s reader and writer.
+Hybrid owns the diagnostic declarations and computed values for each model
+and level. The standalone INI workflow
+records the observation settings and input paths beside that result.
+See [Result files](results.md) for the layout and validation contract.

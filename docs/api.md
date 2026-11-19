@@ -51,32 +51,28 @@ stages, physical conventions, configuration and product contracts.
 
 `E2ECalibratedModel` owns prepared calibrated prediction independently of
 `E2ECalibration`. `load_e2e_calibrated_model()` loads its complete shared INI
-inputs; `model.predict()` returns an immutable `E2ELowOrderPrediction` containing
-component covariances, feedback diagnostics and a `LowOrderDistribution` at
-`prediction.distribution`. This operation calculates LO motion only. See [Calibrated LO prediction](e2e-model.md)
-for loading, support, units and the boundary with complete PSF simulation.
+inputs. `model.predict()` returns an immutable `E2ELowOrderPrediction` with
+a `displacement_distribution` at the requested science positions. Pass
+`diagnostics_level="debug"` to retain the evaluated NGS inputs, control
+solution and intermediate covariance terms. See [Calibrated LO prediction](e2e-model.md).
 
 ## Results
 
-`HybridResult` is the immutable standard result. It carries the final
-selected-precision PSF cube, neutral `ao_core.stats.PsfMetadata`, NGS
-metrics, angular Ctot, frame rates, jitter, PSD-clipping mask, provenance, model
-identity and the applied `LowOrderDistribution` at `result.distribution`. Its
-weights and covariances have shapes `(component,)` and
-`(science, component, 2, 2)`. Their weighted covariance equals angular Ctot.
-Execution records field/NGS positions and ZA.
-MASTSEL additionally retains wavefront Ctot, angular conversion, effective flux
-and INI, and optional supplied magnitudes/zeropoint. Those MASTSEL-only fields
-are `None` for E2E, which instead retains magnitudes and a complete
-`E2ELowOrderPrediction` with component diagnostics.
-`HybridDiagnostics` carries the selected validation summaries. At the debug
-level it also carries the large pre-blur PSF cube.
+`HybridResult` returns the ordered Cartesian science `positions`, final
+science `psfs` and radial `jitter`. Row `i` identifies the same field point
+in all three. Its physical `metadata` is an `ao_core.stats.PsfMetadata` record
+accepted by the `ao_core.stats` measurement functions. The arrays are
+read-only and retain the simulation precision.
 
-Result arrays and quantities are result-owned and read-only. Final-PSF
-statistics are deliberately absent; callers may use `ao_core.stats` when wanted.
+Optional `diagnostics` provide validation and debug information
+from the low-order calculation. See [Engine diagnostics](engine.md#diagnostics)
+for the data provided at each level. Use `diagnostic_fields()` and
+`diagnostic_values()` to save the same diagnostic fields through AO Core from
+a batch workflow.
 
-Use `save_result()` and `load_result()` for the versioned standalone HDF5
-contract described in [Result files](results.md).
+Use `run_configuration()` to run and save an INI observation with its inputs.
+Use `save_result()` to save the science output and diagnostics of a
+`HybridResult`, and `load_result()` to read them back. See [Standalone HDF5 results](results.md).
 
 ## Simulation
 
@@ -96,23 +92,17 @@ Return a new Quantity convertible to `nm2` with the same shape/order, or `None`
 for no change. Do not mutate inputs. Exceptions propagate; the engine still owns
 PSD conditioning, convolution and all result diagnostics.
 
-The context borrows the live MASTSEL runtime until the callback returns. It
-contains the observation request, interpolated NGS metrics, WFS-effective photon
-rates, frame rates, the zeropoint used for magnitude inputs, the effective INI
-and the angular-to-wavefront scale. Its
-`HybridMastselStatistics` contains read-only Css, Cas, centre Cas, exact
-science-position reconstructor blocks and filtered NGS measurement-noise
-covariance. Covariances are in `nm2`, axes are interleaved NGS `(x, y)`, and
-reconstructors are dimensionless. Noise is available for fixed controller gain;
-otherwise it is `None`. These snapshots and the live runtime are not persisted.
-Do not retain the context or re-evaluate baseline MASTSEL from the callback.
+The context contains the observation request, NGS metrics, angular-to-wavefront
+scale, LO frame rate, and the zeropoint used for magnitude inputs. It supplies
+the configured numeric loop gain and delay. Automatic gain is reported as
+`None`. The required statistics give read-only Css, Cas, centre Cas,
+science-position reconstructor blocks, and filtered NGS measurement-noise
+covariance for fixed gain. Covariances are in `nm2`, axes are interleaved NGS
+`(x, y)`, and reconstructors are dimensionless.
 
 This example doubles Ctot using the providers and request from a combined INI.
-First build the sample products from the project root:
-
-```bash
-./.conda/bin/python examples/build_sample_artifacts.py
-```
+First generate the PSFs and build the interpolators for the
+[MASTSEL example](configuration.md#executable-sample).
 
 ```python
 from hybrid_ao_psf import (
@@ -124,11 +114,8 @@ from hybrid_ao_psf import (
     simulate,
 )
 
-configuration = load_configuration("examples/hybrid.ini")
-correction = HybridCtotCorrection(
-    apply=lambda ctot, context: 2 * ctot,
-    provenance={"ctot_scale": "2"},
-)
+configuration = load_configuration("examples/mastsel/hybrid.ini")
+correction = HybridCtotCorrection(apply=lambda ctot, context: 2 * ctot)
 model = MastselModel(
     mastsel_ini=configuration.mastsel_ini,
     ngs_metrics=load_psf_metric_interpolator(configuration.ngs_metric_file),
@@ -139,11 +126,8 @@ science = load_psf_interpolator(configuration.science_psf_file)
 result = simulate(configuration.request, science, lo_model=model)
 ```
 
-The definition copies/freezes its string-to-string provenance. The engine
-merges it into result provenance even when the callback returns `None`, and
-rejects collisions with engine-owned keys. `save_result()` and `load_result()`
-preserve this metadata, not the callable or runtime. No correction is enabled
-by default, and the INI/CLI does not select one.
+A correction can keep its input paths in the `HybridCtotCorrection.input_files`
+mapping. The correction is configured through the Python API.
 
 Use `blur_psfs_with_ctot()` for externally supplied PSFs with symmetric,
 already-conditioned wavefront Ctot in square nanometres. Supply the angular
@@ -167,9 +151,9 @@ familiar polar source fields; E2E uses Cartesian `[hybrid]` inputs and the share
 `[e2e]` product/provider paths. See
 [Configuration](configuration.md) for the field contract.
 
-`simulate_configuration()` loads the selected model/providers and calls
-`simulate()`. `run_configuration()` additionally writes the configured HDF5
-result and is the operation used by the CLI.
+`simulate_configuration()` loads the selected model and providers and
+returns the in-memory result. `run_configuration()` also writes the HDF5
+file and is the operation used by the CLI.
 
 ## Standalone Execution
 
@@ -182,8 +166,8 @@ hybrid-ao-psf path/to/simulation.ini
 `--output` overrides the path in `[hybrid]`. An explicit relative path is
 relative to the working directory. Paths in the INI are relative to the INI.
 Pass `--overwrite` to replace an existing result.
-The command loads the same providers, calls the same `simulate()`
-operation, and uses the same `save_result()` contract as Python callers.
+The command calls `run_configuration()`, which captures the extra file
+fields during the same calculation that produces the in-memory result.
 
 Package version inspection is available:
 

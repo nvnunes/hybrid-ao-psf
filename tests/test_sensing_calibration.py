@@ -177,9 +177,7 @@ def test_complete_sensing_noise_simulation_shape_fit_and_roundtrip(tmp_path):
             measure_covariance_calibration(
                 telemetry,
                 controller,
-                settings=CovarianceCalibrationSettings(
-                    feedback=(0.5, 1, 1.5)
-                ),
+                settings=CovarianceCalibrationSettings(feedback=(0.5, 1, 1.5)),
                 dtype=np.float64,
             )
         ],
@@ -234,7 +232,9 @@ def test_complete_sensing_noise_simulation_shape_fit_and_roundtrip(tmp_path):
                 rng=rng,
                 count=3 * total,
             )
-            scaled = (white * np.sqrt(measurement.variances.value[g])).reshape(3, total, 2)
+            scaled = (white * np.sqrt(measurement.variances.value[g])).reshape(
+                3, total, 2
+            )
             x += scaled @ blocks[g].T
         output = np.zeros_like(x)
         B = measurement.feedback.value
@@ -274,17 +274,22 @@ def test_complete_sensing_noise_simulation_shape_fit_and_roundtrip(tmp_path):
                 replace(
                     noise_measurements[0],
                     variances=noise_measurements[0].variances * 1.1,
-                    analytical_covariance=noise_measurements[0].analytical_covariance * 1.1,
+                    analytical_covariance=noise_measurements[0].analytical_covariance
+                    * 1.1,
                 ),
                 *noise_measurements[1:],
             ],
             dtype=np.float64,
         )
     with pytest.raises(ValueError, match="positive semidefinite"):
-        replace(noise_measurements[0], measured_covariance=np.diag([-1.0, 1.0]) * u.mas**2)
+        replace(
+            noise_measurements[0], measured_covariance=np.diag([-1.0, 1.0]) * u.mas**2
+        )
     # Stored float32 histories need not have an exactly zero pooled mean, and
     # the distinct realization means are part of the calibrated distribution.
-    assert np.linalg.norm(noise_measurements[0].displacements.value.mean(axis=(0, 1))) > 0
+    assert (
+        np.linalg.norm(noise_measurements[0].displacements.value.mean(axis=(0, 1))) > 0
+    )
     changed = noise_measurements[0].displacements.copy()
     changed[0, 0] *= 100
     for updates in (
@@ -302,7 +307,9 @@ def test_complete_sensing_noise_simulation_shape_fit_and_roundtrip(tmp_path):
     import json
 
     header = json.loads(str(arrays["__header__"]))
-    np.savez_compressed(path, **(arrays | {"__header__": json.dumps(dict(header, version=1))}))
+    np.savez_compressed(
+        path, **(arrays | {"__header__": json.dumps(dict(header, version=1))})
+    )
     with pytest.raises(ValueError, match="schema"):
         load_sensing_noise(path)
     arrays["measured_covariance"] = arrays["measured_covariance"] * 1.2
@@ -310,7 +317,9 @@ def test_complete_sensing_noise_simulation_shape_fit_and_roundtrip(tmp_path):
     with pytest.raises(ValueError, match="history moments"):
         load_sensing_noise(path)
     result = build_sensing_calibration(response, noise_measurements, dtype=np.float64)
-    lower_precision = build_sensing_calibration(response, noise_measurements, dtype=np.float32)
+    lower_precision = build_sensing_calibration(
+        response, noise_measurements, dtype=np.float32
+    )
     assert lower_precision.model.dtype == np.dtype(np.float32)
     assert lower_precision.diagnostics["asterisms"] == result.diagnostics["asterisms"]
     assert result.diagnostics["asterisms"] == 3
@@ -329,14 +338,15 @@ def test_complete_sensing_noise_simulation_shape_fit_and_roundtrip(tmp_path):
         with pytest.raises(ValueError, match="product schema"):
             load_sensing_calibration(path)
     path.write_text(json.dumps(header))
-    case = requests[2]
-    width = model.noise_covariance(
+    measurement = noise_measurements[2]
+    case = measurement.request
+    sensing = model.predict(
         positions=case.positions,
         magnitudes=case.magnitudes,
         zenith_angle=case.zenith_angle,
-        reconstructor=noise_measurements[2].reconstructor.value,
     )
-    np.testing.assert_array_equal(width, noise_measurements[2].analytical_covariance)
+    np.testing.assert_array_equal(sensing.gain, measurement.gains)
+    np.testing.assert_array_equal(sensing.variance, measurement.variances)
     assert model.blur.parameters() == result.model.blur.parameters()
     with pytest.raises(ValueError):
         model.response.gain_table.value.flags.writeable = True

@@ -119,49 +119,6 @@ class SensingModel:
             positions=positions, magnitudes=magnitudes, zenith_angle=zenith_angle
         )
 
-    def noise_covariance(
-        self,
-        *,
-        positions: u.Quantity,
-        magnitudes: u.Quantity,
-        zenith_angle: u.Quantity,
-        reconstructor: np.ndarray,
-    ) -> u.Quantity:
-        """Calculate stationary noise-command covariance for supplied absolute weights.
-
-        The reconstructor is finite dimensionless (2,2*N). Use the actual B=sum
-        g_g*R_g and reconstructed white-noise covariance sum v_g*R_g*R_g.T,
-        without a symmetric feedback approximation. Return a 2-by-2 mas-squared
-        covariance. Gain/delay/cadence come from this accepted calibration.
-
-        Args:
-            positions: Cartesian x/y coordinates with shape ``(NGS, 2)``.
-            magnitudes: NGS magnitudes in the calibrated convention.
-            zenith_angle: Common angular viewing coordinate.
-            reconstructor: Dimensionless ``(2, 2*NGS)`` weights with interleaved x/y columns.
-
-        Returns:
-            Stationary x/y command covariance in square milliarcseconds.
-
-        Raises:
-            ValueError: If the reconstruction or calibrated response is invalid,
-                or the loop is unstable.
-        """
-        values = self.predict(
-            positions=positions, magnitudes=magnitudes, zenith_angle=zenith_angle
-        )
-        weights = np.asarray(reconstructor, dtype=self.dtype)
-        if (
-            weights.shape != (2, 2 * len(values.gain))
-            or weights.dtype.kind not in "fiu"
-            or not np.isfinite(weights).all()
-        ):
-            raise ValueError("finite two-by-2N dimensionless reconstructor required")
-        blocks = weights.reshape(2, len(values.gain), 2).transpose(1, 0, 2)
-        feedback = np.einsum("g,gab->ab", values.gain.value, blocks)
-        noise = np.einsum("g,gab,gcb->ac", values.variance.value, blocks, blocks)
-        return self.controller.noise_covariance(feedback, noise * u.mas**2)
-
 
 @dataclass(frozen=True, kw_only=True)
 class SensingCalibrationResult:
@@ -223,7 +180,9 @@ def build_sensing_calibration(
             raise TypeError("typed sensing noise_measurements required")
         # Validate against the response as evaluated when this history was captured.
         if measurement.dtype not in validation_models:
-            validation_models[measurement.dtype] = response.model.prepare(dtype=measurement.dtype)
+            validation_models[measurement.dtype] = response.model.prepare(
+                dtype=measurement.dtype
+            )
         validation_model = validation_models[measurement.dtype]
         controller = validation_model.controller
         if (
@@ -238,7 +197,9 @@ def build_sensing_calibration(
         ) or measurement.settings.displacement != response._displacement.astype(
             measurement.dtype
         ):
-            raise ValueError("measurement WFS sampling differs from response calibration")
+            raise ValueError(
+                "measurement WFS sampling differs from response calibration"
+            )
         request = measurement.request
         predicted = validation_model.predict(
             positions=request.positions,
@@ -248,9 +209,14 @@ def build_sensing_calibration(
         if not np.allclose(
             predicted.gain.value, measurement.gains.value, rtol=1e-10, atol=1e-10
         ) or not np.allclose(
-            predicted.variance.value, measurement.variances.value, rtol=1e-10, atol=1e-10
+            predicted.variance.value,
+            measurement.variances.value,
+            rtol=1e-10,
+            atol=1e-10,
         ):
-            raise ValueError("measurement gains/variances differ from response calibration")
+            raise ValueError(
+                "measurement gains/variances differ from response calibration"
+            )
         angle = float(request.zenith_angle.value)
         zenith_plane = validation_model._measured_zenith_index(request.zenith_angle)
         identity = (zenith_plane, request.key)
@@ -273,7 +239,8 @@ def build_sensing_calibration(
             {
                 "case": case.key,
                 "trace_relative_difference": float(
-                    np.trace(measurement.measured_covariance.value) / np.trace(analytical)
+                    np.trace(measurement.measured_covariance.value)
+                    / np.trace(analytical)
                     - 1
                 ),
                 "realizations": measurement.settings.noise_realizations,

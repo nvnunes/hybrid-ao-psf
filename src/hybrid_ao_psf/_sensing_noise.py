@@ -25,6 +25,7 @@ from ._calibration_numerics import filter_input
 from ._calibration_products import controller_header, read_controller_header
 from ._covariance_calibration import CovarianceFunctions
 from ._io import atomic_output_path
+from ._lo_model import _compute_noise_command_covariance
 from ._reconstructor_calibration import ReconstructorNoiseModel, build_lo_reconstructor
 from ._sensing_response import SensingResponseResult
 from ._sensing_statistics import pooled_displacement_moments
@@ -212,8 +213,9 @@ class SensingNoiseMeasurements(_PhysicalRecord):
         feedback = np.einsum("g,gab->ab", self.gains.value, blocks)
         if not np.allclose(feedback, self.feedback.value, rtol=1e-12, atol=1e-12):
             raise ValueError("measurement feedback differs from declared weights/gains")
-        innovation = np.einsum("g,gab,gcb->ac", self.variances.value, blocks, blocks)
-        covariance = self.controller.noise_covariance(feedback, innovation * u.mas**2)
+        covariance = _compute_noise_command_covariance(
+            self.controller, feedback, blocks, self.variances.value
+        )
         if not np.allclose(
             covariance.value, self.analytical_covariance.value, rtol=1e-10, atol=1e-10
         ):
@@ -346,8 +348,10 @@ def simulate_sensing_noise(
             magnitudes=request.magnitudes,
             zenith_angle=request.zenith_angle,
         )
-        photons = response.model.photometry.photons_per_frame(request.magnitudes)
-        prior = noise_prior.measurement_noise(
+        photons = response.model.photometry.magnitude_to_photons_per_frame(
+            request.magnitudes
+        )
+        prior = noise_prior.build_measurement_noise_covariance(
             photons_per_frame=photons, ee=request.ee, fwhm=request.fwhm
         )
         weights = build_lo_reconstructor(
@@ -364,8 +368,9 @@ def simulate_sensing_noise(
         blocks = weights.reshape(2, n, 2).transpose(1, 0, 2)
         gains, variance = values.gain.value, values.variance.value
         feedback = np.einsum("g,gab->ab", gains, blocks)
-        reconstructed_noise = np.einsum("g,gab,gcb->ac", variance, blocks, blocks)
-        expected = controller.noise_covariance(feedback, reconstructed_noise * u.mas**2)
+        expected = _compute_noise_command_covariance(
+            controller, feedback, blocks, variance
+        )
         frames = settings.noise_frames + settings.discard_frames
         realizations = settings.noise_realizations
         x = np.zeros((2, realizations, frames), dtype=dtype)
@@ -469,7 +474,9 @@ def load_sensing_noise(path: str | Path) -> SensingNoiseMeasurements:
     """
     with np.load(Path(path), allow_pickle=False) as saved:
         header = json.loads(str(saved["__header__"]))
-        validate_calibration_data_precision(header, saved, history_fields=("displacements",))
+        validate_calibration_data_precision(
+            header, saved, history_fields=("displacements",)
+        )
         if (
             (set(header) - {"precision"})
             != {
@@ -491,7 +498,9 @@ def load_sensing_noise(path: str | Path) -> SensingNoiseMeasurements:
             or header["centring"] != "pooled"
             or set(saved.files) != {"__header__", *_ARRAY_UNITS}
         ):
-            raise ValueError("invalid sensing measurement schema, units, centring or fields")
+            raise ValueError(
+                "invalid sensing measurement schema, units, centring or fields"
+            )
         dtype = header["precision"]
         settings = dict(header["settings"])
         settings["displacement"] = settings.pop("displacement_mas") * u.mas

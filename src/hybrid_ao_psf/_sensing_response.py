@@ -150,7 +150,9 @@ class SensingResponseModel:
         ):
             raise ValueError("finite increasing sensing interpolation axes required")
         if any(len(a) < 2 for a in axes[1:]):
-            raise ValueError("at least two points per spatial and magnitude axis required")
+            raise ValueError(
+                "at least two points per spatial and magnitude axis required"
+            )
         angles = np.asarray(arrays["zenith_deg"])
         if (
             angles.shape != axes[0].shape
@@ -168,7 +170,8 @@ class SensingResponseModel:
             raise ValueError("measured sensing zenith/airmass axes disagree")
         shape = tuple(len(a) for a in axes)
         gain, log_variance, measured_mask = (
-            np.asarray(arrays[key]) for key in ("gain", "log_variance_mas2", "measured_mask")
+            np.asarray(arrays[key])
+            for key in ("gain", "log_variance_mas2", "measured_mask")
         )
         if (
             any(v.shape != shape for v in (gain, log_variance, measured_mask))
@@ -378,7 +381,9 @@ class SensingResponseModel:
             )
         angles = self.zenith_angles.value
         angle = (
-            snap_coordinate_range(angle.value, angles, dtype=precision, label="zenith angle")
+            snap_coordinate_range(
+                angle.value, angles, dtype=precision, label="zenith angle"
+            )
             * u.deg
         )
         x, y = positions.value.T
@@ -416,9 +421,7 @@ class SensingResponseModel:
     def _measured_zenith_index(self, zenith_angle: u.Quantity) -> int:
         """Locate one measured plane within the rounding of the stored grid."""
         angles = self.zenith_angles.to_value(u.deg)
-        bound = (
-            2 * np.finfo(self.grid_precision).eps * np.maximum(1.0, np.abs(angles))
-        )
+        bound = 2 * np.finfo(self.grid_precision).eps * np.maximum(1.0, np.abs(angles))
         query = self.dtype.type(zenith_angle.to_value(u.deg))
         matches = np.flatnonzero(np.abs(angles - query) <= bound)
         if len(matches) != 1:

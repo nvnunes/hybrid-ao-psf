@@ -59,8 +59,9 @@ from ._covariance_calibration import (
     save_covariance_calibration,
     save_covariance_measurements,
 )
+from ._diagnostic_io import diagnostic_fields, diagnostic_values
 from ._e2e_model import E2ECalibratedModel, load_e2e_calibrated_model
-from ._e2e_prediction import E2ELowOrderPrediction
+from ._e2e_prediction import E2ELowOrderDiagnostics, E2ELowOrderPrediction
 from ._mastsel import MastselModel
 from ._noise_blur import NoiseBlurModel
 from ._reconstructor_calibration import (
@@ -101,8 +102,9 @@ from ._sensing_response import (
     build_sensing_response,
 )
 from ._version import __version__
-from .config import HYBRID_SECTION, HybridConfiguration, load_configuration
+from .config import HybridConfiguration, load_configuration
 from .contracts import (
+    CovarianceDiagnostics,
     DiagnosticsLevel,
     HybridCtotContext,
     HybridCtotCorrection,
@@ -112,6 +114,7 @@ from .contracts import (
     HybridResult,
     LowOrderDistribution,
     LowOrderModel,
+    MastselDiagnostics,
     NonPsdPolicy,
     PsfMetricPrediction,
     PsfMetricProvider,
@@ -144,12 +147,7 @@ from .interpolation import (
     zenith_angle_to_airmass,
 )
 from .psf_files import PsfFileProvider
-from .result_io import (
-    RESULT_SCHEMA,
-    RESULT_SCHEMA_VERSION,
-    load_result,
-    save_result,
-)
+from .result_io import load_result, save_result
 from .standalone import run_configuration, simulate_configuration
 
 # Keep canonical exports in scientific workflow order.
@@ -161,7 +159,6 @@ __all__ = [  # noqa: RUF022
     "NonPsdPolicy",
     "DiagnosticsLevel",
     "HybridConfiguration",
-    "HYBRID_SECTION",
     "load_configuration",
     "PsfProvider",
     "PsfFileProvider",
@@ -174,11 +171,13 @@ __all__ = [  # noqa: RUF022
     "HybridMastselStatistics",
     "HybridResult",
     "HybridDiagnostics",
+    "CovarianceDiagnostics",
+    "MastselDiagnostics",
     "LowOrderDistribution",
     "save_result",
+    "diagnostic_fields",
+    "diagnostic_values",
     "load_result",
-    "RESULT_SCHEMA",
-    "RESULT_SCHEMA_VERSION",
     # PSF images
     "PsfSamples",
     "PsfInterpolator",
@@ -202,6 +201,7 @@ __all__ = [  # noqa: RUF022
     # Calibrated low-order prediction
     "E2ECalibratedModel",
     "load_e2e_calibrated_model",
+    "E2ELowOrderDiagnostics",
     "E2ELowOrderPrediction",
     # Calibration configuration and reusable measurements
     "E2ECalibration",

@@ -49,7 +49,7 @@ preserving existing float32 defaults and rejecting unsupported precisions.
 It also checks physical metadata, NGS metrics, immutable runtime preparation
 and retention of producer precision. `test_execution_precision.py` adds independent FFT comparisons, a source
 pixel perturbation below float32 resolution, metrics, both-mode result
-round trips, legacy mixed-array preservation and declared-precision rejection.
+round trips and rejection of invalid precision and unsupported result versions.
 
 ## PSF File Providers
 
@@ -89,9 +89,9 @@ realization means. It checks independent noise impulse sums, real/scalar and
 complex-feedback behavior, both precisions, prepared-result immutability, complete
 preparation of mixed-precision providers, rounding-time validation, content-bound
 INI loading without native imports, missing products, numerical conflicts and
-out-of-range rejection. `test_contracts.py` additionally checks shared metric numeric
-backing and unit metadata throughout the backing chain, including preserved
-legacy precision. PSF construction is covered separately below.
+out-of-range rejection. `test_contracts.py` additionally checks shared metric
+numeric backing and unit metadata throughout the backing chain. PSF
+construction is covered separately below.
 
 ## Peer-Model Engine Coverage
 
@@ -99,8 +99,8 @@ legacy precision. PSF construction is covered separately below.
 precisions against independent FFT mixture convolution on odd rectangular
 images. A discriminating fixture rejects substituting a Gaussian with the same
 Ctot. Tests cover explicit peer selection, incompatible request/configuration
-inputs, unchanged provider state, immutable result state and schema-3 round trips.
+inputs, unchanged provider state, immutable result state and current-schema round trips.
 Corrupted model-specific fields and declared precision mismatches are rejected.
 A fresh-process CLI test forbids MASTSEL and native imports; saved results load
 after removing the fitted product/provider files. Existing MASTSEL golden,
-correction, standalone and legacy-result tests protect that peer path.
+correction and standalone tests protect that peer path.
