@@ -18,16 +18,17 @@ Hybrid AO PSF owns:
 
 Hybrid AO PSF does not own batch simulation orchestration, external dataset
 schemas, instrument calibration selection, instrument-specific policy, or
-final PSF statistics. On the MASTSEL path, callers may supply effective NGS flux directly or
-provide magnitudes with an explicit caller-owned zeropoint. Hybrid converts
-the latter to WFS-effective rates using MASTSEL geometry and NGS Photometry.
+final PSF statistics. On the MASTSEL path, callers may supply WFS-effective
+photon rates directly or provide magnitudes with an explicit caller-owned
+zeropoint. Hybrid converts magnitudes using MASTSEL geometry and AO Core.
 
 ## Dependencies
 
 The package uses AO Models for shared INI handling, delayed-integrator
 arithmetic and reconstruction. Hybrid keeps its controller and reconstructor
 entry points and their float32 defaults. AO Stats provides PSF metadata and
-measurements. NGS Photometry converts magnitudes to effective rates. The low-order engine supports a tested range of MASTSEL
+measurements. AO Core converts magnitudes to effective rates. The low-order
+engine supports a tested range of MASTSEL
 releases. It has no dependency on an orchestration framework or instrument
 package.
 
@@ -89,9 +90,9 @@ The MASTSEL path reads the active NGS frame rate from `RTC.SensorFrameRate_LO` i
 effective MASTSEL configuration and reports the applied rates in the result.
 For magnitude requests it also reads `telescope.TelescopeDiameter` and the
 first `sensor_LO.NumberLenslets` value, converts once before MASTSEL, and
-reports both the effective flux and the supplied magnitudes and zeropoint.
+reports the WFS-effective photon rates, supplied magnitudes and zeropoint.
 The MASTSEL INI contains no instrument zeropoint; the standalone command
-supplies resolved flux through its `[hybrid]` section.
+supplies the photon rates through its `[hybrid]` section.
 Hybrid passes the effective configuration in memory on MASTSEL releases
 that accept it. Earlier supported releases read the same configuration
 through their file interface. The effective INI is saved in both cases.

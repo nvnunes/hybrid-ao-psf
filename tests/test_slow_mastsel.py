@@ -8,9 +8,9 @@ from pathlib import Path
 
 import numpy as np
 import pytest
+from ao_core.photometry import WFSPhotometryConfig, photons_per_frame_to_magnitudes
 from ao_models import parse_ini
 from astropy import units as u
-from ngs_photometry import WFSPhotometryConfig, photons_per_frame_to_magnitudes
 
 from hybrid_ao_psf import (
     HybridCtotCorrection,

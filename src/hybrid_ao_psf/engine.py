@@ -13,11 +13,11 @@ from dataclasses import replace
 from io import StringIO
 
 import numpy as np
-from astropy import units as u
-from ngs_photometry import (
+from ao_core.photometry import (
     WFSPhotometryConfig,
     magnitudes_to_effective_photons_per_second,
 )
+from astropy import units as u
 from numpy.typing import DTypeLike
 from scipy.fft import fft2, ifft2
 

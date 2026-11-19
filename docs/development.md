@@ -23,12 +23,11 @@ The AO Stats source override also accepts a local checkout for co-development:
 HYBRID_AO_PSF_AO_STATS_SOURCE=../ao-stats ./scripts/bootstrap.sh
 ```
 
-Bootstrap also installs NGS Photometry from its public GitHub repository
+Bootstrap also reinstalls AO Core from its public GitHub repository
 before installing Hybrid AO PSF. For a sibling checkout, set
-`HYBRID_AO_PSF_NGS_PHOTOMETRY_SOURCE=../ngs-photometry`; remote sources are
-installed normally and local paths editably. These overrides affect only
-dependency installation. Package metadata sets the required distribution
-versions.
+`HYBRID_AO_PSF_AO_CORE_SOURCE=../ao-core`. Remote sources and wheels are
+installed as distributions. Local checkouts are installed editably. Bootstrap
+checks that `ao_core.photometry` imports after installing the dependencies.
 
 ## AO Models
 

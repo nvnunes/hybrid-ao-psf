@@ -7,16 +7,17 @@ This guide defines the supported public Python surface of Hybrid AO PSF.
 `HybridRequest` describes the observation and requested diagnostics. Its
 keyword-only inputs use Astropy quantities. Supply `science_positions` and
 `ngs_positions` as angular arrays of shape `(N, 2)`, with an `(x, y)` pair per
-row. Supply either effective `ngs_flux` in `photon / s` or one `ngs_magnitude`
-in `mag` per NGS row, in the same order. Array inputs are read-only copies.
+row. Supply the WFS-effective photon rate as `ngs_flux` in `photon / s`, or
+supply `ngs_magnitude` in `mag`. Give one value per NGS in the same order.
+Array inputs are read-only copies.
 
 Pass a `MastselModel` or `E2ECalibratedModel` as `lo_model` to `simulate()`.
 `MastselModel` holds the INI text, NGS metric provider, non-PSD policy and
 optional covariance correction. For magnitudes, set the model's positive scalar
 `ngs_magnitude_zeropoint` in `photon / (m2 s)`. The engine uses
 `telescope.TelescopeDiameter`, the first `sensor_LO.NumberLenslets` value,
-and `RTC.SensorFrameRate_LO` with NGS Photometry to resolve effective flux
-once before MASTSEL.
+and `RTC.SensorFrameRate_LO` with `ao_core.photometry` to calculate
+WFS-effective photon rates once before calling MASTSEL.
 
 E2E-Calibrated takes magnitudes and supplies its own NGS metrics and photometry.
 Coordinates, Ctot axes, and PSF image orientation follow the
@@ -96,9 +97,9 @@ for no change. Do not mutate inputs. Exceptions propagate; the engine still owns
 PSD conditioning, convolution and all result diagnostics.
 
 The context borrows the live MASTSEL runtime until the callback returns. It
-contains the observation request, interpolated NGS metrics, effective flux and
-frame rates, the zeropoint used for magnitude inputs, the effective INI and
-the angular-to-wavefront scale. Its
+contains the observation request, interpolated NGS metrics, WFS-effective photon
+rates, frame rates, the zeropoint used for magnitude inputs, the effective INI
+and the angular-to-wavefront scale. Its
 `HybridMastselStatistics` contains read-only Css, Cas, centre Cas, exact
 science-position reconstructor blocks and filtered NGS measurement-noise
 covariance. Covariances are in `nm2`, axes are interleaved NGS `(x, y)`, and

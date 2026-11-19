@@ -27,13 +27,13 @@ if [ -n "${HYBRID_AO_PSF_AO_STATS_SOURCE:-}" ]; then
       ;;
   esac
 fi
-ngs_photometry_source="${HYBRID_AO_PSF_NGS_PHOTOMETRY_SOURCE:-git+https://github.com/nvnunes/ngs-photometry.git}"
-case "$ngs_photometry_source" in
-  git+*|http://*|https://*)
-    conda run --prefix "$env_prefix" python -m pip install "$ngs_photometry_source"
+ao_core_source="${HYBRID_AO_PSF_AO_CORE_SOURCE:-git+https://github.com/nvnunes/ao-core.git}"
+case "$ao_core_source" in
+  git+*|http://*|https://*|*.whl)
+    conda run --prefix "$env_prefix" python -m pip install --force-reinstall --no-deps "$ao_core_source"
     ;;
   *)
-    conda run --prefix "$env_prefix" python -m pip install -e "$ngs_photometry_source"
+    conda run --prefix "$env_prefix" python -m pip install --force-reinstall --no-deps -e "$ao_core_source"
     ;;
 esac
 ao_models_source="${HYBRID_AO_PSF_AO_MODELS_SOURCE:-../ao-models}"
@@ -46,6 +46,7 @@ case "$ao_models_source" in
     ;;
 esac
 conda run --prefix "$env_prefix" python -m pip install -e ".[dev,docs]"
+conda run --prefix "$env_prefix" python -c 'import ao_core.photometry'
 
 echo "[bootstrap] Configuring Git hooks path..."
 git config core.hooksPath .githooks

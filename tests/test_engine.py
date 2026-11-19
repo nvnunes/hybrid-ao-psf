@@ -7,12 +7,12 @@ from pathlib import Path
 
 import numpy as np
 import pytest
-from ao_stats import PsfMetadata
-from astropy import units as u
-from ngs_photometry import (
+from ao_core.photometry import (
     WFSPhotometryConfig,
     magnitudes_to_effective_photons_per_second,
 )
+from ao_stats import PsfMetadata
+from astropy import units as u
 
 from hybrid_ao_psf import (
     DiagnosticsLevel,
