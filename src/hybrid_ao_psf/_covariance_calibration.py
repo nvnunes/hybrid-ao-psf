@@ -9,7 +9,7 @@ from pathlib import Path
 from types import MappingProxyType
 
 import numpy as np
-from ao_models import FixedGainIntegrator
+from ao_core.models.control import FixedGainIntegrator
 from astropy import units as u
 from numpy.typing import ArrayLike, DTypeLike, NDArray
 from scipy.interpolate import RegularGridInterpolator

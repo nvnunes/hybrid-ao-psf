@@ -14,7 +14,7 @@ from tempfile import TemporaryDirectory
 from typing import Any
 
 import numpy as np
-from ao_models import parse_ini
+from ao_core.models.config import parse_ini
 from astropy import units as u
 
 from ._units import _PhysicalRecord

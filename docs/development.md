@@ -23,25 +23,18 @@ The AO Stats source override also accepts a local checkout for co-development:
 HYBRID_AO_PSF_AO_STATS_SOURCE=../ao-stats ./scripts/bootstrap.sh
 ```
 
-Bootstrap also reinstalls AO Core from its public GitHub repository
-before installing Hybrid AO PSF. For a sibling checkout, set
-`HYBRID_AO_PSF_AO_CORE_SOURCE=../ao-core`. Remote sources and wheels are
-installed as distributions. Local checkouts are installed editably. Bootstrap
-checks that `ao_core.photometry` imports after installing the dependencies.
+Bootstrap reinstalls AO Core from its public GitHub repository before
+installing Hybrid AO PSF. Hybrid requires an AO Core build with its
+photometry, shared configuration, control and reconstruction modules.
+Bootstrap checks the photometry import and the shared `Configuration` API.
 
-## AO Models
-
-Hybrid requires AO Models 0.2.0 or later for shared configuration, control
-and reconstruction. Obtain the AO Models checkout or a wheel from the
-project maintainer. In the joint
-development workspace, bootstrap uses the sibling `../ao-models` checkout.
-
-Set `HYBRID_AO_PSF_AO_MODELS_SOURCE` to use a different local checkout, a
-wheel file, or a VCS URL. For example, to use a wheel supplied separately:
+Set `HYBRID_AO_PSF_AO_CORE_SOURCE` to use a sibling checkout, wheel, or VCS
+URL. Bootstrap installs a local checkout editably. Use the sibling
+checkout during co-development:
 
 ```bash
 HYBRID_AO_PSF_AO_STATS_SOURCE='git+https://github.com/nvnunes/ao-stats.git@main' \
-HYBRID_AO_PSF_AO_MODELS_SOURCE=/path/to/ao_models-0.2.0-py3-none-any.whl \
+HYBRID_AO_PSF_AO_CORE_SOURCE=../ao-core \
   ./scripts/bootstrap.sh
 ```
 

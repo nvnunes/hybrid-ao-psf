@@ -5,7 +5,7 @@ from __future__ import annotations
 from dataclasses import dataclass, field, replace
 
 import numpy as np
-from ao_models import FixedGainIntegrator as _SharedFixedGainIntegrator
+from ao_core.models.control import FixedGainIntegrator as _SharedFixedGainIntegrator
 from astropy import units as u
 from numpy.typing import DTypeLike
 

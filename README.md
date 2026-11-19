@@ -6,10 +6,9 @@ E2E-calibrated low-order motion. Researchers can run one simulation directly
 from an INI file or use the typed Python API from a larger orchestration system.
 
 The project owns Hybrid-specific interpolation products, both low-order models,
-scientific execution, engine diagnostics, and standalone results. It depends
-on AO Models for shared configuration, [AO Stats](https://github.com/nvnunes/ao-stats) for neutral PSF metadata and
-measurements, and AO Core for converting magnitudes to WFS-effective photon
-rates.
+scientific execution, engine diagnostics, and standalone results. AO Core
+provides shared configuration, control, reconstruction and photometry.
+AO Stats provides shared PSF metadata and measurements.
 
 ## Status
 
@@ -20,18 +19,15 @@ regression suite on the minimum and current selected MASTSEL releases.
 
 ## Installation
 
-Install AO Stats and AO Core from their public repositories. The
-commands below use the compatible sibling AO Models checkout described in
-[AO Models setup](docs/development.md#ao-models).
+Install AO Stats and an AO Core build with `ao_core.models`. This example
+uses a sibling AO Core checkout.
 
 ```bash
 python -m pip install \
   'ao-stats @ git+https://github.com/nvnunes/ao-stats.git@main'
-python -m pip install --force-reinstall --no-deps \
-  'ao-core @ git+https://github.com/nvnunes/ao-core.git'
-python -m pip install ../ao-models
+python -m pip install --force-reinstall --no-deps ../ao-core
 python -m pip install .
-python -c 'import ao_core.photometry'
+python -c 'import ao_core.photometry; from ao_core.models.config import Configuration'
 ```
 
 For repository-local development and source overrides, see

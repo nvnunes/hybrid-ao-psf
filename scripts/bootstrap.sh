@@ -36,17 +36,9 @@ case "$ao_core_source" in
     conda run --prefix "$env_prefix" python -m pip install --force-reinstall --no-deps -e "$ao_core_source"
     ;;
 esac
-ao_models_source="${HYBRID_AO_PSF_AO_MODELS_SOURCE:-../ao-models}"
-case "$ao_models_source" in
-  git+*|http://*|https://*|*.whl)
-    conda run --prefix "$env_prefix" python -m pip install "$ao_models_source"
-    ;;
-  *)
-    conda run --prefix "$env_prefix" python -m pip install -e "$ao_models_source"
-    ;;
-esac
 conda run --prefix "$env_prefix" python -m pip install -e ".[dev,docs]"
-conda run --prefix "$env_prefix" python -c 'import ao_core.photometry'
+conda run --prefix "$env_prefix" python -c 'import ao_core.photometry
+from ao_core.models.config import Configuration'
 
 echo "[bootstrap] Configuring Git hooks path..."
 git config core.hooksPath .githooks

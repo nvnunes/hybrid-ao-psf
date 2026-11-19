@@ -8,7 +8,7 @@ from io import StringIO
 from pathlib import Path
 
 import numpy as np
-from ao_models import (
+from ao_core.models.config import (
     parse_ini,
     polar_to_cartesian,
     read_ini,

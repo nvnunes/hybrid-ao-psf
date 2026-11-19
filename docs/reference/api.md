@@ -12,7 +12,7 @@
 
 ::: hybrid_ao_psf
     options:
-      preload_modules: [ao_models]
+      preload_modules: [ao_core.models.control]
       inherited_members:
         - transition
         - filter

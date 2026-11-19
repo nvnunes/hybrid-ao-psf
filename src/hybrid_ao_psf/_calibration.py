@@ -7,7 +7,7 @@ from collections.abc import Iterable, Iterator
 from pathlib import Path
 from typing import TYPE_CHECKING
 
-from ao_models import FixedGainIntegrator
+from ao_core.models.control import FixedGainIntegrator
 from astropy import units as u
 
 from ._calibration_config import E2ECalibrationConfiguration

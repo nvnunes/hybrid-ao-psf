@@ -7,7 +7,9 @@ from dataclasses import dataclass, field, replace
 from pathlib import Path
 
 import numpy as np
-from ao_models import solve_lo_reconstructor as _shared_solve_lo_reconstructor
+from ao_core.models.reconstruction import (
+    solve_lo_reconstructor as _shared_solve_lo_reconstructor,
+)
 from astropy import units as u
 from numpy.typing import DTypeLike
 from scipy.interpolate import RegularGridInterpolator

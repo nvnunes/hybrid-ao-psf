@@ -361,7 +361,7 @@ def test_empty_noise_asterism_is_rejected_before_loop_work():
 
 @pytest.mark.parametrize("dtype", [np.float32, np.float64])
 def test_shared_controller_cadence_matches_saved_sensing_precision(tmp_path, dtype):
-    from ao_models import FixedGainIntegrator as SharedIntegrator
+    from ao_core.models.control import FixedGainIntegrator as SharedIntegrator
 
     measured, _ = samples()
     controller = SharedIntegrator(gain=0.3, delay=2, frame_rate=500.00001 * u.Hz)

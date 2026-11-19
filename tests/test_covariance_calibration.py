@@ -2,7 +2,7 @@
 
 import numpy as np
 import pytest
-from ao_models import FixedGainIntegrator as SharedFixedGainIntegrator
+from ao_core.models.control import FixedGainIntegrator as SharedFixedGainIntegrator
 from astropy import units as u
 
 from hybrid_ao_psf import (

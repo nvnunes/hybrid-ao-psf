@@ -7,7 +7,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 
 import numpy as np
-from ao_models import FixedGainIntegrator
+from ao_core.models.control import FixedGainIntegrator
 from astropy import units as u
 from numpy.typing import DTypeLike
 

@@ -9,7 +9,7 @@ from dataclasses import dataclass, field, fields, replace
 from pathlib import Path
 
 import numpy as np
-from ao_models import read_ini, resolve_ini_path
+from ao_core.models.config import read_ini, resolve_ini_path
 from astropy import units as u
 from numpy.typing import DTypeLike
 
