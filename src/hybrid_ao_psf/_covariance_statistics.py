@@ -5,8 +5,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 
 import numpy as np
-
-from ._calibration_numerics import scalar_filter, state_matrix
+from ao_core.models.control import scalar_filter, state_matrix
 
 FUNCTIONS = {
     "C_t_t": (False, False, "mas2"),
@@ -98,14 +97,14 @@ def features(
         raise ValueError("Insufficient retained frames after simulation settling")
     ft = np.stack(
         [
-            scalar_filter(telemetry.tilt, b, settings.gain, settings.delay)
+            scalar_filter(telemetry.tilt, b, settings.gain, settings.delay, dtype=None)
             for b in settings.strengths
         ],
         axis=1,
     )
     fc = np.stack(
         [
-            scalar_filter(telemetry.coma, b, settings.gain, settings.delay)
+            scalar_filter(telemetry.coma, b, settings.gain, settings.delay, dtype=None)
             for b in settings.strengths
         ],
         axis=1,

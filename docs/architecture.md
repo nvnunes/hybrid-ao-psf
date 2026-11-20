@@ -24,8 +24,8 @@ zeropoint. Hybrid converts magnitudes using MASTSEL geometry and AO Core.
 
 ## Dependencies
 
-The package uses `ao_core.models` for shared AO configuration, delayed-integrator
-arithmetic and reconstruction. Hybrid keeps its controller and reconstructor
+The package uses `ao_core.models` for shared AO configuration, reconstruction,
+tip–tilt control and residual covariance assembly. Hybrid keeps its controller and reconstructor
 entry points and their float32 defaults. `ao_core.stats` provides PSF metadata
 and measurements. `ao_core.photometry` converts magnitudes to effective rates. The low-order
 engine supports a tested range of MASTSEL
@@ -127,9 +127,10 @@ shared by Python and native CLI workflows. Loaded calibrated products and offlin
 neither a native subclass nor native files/software. Numerical kernels have one
 upstream owner; calibration does not depend on downstream correction modules.
 The four calibration products feed the separate concrete `E2ECalibratedModel`.
-It owns immutable prepared providers and standalone scientific LO composition,
-including reconstructor weights, scalar covariance interpolation, actual-feedback noise
-propagation and displacement-mixture parameters. Its INI loader exposes
+It owns the prepared fitted inputs, covariance interpolation, physical
+acceptance checks and displacement mixture. AO Core calculates the reconstructor,
+feedback, noise propagation and residual covariance from those inputs. Hybrid
+also owns the stored diagnostics. Its INI loader exposes
 checked model-file paths and checksums without acquisition metadata. It does not
 construct science PSFs itself. The canonical engine combines its prediction
 with a science provider. See

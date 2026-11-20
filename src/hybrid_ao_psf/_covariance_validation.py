@@ -7,9 +7,9 @@ Whole-PH Gram matrices retain a common feature ordering for uncertainty checks.
 from __future__ import annotations
 
 import numpy as np
+from ao_core.models.control import scalar_filter, settling_cut
 from scipy.interpolate import RegularGridInterpolator
 
-from ._calibration_numerics import settling_cut
 from ._covariance_grid import rectangular_mapping
 from ._covariance_statistics import (
     FUNCTIONS,
@@ -18,7 +18,6 @@ from ._covariance_statistics import (
     PooledCovariances,
     covariance_tables,
     features,
-    scalar_filter,
 )
 
 BOOTSTRAP_DRAWS = 200
@@ -228,7 +227,11 @@ class InterpolationDiagnostics:
                 filtered = np.stack(
                     [
                         scalar_filter(
-                            history, b, self.settings.gain, self.settings.delay
+                            history,
+                            b,
+                            self.settings.gain,
+                            self.settings.delay,
+                            dtype=None,
                         )[..., self.settings.discard :]
                         for b in self.midpoints
                     ],
@@ -488,7 +491,9 @@ def pilot_diagnostics(
             ("coma", source.coma[indices]),
         ]:
             for b in settings.strengths:
-                output = scalar_filter(values, b, settings.gain, settings.delay)
+                output = scalar_filter(
+                    values, b, settings.gain, settings.delay, dtype=None
+                )
                 expected = np.broadcast_to(values[..., :1] / b, values.shape).copy()
                 for k in range(settings.delay, values.shape[-1]):
                     expected[..., k] = (
@@ -517,6 +522,7 @@ def pilot_diagnostics(
                         settings.gain,
                         settings.delay,
                         equilibrium=equilibrium,
+                        dtype=None,
                     )[..., settings.discard :]
                     restarted -= restarted.mean(-1, keepdims=True)
                     n = restarted.shape[-1]

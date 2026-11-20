@@ -2,14 +2,10 @@
 
 import numpy as np
 import pytest
+from ao_core.models.control import scalar_filter, settling_cut
 from astropy import units as u
 
-from hybrid_ao_psf import FixedGainIntegrator, NoiseBlurModel
-from hybrid_ao_psf._calibration_numerics import (
-    lo_reconstructor,
-    scalar_filter,
-    settling_cut,
-)
+from hybrid_ao_psf import FixedGainIntegrator, NoiseBlurModel, solve_lo_reconstructor
 
 
 def direct_response(history, response, gain, delay, equilibrium=False):
@@ -90,10 +86,15 @@ def test_weight_solver_preserves_absolute_response_and_one_ngs_identity():
     noise = np.diag([0.2, 0.5, 0.4, 0.3])
     cas = np.arange(8).reshape(2, 4) / 10
     expected = cas / np.diag(css + noise)
-    np.testing.assert_allclose(lo_reconstructor(css, cas, noise), expected, rtol=1e-14)
-    np.testing.assert_array_equal(
-        lo_reconstructor(np.eye(2) * 3, np.eye(2), np.eye(2)), np.eye(2)
+    reconstructor = solve_lo_reconstructor(
+        css * u.mas**2, cas * u.mas**2, noise * u.mas**2, dtype=np.float64
     )
+    np.testing.assert_allclose(reconstructor.to_value(u.one), expected, rtol=1e-14)
+    identity = solve_lo_reconstructor(
+        3 * np.eye(2) * u.mas**2, np.eye(2) * u.mas**2, np.eye(2) * u.mas**2
+    )
+    np.testing.assert_array_equal(identity.to_value(u.one), np.eye(2))
+    assert identity.dtype == np.float32
 
 
 @pytest.mark.parametrize("count", [1, 3])

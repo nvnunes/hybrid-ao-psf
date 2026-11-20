@@ -28,7 +28,10 @@ case "$ao_core_source" in
 esac
 conda run --prefix "$env_prefix" python -m pip install -e ".[dev,docs]"
 conda run --prefix "$env_prefix" python -c 'import ao_core.photometry, ao_core.stats
-from ao_core.models.config import Configuration'
+from ao_core.models.config import Configuration
+from ao_core.models.control import TipTiltControl
+from ao_core.models.residual import assemble_tilt_residual_covariances
+import hybrid_ao_psf'
 
 echo "[bootstrap] Configuring Git hooks path..."
 git config core.hooksPath .githooks

@@ -12,6 +12,12 @@ from dataclasses import dataclass, field, replace
 from pathlib import Path
 
 import numpy as np
+from ao_core.models.control import TipTiltControl
+from ao_core.models.residual import (
+    TiltCommandCovariances,
+    TiltResidualCovariances,
+    assemble_tilt_residual_covariances,
+)
 from astropy import units as u
 from numpy.typing import DTypeLike, NDArray
 
@@ -27,12 +33,12 @@ from ._e2e_prediction import (
     _NgsDiagnostics,
 )
 from ._lo_model import (
+    _check_prediction_covariances,
     _check_psd_covariance,
     _ControlSolution,
     _LowOrderCovariances,
-    _LowOrderModel,
     _ReconstructorCovariances,
-    _TiltCommandCovariances,
+    _solve_control,
 )
 from ._reconstructor_calibration import (
     ReconstructorNoiseModel,
@@ -47,7 +53,7 @@ from .interpolation import PsfMetricInterpolator, load_psf_metric_interpolator
 
 
 @dataclass(frozen=True, kw_only=True, eq=False)
-class E2ECalibratedModel(_LowOrderModel):
+class E2ECalibratedModel:
     """Prepared fitted products for standalone LO displacement prediction.
 
     Construct from loaded shared products, or use load_e2e_calibrated_model for
@@ -219,10 +225,11 @@ class E2ECalibratedModel(_LowOrderModel):
             )
 
         controller = self.covariance.controller
-        control = self._solve_control(
+        control = _solve_control(
             reconstruction_covariances=reconstruction_covariances,
-            sensing_gains=sensing.gain.value,
+            sensing_gains=sensing.gain,
             controller=controller,
+            dtype=dtype,
         )
         command_covariances = _compute_calibrated_command_covariances(
             self.covariance,
@@ -233,18 +240,17 @@ class E2ECalibratedModel(_LowOrderModel):
             zenith_angle,
             control,
         )
-        covariances = self._assemble_low_order_covariances(
-            command_covariances=command_covariances,
-            control=control,
-            wfs_noise_variances=sensing.variance.value,
-            controller=controller,
+        residual = assemble_tilt_residual_covariances(
+            command_covariances,
+            command_noise=control.command_noise_covariance(sensing.variance),
         )
+        _check_prediction_covariances(command_covariances, residual)
 
         noise_covariance_scales = np.asarray(
             self.sensing.blur.compute_covariance_scales(len(ngs_positions)), dtype=dtype
         )
         distribution = self._build_displacement_distribution(
-            covariances, noise_covariance_scales
+            residual, noise_covariance_scales
         )
         diagnostics = None
         if diagnostics_level is DiagnosticsLevel.DEBUG:
@@ -256,8 +262,18 @@ class E2ECalibratedModel(_LowOrderModel):
                     sensing=sensing,
                     reconstructor_noise_covariance=reconstructor_noise_prior,
                 ),
-                control=control,
-                covariances=covariances,
+                control=_ControlSolution(
+                    reconstructor=control.reconstructor.value,
+                    feedback=control.feedback,
+                    scalar_feedback=control.scalar_feedback,
+                ),
+                covariances=_LowOrderCovariances(
+                    terms=command_covariances,
+                    atmospheric_residual=residual.atmospheric_residual,
+                    ho_correction=residual.ho_contribution,
+                    noiseless=residual.noiseless,
+                    noise_command=residual.command_noise,
+                ),
                 noise_covariance_scales=noise_covariance_scales,
             )
         return E2ELowOrderPrediction(
@@ -266,16 +282,16 @@ class E2ECalibratedModel(_LowOrderModel):
         )
 
     def _build_displacement_distribution(
-        self, covariances: _LowOrderCovariances, noise_covariance_scales: NDArray
+        self, residual: TiltResidualCovariances, noise_covariance_scales: NDArray
     ) -> LowOrderDistribution:
         """Add the scaled noise covariance to each Gaussian component."""
         weight = self.sensing.blur.mixture_weight
         weights = np.array([weight, 1 - weight], dtype=self.dtype)
         _check_noise_scales(weights, noise_covariance_scales)
         mixture = (
-            covariances.noiseless.value[:, None]
+            residual.noiseless.value[:, None]
             + noise_covariance_scales[None, :, None, None]
-            * covariances.noise_command.value
+            * residual.command_noise.value
         )
         return LowOrderDistribution(
             weights=weights,
@@ -291,8 +307,8 @@ def _compute_calibrated_command_covariances(
     sensing_gains: NDArray,
     coma_responses: NDArray,
     zenith_angle: u.Quantity,
-    control: _ControlSolution,
-) -> _TiltCommandCovariances:
+    control: TipTiltControl,
+) -> TiltCommandCovariances:
     """Contract the six calibrated functions with the scalar closed-loop response.
 
     Borrow the fitted interpolator, physical field coordinates, and numerical WFS
@@ -363,7 +379,7 @@ def _compute_calibrated_command_covariances(
     science_tilt = covariance.C_t_t(
         science_x, science_y, science_x, science_y, zenith_angle=zenith_angle
     ).value
-    return _TiltCommandCovariances(
+    return TiltCommandCovariances(
         science_tilt=quantity_from_value(science_tilt, u.mas**2),
         atmospheric_command=quantity_from_value(atmospheric_command, u.mas**2),
         ho_command=quantity_from_value(ho_command, u.mas**2),

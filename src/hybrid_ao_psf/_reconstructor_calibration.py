@@ -7,6 +7,7 @@ from dataclasses import dataclass, field, replace
 from pathlib import Path
 
 import numpy as np
+from ao_core.models.reconstruction import lo_reconstructor
 from ao_core.models.reconstruction import (
     solve_lo_reconstructor as _shared_solve_lo_reconstructor,
 )
@@ -810,7 +811,6 @@ def build_lo_reconstructor(
         ValueError: If the supplied inputs or their calibrated range are invalid.
     """
     from ._calibration_contracts import _angle
-    from ._calibration_numerics import lo_reconstructor
 
     dtype = validate_psf_dtype(dtype)
     positions = _quantity(ngs_positions, u.arcsec, "ngs_positions", 2, dtype=dtype)

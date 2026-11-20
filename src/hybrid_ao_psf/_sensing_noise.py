@@ -8,7 +8,12 @@ from dataclasses import dataclass, field, replace
 from pathlib import Path
 
 import numpy as np
-from ao_core.models.control import FixedGainIntegrator
+from ao_core.models.control import (
+    FixedGainIntegrator,
+    filter_input,
+    reconstructed_noise_covariance,
+    tip_tilt_feedback,
+)
 from astropy import units as u
 from numpy.typing import DTypeLike
 
@@ -21,11 +26,9 @@ from ._calibration_contracts import (
     _quantity,
 )
 from ._calibration_io import validate_calibration_data_precision
-from ._calibration_numerics import filter_input
 from ._calibration_products import controller_header, read_controller_header
 from ._covariance_calibration import CovarianceFunctions
 from ._io import atomic_output_path
-from ._lo_model import _compute_noise_command_covariance
 from ._reconstructor_calibration import ReconstructorNoiseModel, build_lo_reconstructor
 from ._sensing_response import SensingResponseResult
 from ._sensing_statistics import pooled_displacement_moments
@@ -209,13 +212,12 @@ class SensingNoiseMeasurements(_PhysicalRecord):
                 raise ValueError(
                     f"measurement {name} must be symmetric positive semidefinite"
                 )
-        blocks = self.reconstructor.value.reshape(2, n, 2).transpose(1, 0, 2)
-        feedback = np.einsum("g,gab->ab", self.gains.value, blocks)
+        reconstructor = self.reconstructor.value
+        feedback = tip_tilt_feedback(reconstructor, self.gains.value)
         if not np.allclose(feedback, self.feedback.value, rtol=1e-12, atol=1e-12):
             raise ValueError("measurement feedback differs from declared weights/gains")
-        covariance = _compute_noise_command_covariance(
-            self.controller, feedback, blocks, self.variances.value
-        )
+        noise = reconstructed_noise_covariance(reconstructor, self.variances.value)
+        covariance = self.controller.noise_covariance(feedback, noise * u.mas**2)
         if not np.allclose(
             covariance.value, self.analytical_covariance.value, rtol=1e-10, atol=1e-10
         ):
@@ -367,10 +369,9 @@ def simulate_sensing_noise(
         n = len(request.positions)
         blocks = weights.reshape(2, n, 2).transpose(1, 0, 2)
         gains, variance = values.gain.value, values.variance.value
-        feedback = np.einsum("g,gab->ab", gains, blocks)
-        expected = _compute_noise_command_covariance(
-            controller, feedback, blocks, variance
-        )
+        feedback = tip_tilt_feedback(weights, gains)
+        noise = reconstructed_noise_covariance(weights, variance)
+        expected = controller.noise_covariance(feedback, noise * u.mas**2)
         frames = settings.noise_frames + settings.discard_frames
         realizations = settings.noise_realizations
         x = np.zeros((2, realizations, frames), dtype=dtype)
@@ -386,9 +387,9 @@ def simulate_sensing_noise(
             samples *= np.sqrt(variance[g])
             values = samples.T.reshape(2, realizations, frames)
             x += np.einsum("ab,brt->art", blocks[g], values)
-        displacements = -filter_input(x, feedback, controller.gain, controller.delay)[
-            ..., settings.discard_frames :
-        ]
+        displacements = -filter_input(
+            x, feedback, controller.gain, controller.delay, dtype=dtype
+        )[..., settings.discard_frames :]
         realization_means = displacements.mean(-1)
         displacements, mean, covariance = pooled_displacement_moments(displacements)
         yield SensingNoiseMeasurements(

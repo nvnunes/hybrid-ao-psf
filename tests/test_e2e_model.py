@@ -8,6 +8,7 @@ from dataclasses import replace
 
 import numpy as np
 import pytest
+from ao_core.models.control import TipTiltControl
 from astropy import units as u
 
 from hybrid_ao_psf import (
@@ -39,7 +40,18 @@ from hybrid_ao_psf import (
     save_reconstructor_calibration,
     save_sensing_calibration,
 )
-from hybrid_ao_psf._lo_model import _decompose_feedback, _ReconstructorCovariances
+from hybrid_ao_psf._lo_model import _ReconstructorCovariances, _solve_control
+
+
+def scalar_feedback(feedback):
+    controller = FixedGainIntegrator(
+        gain=0.3, delay=2, frame_rate=500 * u.Hz, dtype=feedback.dtype
+    )
+    return TipTiltControl(
+        reconstructor=feedback * u.one,
+        sensing_gains=[1.0] * u.one,
+        controller=controller,
+    ).scalar_feedback
 
 
 def pooled(left, right):
@@ -175,7 +187,7 @@ def synthetic():
             zenith_angle=record.zenith_angle,
         ).gain.value
         feedback = sum(g * weights[:, 2 * i : 2 * i + 2] for i, g in enumerate(gains))
-        strengths.extend(_decompose_feedback(feedback).strengths)
+        strengths.extend(scalar_feedback(feedback).strengths)
     measured = measure_covariance_calibration(
         record,
         controller,
@@ -242,14 +254,15 @@ def test_control_solve_rejects_reconstruction_for_wrong_ngs_count(synthetic):
     model, _ = synthetic
     one_ngs_covariance = np.eye(2) * u.mas**2
     with pytest.raises(ValueError, match="two axes per NGS"):
-        model._solve_control(
+        _solve_control(
             reconstruction_covariances=_ReconstructorCovariances(
                 ngs_covariance=one_ngs_covariance,
                 centre_ngs_covariance=one_ngs_covariance,
                 noise_prior=one_ngs_covariance,
             ),
-            sensing_gains=np.array([0.4, 0.6]),
+            sensing_gains=[0.4, 0.6] * u.one,
             controller=model.covariance.controller,
+            dtype=model.dtype,
         )
 
 
@@ -434,17 +447,17 @@ def test_precision_immutability_and_input_rejection(synthetic, dtype, indices):
 
 def test_feedback_limits_and_scalar_closed_form():
     for b in (0.5, 1.0, 1.7):
-        values = _decompose_feedback(np.eye(2) * b)
+        values = scalar_feedback(np.eye(2) * b)
         np.testing.assert_allclose(values.strengths, b)
         np.testing.assert_allclose(values.projectors.sum(0), np.eye(2))
         assert not values.symmetric_fallback
     feedback = np.array([[0.8, 0.2], [-0.2, 0.8]])
-    values = _decompose_feedback(feedback)
+    values = scalar_feedback(feedback)
     assert values.symmetric_fallback
     np.testing.assert_allclose(values.effective_feedback, np.eye(2) * 0.8)
     assert values.approximation_relative_error > 0.1
     with pytest.raises(ValueError, match="defective"):
-        _decompose_feedback(np.array([[0.8, 1.0], [0, 0.8]]))
+        scalar_feedback(np.array([[0.8, 1.0], [0, 0.8]]))
 
 
 @pytest.mark.parametrize(
@@ -472,7 +485,7 @@ def test_nonorthogonal_projectors_allow_matrix_product_roundoff(dtype, feedback)
         gain=0.3, delay=2, frame_rate=500 * u.Hz, dtype=dtype
     )
     assert np.max(np.abs(np.linalg.eigvals(controller.transition(feedback)))) < 1
-    decomposition = _decompose_feedback(feedback)
+    decomposition = scalar_feedback(feedback)
     projectors = decomposition.projectors
     tolerance = max(1e-10, 32 * np.finfo(dtype).eps)
     assert not decomposition.symmetric_fallback

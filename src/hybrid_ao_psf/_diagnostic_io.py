@@ -3,10 +3,11 @@
 from __future__ import annotations
 
 from collections.abc import Mapping
-from dataclasses import fields
 from typing import Any
 
 import numpy as np
+from ao_core.models.control import ScalarFeedback
+from ao_core.models.residual import TiltCommandCovariances
 from astropy import units as u
 from numpy.typing import DTypeLike
 
@@ -19,8 +20,6 @@ from ._e2e_prediction import (
 from ._lo_model import (
     _ControlSolution,
     _LowOrderCovariances,
-    _ScalarFeedback,
-    _TiltCommandCovariances,
 )
 from ._sensing_response import SensingPrediction
 from ._units import quantity_from_value
@@ -44,6 +43,15 @@ _FEEDBACK_FIELDS = {
     "eigenbasis_condition": "eigenbasis_condition_number",
 }
 
+
+_COMMAND_COVARIANCE_FIELDS = {
+    "science_tilt": ("science_tilt_covariance", ("num_sci", 2, 2)),
+    "atmospheric_command": ("atmospheric_command_covariance", (2, 2)),
+    "ho_command": ("ho_command_covariance", (2, 2)),
+    "atmospheric_ho_command": ("atmospheric_ho_command_covariance", (2, 2)),
+    "science_atmospheric_command": ("science_atmospheric_command_covariance", ("num_sci", 2, 2)),
+    "science_ho_command": ("science_ho_command_covariance", ("num_sci", 2, 2)),
+}
 
 def _field(dtype: str, shape: tuple = (), unit: str | None = None) -> dict[str, Any]:
     spec = {"dtype": dtype, "shape": shape}
@@ -93,25 +101,13 @@ def _calibrated_fields(dtype: str, num_ngs: int) -> dict[str, dict[str, Any]]:
         "feedback_approximation_relative_error": _field("float64", (), "1"),
         "eigenbasis_condition_number": _field("float64", (), "1"),
         **{
-            name: _field(dtype, (2, 2), "mas2")
-            for name in (
-                "atmospheric_command_covariance",
-                "ho_command_covariance",
-                "atmospheric_ho_command_covariance",
-                "noise_command_covariance",
-            )
+            name: _field(dtype, shape, "mas2")
+            for name, shape in _COMMAND_COVARIANCE_FIELDS.values()
         },
-        **{
-            name: _field(dtype, ("num_sci", 2, 2), "mas2")
-            for name in (
-                "science_atmospheric_command_covariance",
-                "science_ho_command_covariance",
-                "science_tilt_covariance",
-                "atmospheric_residual_covariance",
-                "ho_correction",
-                "noiseless_covariance",
-            )
-        },
+        "noise_command_covariance": _field(dtype, (2, 2), "mas2"),
+        "atmospheric_residual_covariance": _field(dtype, ("num_sci", 2, 2), "mas2"),
+        "ho_correction": _field(dtype, ("num_sci", 2, 2), "mas2"),
+        "noiseless_covariance": _field(dtype, ("num_sci", 2, 2), "mas2"),
         "noise_covariance_scales": _field(dtype, (2,), "1"),
         "displacement_distribution/weights": _field(dtype, (2,), "1"),
         "displacement_distribution/covariances": _field(
@@ -176,8 +172,8 @@ def _calibrated_values(prediction: E2ELowOrderPrediction) -> dict[str, Any]:
             if attribute == "symmetric_fallback"
             else quantity_from_value(value, u.one)
         )
-    for item in fields(_TiltCommandCovariances):
-        values[f"{item.name}_covariance"] = getattr(covariances.terms, item.name)
+    for attribute, (name, _) in _COMMAND_COVARIANCE_FIELDS.items():
+        values[name] = getattr(covariances.terms, attribute)
     return values
 
 
@@ -230,12 +226,12 @@ def _read_calibrated_prediction(
     control = _ControlSolution(
         reconstructor=values["reconstructor"].to_value(u.one),
         feedback=values["feedback_matrix"].to_value(u.one),
-        scalar_feedback=_ScalarFeedback(**feedback),
+        scalar_feedback=ScalarFeedback(**feedback),
     )
-    terms = _TiltCommandCovariances(
+    terms = TiltCommandCovariances(
         **{
-            item.name: values[f"{item.name}_covariance"]
-            for item in fields(_TiltCommandCovariances)
+            attribute: values[name]
+            for attribute, (name, _) in _COMMAND_COVARIANCE_FIELDS.items()
         }
     )
     covariances = _LowOrderCovariances(

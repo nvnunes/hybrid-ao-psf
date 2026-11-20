@@ -5,16 +5,16 @@ from __future__ import annotations
 from dataclasses import dataclass, fields, replace
 
 import numpy as np
+from ao_core.models.control import tip_tilt_feedback
+from ao_core.models.residual import assemble_tilt_residual_covariances
 from astropy import units as u
 from numpy.typing import NDArray
 
 from ._calibration_contracts import _quantity
 from ._lo_model import (
     _check_psd_covariance,
-    _compute_feedback_matrix,
     _ControlSolution,
     _LowOrderCovariances,
-    _validate_scalar_decomposition,
 )
 from ._sensing_response import SensingPrediction
 from ._units import _PhysicalRecord
@@ -148,14 +148,16 @@ def _copy_covariances(
 ) -> _LowOrderCovariances:
     """Preserve the solved covariance groups with immutable physical arrays."""
     terms = covariances.terms
-    frozen_terms = {}
-    for item in fields(terms):
-        value = getattr(terms, item.name)
-        frozen_terms[item.name] = _quantity(
-            value, u.mas**2, item.name, value.ndim, dtype=dtype
+    if terms.science_tilt.dtype != dtype:
+        terms = replace(
+            terms,
+            **{
+                item.name: getattr(terms, item.name).astype(dtype)
+                for item in fields(terms)
+            },
         )
     return _LowOrderCovariances(
-        terms=replace(terms, **frozen_terms),
+        terms=terms,
         atmospheric_residual=_quantity(
             covariances.atmospheric_residual,
             u.mas**2,
@@ -194,7 +196,7 @@ def _check_saved_prediction(prediction: E2ELowOrderPrediction) -> None:
     tolerance = max(1e-10, 32 * np.finfo(distribution.dtype).eps)
     if not np.allclose(
         control.feedback,
-        _compute_feedback_matrix(control.reconstructor, ngs.sensing.gain.value),
+        tip_tilt_feedback(control.reconstructor, ngs.sensing.gain.value),
         rtol=tolerance,
         atol=tolerance,
     ):
@@ -202,18 +204,7 @@ def _check_saved_prediction(prediction: E2ELowOrderPrediction) -> None:
             "feedback_matrix must equal the gain-weighted reconstructor sum"
         )
     scalar = control.scalar_feedback
-    _validate_scalar_decomposition(
-        control.feedback,
-        scalar.effective_feedback,
-        scalar.strengths,
-        scalar.projectors,
-        scalar.symmetric_fallback,
-    )
-    if type(scalar.symmetric_fallback) not in (bool, np.bool_) or any(
-        not np.isfinite(value) or value < 0
-        for value in (scalar.approximation_relative_error, scalar.eigenbasis_condition)
-    ):
-        raise ValueError("invalid scalar feedback diagnostics")
+    scalar.validate(control.feedback)
 
     terms = covariances.terms
     for name, covariance in (
@@ -227,16 +218,18 @@ def _check_saved_prediction(prediction: E2ELowOrderPrediction) -> None:
         ("total_covariance", covariances.total),
     ):
         _check_psd_covariance(covariance.value, name)
-    atmospheric, ho = terms.assemble_residual_covariances()
+    residual = assemble_tilt_residual_covariances(
+        terms, command_noise=covariances.noise_command
+    )
     for actual, expected, error in (
         (
             covariances.atmospheric_residual.value,
-            atmospheric,
+            residual.atmospheric_residual.value,
             "atmospheric residual covariance disagrees with stored command terms",
         ),
         (
             covariances.ho_correction.value,
-            ho,
+            residual.ho_contribution.value,
             "HO covariance contribution disagrees with stored command terms",
         ),
         (

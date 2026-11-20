@@ -9,7 +9,7 @@ from pathlib import Path
 from types import MappingProxyType
 
 import numpy as np
-from ao_core.models.control import FixedGainIntegrator
+from ao_core.models.control import FixedGainIntegrator, settling_cut
 from astropy import units as u
 from numpy.typing import ArrayLike, DTypeLike, NDArray
 from scipy.interpolate import RegularGridInterpolator
@@ -25,7 +25,6 @@ from ._calibration_contracts import (
 )
 from ._calibration_contracts import FixedGainIntegrator as _HybridFixedGainIntegrator
 from ._calibration_io import validate_calibration_data_precision
-from ._calibration_numerics import settling_cut
 from ._calibration_products import (
     controller_header,
     immutable_metadata,

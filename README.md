@@ -19,13 +19,13 @@ regression suite on the minimum and current selected MASTSEL releases.
 
 ## Installation
 
-Install an AO Core build with `ao_core.models` and `ao_core.stats`.
-This example uses a sibling AO Core checkout.
+Hybrid AO PSF requires AO Core 0.1.2 or newer. This example uses a sibling
+AO Core checkout.
 
 ```bash
 python -m pip install --force-reinstall --no-deps ../ao-core
 python -m pip install .
-python -c 'import ao_core.photometry, ao_core.stats; from ao_core.models.config import Configuration'
+python -c 'import hybrid_ao_psf'
 ```
 
 For repository-local development and source overrides, see
