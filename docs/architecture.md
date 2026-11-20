@@ -24,7 +24,7 @@ zeropoint. Hybrid converts magnitudes using MASTSEL geometry and AO Core.
 
 ## Dependencies
 
-The package uses `ao_core.models` for shared INI handling, delayed-integrator
+The package uses `ao_core.models` for shared AO configuration, delayed-integrator
 arithmetic and reconstruction. Hybrid keeps its controller and reconstructor
 entry points and their float32 defaults. `ao_core.stats` provides PSF metadata
 and measurements. `ao_core.photometry` converts magnitudes to effective rates. The low-order
@@ -70,8 +70,10 @@ are validated, ready to evaluate and reusable. Coordinate checks run inside
 evaluation; validation helpers are private. Public comparison operations measure
 interpolation errors against reference samples. The engine converts built-in
 providers internally when the request requires another precision. The combined
-configuration boundary is `HybridConfiguration` plus `load_configuration()`;
-standalone runs write results through `run_configuration()`.
+configuration boundary is `HybridConfiguration` plus `load_configuration()`.
+The loader uses AO Core's shared physical fields and adds Hybrid's request,
+model settings, and provider paths. Standalone runs write results through
+`run_configuration()`.
 
 `HybridCtotCorrection` pairs a callable with optional input file paths.
 `HybridCtotContext` passes resolved observation and controller inputs with

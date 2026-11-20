@@ -4,23 +4,25 @@ from __future__ import annotations
 
 from configparser import ConfigParser, SectionProxy
 from dataclasses import dataclass
+from functools import partial
 from io import StringIO
 from pathlib import Path
 
 import numpy as np
 from ao_core.models.config import (
+    Configuration,
+    IniSource,
+    load_ao_configuration,
     parse_ini,
-    polar_to_cartesian,
     read_ini_array,
     read_ini_scalar,
     resolve_ini_path,
 )
-from ao_core.photometry import photons_per_frame_to_magnitudes
+from ao_core.photometry import WFSPhotometryConfig, photons_per_frame_to_magnitudes
 from astropy import units as u
 from numpy.typing import DTypeLike
 
 from ._calibration_config import _read_e2e_calibration_configuration
-from ._mastsel import _mastsel_frame_rate, _mastsel_photometry
 from .contracts import (
     DiagnosticsLevel,
     HybridRequest,
@@ -38,8 +40,8 @@ type _IniSections = tuple[tuple[str, tuple[tuple[str, str], ...]], ...]
 
 
 @dataclass(frozen=True)
-class HybridConfiguration:
-    """Resolved standalone configuration and its external file paths.
+class HybridConfiguration(Configuration):
+    """Shared AO inputs plus the resolved standalone Hybrid settings.
 
     Attributes:
         request: Validated observation derived from the combined INI file.
@@ -98,15 +100,23 @@ def load_configuration(
     source = Path(path).expanduser().resolve()
     if not source.is_file():
         raise FileNotFoundError(f"Hybrid AO PSF configuration not found: {source}")
-    base_config = source.read_text(encoding="utf-8")
-    parser = parse_ini(base_config)
+    return load_ao_configuration(
+        source, load_pupil=False, decode=partial(_decode_configuration, dtype=dtype)
+    )
+
+
+def _decode_configuration(
+    ini_source: IniSource, ao_config: Configuration, *, dtype: DTypeLike | None
+) -> HybridConfiguration:
+    ini_path, base_ini_text, parser = ini_source.path, ini_source.text, ini_source.parser
+    assert ini_path is not None and base_ini_text is not None
     if not parser.has_section(_HYBRID_SECTION):
         raise ValueError("Configuration requires [hybrid].")
-    model = LowOrderModel(
+    low_order_model = LowOrderModel(
         parser[_HYBRID_SECTION].get("lo_model", LowOrderModel.MASTSEL.value)
     )
-    if model is LowOrderModel.E2E_CALIBRATED:
-        return _load_calibrated_configuration(parser, source, base_config, dtype)
+    if low_order_model is LowOrderModel.E2E_CALIBRATED:
+        return _decode_calibrated_configuration(ini_source, ao_config, dtype)
     for section in (
         _HYBRID_SECTION,
         "telescope",
@@ -117,39 +127,38 @@ def load_configuration(
         if not parser.has_section(section):
             raise ValueError(f"Configuration requires [{section}].")
 
-    hybrid = parser[_HYBRID_SECTION]
+    hybrid_section = parser[_HYBRID_SECTION]
     for option in ("science_psf_file", "ngs_metric_file"):
         previous = option.removesuffix("_file") + "_artifact"
-        if previous in hybrid:
-            if option in hybrid and hybrid[option] != hybrid[previous]:
+        if previous in hybrid_section:
+            if (
+                option in hybrid_section
+                and hybrid_section[option] != hybrid_section[previous]
+            ):
                 raise ValueError(f"Conflicting hybrid.{option} paths.")
-            hybrid[option] = hybrid.pop(previous)
-    if "pixel_scale_mas" in hybrid:
+            hybrid_section[option] = hybrid_section.pop(previous)
+    if "pixel_scale_mas" in hybrid_section:
         raise ValueError(
             "hybrid.pixel_scale_mas is not supported; the science PSF file "
             "owns the pixel scale."
         )
-    science_r = read_ini_array(
-        parser["sources_science"], "Zenith", label="sources_science.Zenith"
-    )
-    science_theta = read_ini_array(
-        parser["sources_science"], "Azimuth", label="sources_science.Azimuth"
-    )
-    science_x, science_y = polar_to_cartesian(science_r, science_theta)
-    ngs_r = read_ini_array(parser["sources_LO"], "Zenith", label="sources_LO.Zenith")
-    ngs_theta = read_ini_array(
-        parser["sources_LO"], "Azimuth", label="sources_LO.Azimuth"
-    )
-    ngs_x, ngs_y = polar_to_cartesian(ngs_r, ngs_theta)
-
-    wavelength_values = read_ini_array(
-        parser["sources_science"],
-        "Wavelength",
-        label="sources_science.Wavelength",
-    )
-    if wavelength_values.size != 1:
+    science_sources = ao_config.science_sources
+    low_order_sources = ao_config.low_order_sources
+    telescope_config = ao_config.telescope
+    if science_sources is None or science_sources.directions is None:
+        raise ValueError("Configuration requires sources_science.Zenith and Azimuth.")
+    if low_order_sources is None or low_order_sources.directions is None:
+        raise ValueError("Configuration requires sources_LO.Zenith and Azimuth.")
+    science_wavelengths = science_sources.wavelengths
+    if science_wavelengths is None:
+        raise ValueError("Configuration requires sources_science.Wavelength.")
+    if science_wavelengths.size != 1:
         raise ValueError("sources_science.Wavelength must contain exactly one value.")
-    magnitudes, zeropoint, mag_standard = _read_mastsel_magnitudes(parser, ngs_r.shape)
+    if telescope_config is None or telescope_config.zenith_angle is None:
+        raise ValueError("Configuration requires telescope.ZenithAngle.")
+    magnitudes, zeropoint, mag_standard = _read_mastsel_magnitudes(
+        hybrid_section, ao_config, (len(low_order_sources.directions),)
+    )
     mastsel_sections = tuple(
         (section, tuple(parser.items(section, raw=True)))
         for section in parser.sections()
@@ -158,61 +167,60 @@ def load_configuration(
     stream = StringIO()
     _mastsel_parser(mastsel_sections).write(stream)
     request = HybridRequest(
-        dtype=hybrid.get("precision", "float32") if dtype is None else dtype,
-        science_positions=np.column_stack((science_x, science_y)) * u.arcsec,
-        ngs_positions=np.column_stack((ngs_x, ngs_y)) * u.arcsec,
+        dtype=hybrid_section.get("precision", "float32") if dtype is None else dtype,
+        science_positions=science_sources.directions,
+        ngs_positions=low_order_sources.directions,
         ngs_magnitude=magnitudes,
-        wavelength=float(wavelength_values[0]) * u.m,
-        zenith_angle=read_ini_scalar(
-            parser["telescope"], "ZenithAngle", label="telescope.ZenithAngle"
-        )
-        * u.deg,
-        diagnostics_level=hybrid.get("diagnostics_level", DiagnosticsLevel.NONE.value),
+        wavelength=science_wavelengths[0],
+        zenith_angle=telescope_config.zenith_angle,
+        diagnostics_level=hybrid_section.get(
+            "diagnostics_level", DiagnosticsLevel.NONE.value
+        ),
     )
-    return HybridConfiguration(
+    return HybridConfiguration.from_config(
+        ao_config,
         request=request,
         lo_model=LowOrderModel.MASTSEL,
         mastsel_ini=stream.getvalue(),
         non_psd_policy=NonPsdPolicy(
-            hybrid.get("non_psd_policy", NonPsdPolicy.ERROR.value)
+            hybrid_section.get("non_psd_policy", NonPsdPolicy.ERROR.value)
         ),
         science_psf_file=_resolved_path(
-            hybrid,
+            hybrid_section,
             "science_psf_file",
-            source=source,
+            source=ini_path,
         ),
         ngs_metric_file=_resolved_path(
-            hybrid,
+            hybrid_section,
             "ngs_metric_file",
-            source=source,
+            source=ini_path,
         ),
-        output=_resolved_path(hybrid, "output", source=source, must_exist=False),
-        source=source,
-        base_config=base_config,
+        output=_resolved_path(hybrid_section, "output", source=ini_path, must_exist=False),
+        source=ini_path,
+        base_config=base_ini_text,
         ngs_magnitude_zeropoint=zeropoint,
         ngs_mag_standard=mag_standard,
     )
 
 
 def _read_mastsel_magnitudes(
-    parser: ConfigParser, ngs_shape: tuple[int, ...]
+    hybrid_section: SectionProxy, ao_config: Configuration, ngs_shape: tuple[int, ...]
 ) -> tuple[u.Quantity, u.Quantity, str | None]:
     """Resolve magnitudes for current INIs and adapt legacy effective rates."""
-    hybrid = parser[_HYBRID_SECTION]
     flux_key = "ngs_flux_photon_per_s"
-    has_magnitudes = "ngs_magnitude" in hybrid
-    if has_magnitudes == (flux_key in hybrid):
+    has_magnitudes = "ngs_magnitude" in hybrid_section
+    if has_magnitudes == (flux_key in hybrid_section):
         raise ValueError(
             f"Specify exactly one of hybrid.ngs_magnitude and hybrid.{flux_key}."
         )
     key = "ngs_magnitude" if has_magnitudes else flux_key
-    values = read_ini_array(hybrid, key, label=f"hybrid.{key}")
+    values = read_ini_array(hybrid_section, key, label=f"hybrid.{key}")
     if values.shape != ngs_shape:
         raise ValueError(f"hybrid.{key} must match sources_LO coordinates.")
     if has_magnitudes:
         zeropoint = (
             read_ini_scalar(
-                hybrid,
+                hybrid_section,
                 "ngs_magnitude_zeropoint",
                 label="hybrid.ngs_magnitude_zeropoint",
             )
@@ -222,15 +230,28 @@ def _read_mastsel_magnitudes(
             zeropoint, _ZEROPOINT_UNIT, "ngs_magnitude_zeropoint", dtype=None
         )
         magnitudes = values * u.mag
-        standard = _read_mag_standard(hybrid)
+        standard = _read_mag_standard(hybrid_section)
     else:
         if np.any(values <= 0.0):
             raise ValueError(f"hybrid.{key} must be positive.")
         zeropoint = _LEGACY_FLUX_ZEROPOINT
-        frame_rate = _mastsel_frame_rate(parser)
-        photometry = _mastsel_photometry(parser, frame_rate, zeropoint)
+        telescope_config = ao_config.telescope
+        low_order_detector = ao_config.low_order_detector
+        low_order_loop = ao_config.low_order_loop
+        if low_order_loop is None or low_order_loop.frame_rate is None:
+            raise ValueError("MASTSEL configuration requires RTC.SensorFrameRate_LO.")
+        if telescope_config is None or telescope_config.diameter is None:
+            raise ValueError("MASTSEL configuration requires telescope.TelescopeDiameter for magnitudes.")
+        if low_order_detector is None or low_order_detector.lenslet_counts is None:
+            raise ValueError("MASTSEL configuration requires sensor_LO.NumberLenslets for magnitudes.")
+        photometry = WFSPhotometryConfig(
+            telescope_diameter=telescope_config.diameter,
+            n_channels=float(low_order_detector.lenslet_counts[0].value),
+            frame_rate=low_order_loop.frame_rate,
+            zeropoint=zeropoint,
+        )
         magnitudes = photons_per_frame_to_magnitudes(
-            values * (u.photon / u.s) / frame_rate, photometry
+            values * (u.photon / u.s) / low_order_loop.frame_rate, photometry
         )
         standard = None
     return magnitudes, zeropoint, standard
@@ -243,9 +264,13 @@ def _read_mag_standard(section: SectionProxy) -> str | None:
     return standard
 
 
-def _load_calibrated_configuration(parser, source, base_config, dtype):
+def _decode_calibrated_configuration(
+    ini_source: IniSource, ao_config: Configuration, dtype: DTypeLike | None
+) -> HybridConfiguration:
     """Parse Cartesian prediction inputs and the shared calibration INI paths."""
-    hybrid = parser[_HYBRID_SECTION]
+    ini_path, base_ini_text, parser = ini_source.path, ini_source.text, ini_source.parser
+    assert ini_path is not None and base_ini_text is not None
+    hybrid_section = parser[_HYBRID_SECTION]
     allowed = {
         "lo_model",
         "output",
@@ -260,47 +285,52 @@ def _load_calibrated_configuration(parser, source, base_config, dtype):
         "diagnostics_level",
         "non_psd_policy",
     }
-    unknown = set(hybrid) - allowed
+    unknown = set(hybrid_section) - allowed
     if unknown:
         raise ValueError(
             f"unsupported E2E [hybrid] keys: {sorted(unknown)}; precision belongs in [e2e]"
         )
-    calibrated = _read_e2e_calibration_configuration(parser, source)
-    policy = NonPsdPolicy(hybrid.get("non_psd_policy", NonPsdPolicy.ERROR.value))
+    calibration_config = _read_e2e_calibration_configuration(parser, ini_path)
+    policy = NonPsdPolicy(hybrid_section.get("non_psd_policy", NonPsdPolicy.ERROR.value))
     if policy is not NonPsdPolicy.ERROR:
         raise ValueError(
             "E2E-calibrated configuration requires non_psd_policy = error."
         )
     request = HybridRequest(
-        dtype=calibrated.dtype if dtype is None else dtype,
-        science_positions=_read_cartesian_positions(hybrid, "science"),
-        ngs_positions=_read_cartesian_positions(hybrid, "ngs"),
+        dtype=calibration_config.dtype if dtype is None else dtype,
+        science_positions=_read_cartesian_positions(hybrid_section, "science"),
+        ngs_positions=_read_cartesian_positions(hybrid_section, "ngs"),
         ngs_magnitude=read_ini_array(
-            hybrid, "ngs_magnitude", label="hybrid.ngs_magnitude"
+            hybrid_section, "ngs_magnitude", label="hybrid.ngs_magnitude"
         )
         * u.mag,
         wavelength=read_ini_scalar(
-            hybrid, "wavelength_um", label="hybrid.wavelength_um"
+            hybrid_section, "wavelength_um", label="hybrid.wavelength_um"
         )
         * u.um,
         zenith_angle=read_ini_scalar(
-            hybrid, "zenith_angle_deg", label="hybrid.zenith_angle_deg"
+            hybrid_section, "zenith_angle_deg", label="hybrid.zenith_angle_deg"
         )
         * u.deg,
-        diagnostics_level=hybrid.get("diagnostics_level", DiagnosticsLevel.NONE.value),
+        diagnostics_level=hybrid_section.get(
+            "diagnostics_level", DiagnosticsLevel.NONE.value
+        ),
     )
-    if not calibrated.science_psf.is_file():
-        raise FileNotFoundError(f"science PSF file not found: {calibrated.science_psf}")
-    return HybridConfiguration(
+    if not calibration_config.science_psf.is_file():
+        raise FileNotFoundError(
+            f"science PSF file not found: {calibration_config.science_psf}"
+        )
+    return HybridConfiguration.from_config(
+        ao_config,
         request=request,
         lo_model=LowOrderModel.E2E_CALIBRATED,
-        science_psf_file=calibrated.science_psf,
+        science_psf_file=calibration_config.science_psf,
         ngs_metric_file=None,
-        output=_resolved_path(hybrid, "output", source=source, must_exist=False),
-        source=source,
-        e2e_configuration=source,
-        base_config=base_config,
-        ngs_mag_standard=_read_mag_standard(hybrid),
+        output=_resolved_path(hybrid_section, "output", source=ini_path, must_exist=False),
+        source=ini_path,
+        e2e_configuration=ini_path,
+        base_config=base_ini_text,
+        ngs_mag_standard=_read_mag_standard(hybrid_section),
     )
 
 
