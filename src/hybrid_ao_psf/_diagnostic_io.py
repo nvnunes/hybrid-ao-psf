@@ -82,17 +82,18 @@ def _mastsel_fields(
     return specs
 
 
-def _calibrated_fields(dtype: str, num_ngs: int) -> dict[str, dict[str, Any]]:
-    """Declare the saved E2E prediction, including the applied Gaussian mixture."""
-    ngs_tilt = 2 * num_ngs
+def _calibrated_fields(dtype: str, num_ngs: int | None) -> dict[str, dict[str, Any]]:
+    """Declare E2E diagnostics with known or batch-resolved NGS dimensions."""
+    ngs_axis = "num_ngs" if num_ngs is None else num_ngs
+    tilt_axes = ("num_ngs", 2) if num_ngs is None else (2 * num_ngs,)
     return {
-        **_metric_fields(dtype, num_ngs),
-        "photons_per_frame": _field(dtype, (num_ngs,), "ph"),
-        "coma_response_coefficients": _field(dtype, (num_ngs,), "mas / nm"),
-        "sensing_gains": _field(dtype, (num_ngs,), "1"),
-        "wfs_noise_variances": _field(dtype, (num_ngs,), "mas2"),
-        "reconstructor_noise_covariance": _field(dtype, (ngs_tilt, ngs_tilt), "mas2"),
-        "reconstructor": _field(dtype, (2, ngs_tilt), "1"),
+        **_metric_fields(dtype, ngs_axis),
+        "photons_per_frame": _field(dtype, (ngs_axis,), "ph"),
+        "coma_response_coefficients": _field(dtype, (ngs_axis,), "mas / nm"),
+        "sensing_gains": _field(dtype, (ngs_axis,), "1"),
+        "wfs_noise_variances": _field(dtype, (ngs_axis,), "mas2"),
+        "reconstructor_noise_covariance": _field(dtype, tilt_axes + tilt_axes, "mas2"),
+        "reconstructor": _field(dtype, (2, *tilt_axes), "1"),
         "feedback_matrix": _field(dtype, (2, 2), "1"),
         "interpolation_feedback_matrix": _field(dtype, (2, 2), "1"),
         "interpolation_feedback_eigenvalues": _field(dtype, (2,), "1"),
@@ -291,8 +292,9 @@ def diagnostic_fields(
         level: Requested diagnostic level.
         dtype: Floating-point result precision.
         psf_shape: Rows and columns of a science PSF. Required for debug.
-        num_ngs: Active NGS count. Required for E2E-Calibrated debug. For
-            MASTSEL, omitting it uses the AO Core ``num_ngs`` slot axis.
+        num_ngs: Active NGS count. Omit it for batches that use the AO Core
+            ``num_ngs`` slot axis. E2E matrix fields then express each
+            combined NGS-tilt axis as ``(num_ngs, 2)``.
 
     Returns:
         AO Core field declarations, keyed by paths relative to ``/diagnostics``.
@@ -324,8 +326,8 @@ def diagnostic_fields(
             }
         )
     elif debug:
-        if num_ngs is None or num_ngs <= 0:
-            raise ValueError("E2E-Calibrated debug diagnostics require the NGS count.")
+        if num_ngs is not None and num_ngs <= 0:
+            raise ValueError("E2E-Calibrated diagnostics require a positive NGS count.")
         specs.update(
             {
                 f"e2e_calibrated/{name}": spec

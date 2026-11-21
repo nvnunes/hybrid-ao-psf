@@ -14,7 +14,7 @@ from tempfile import TemporaryDirectory
 from typing import Any
 
 import numpy as np
-from ao_core.models.config import parse_ini, read_ini_array, read_ini_scalar
+from ao_core.io.ini import parse_ini, read_ini_array, read_ini_scalar
 from ao_core.photometry import WFSPhotometryConfig
 from astropy import units as u
 

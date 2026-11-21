@@ -9,7 +9,7 @@ from typing import Any
 import h5py
 import numpy as np
 from ao_core.io import initialize_result, read_result, write_observation
-from ao_core.models.config import polar_to_cartesian
+from ao_core.io.ini import polar_to_cartesian
 from ao_core.stats import PsfMetadata
 from astropy import units as u
 

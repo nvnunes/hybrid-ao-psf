@@ -112,8 +112,11 @@ def test_ini_loader_resolves_zenith_template_relative_to_ini(tmp_path):
     directory = tmp_path / "config"
     telemetry_dir = directory / "captures"
     telemetry_dir.mkdir(parents=True)
+    pupil = np.eye(5, dtype=bool)
+    with h5py.File(telemetry_dir / "pupil.h5", "w") as saved:
+        saved["pupil"] = pupil
     with h5py.File(telemetry_dir / "probe-22.5.h5", "w") as telemetry:
-        telemetry["wavefront"] = np.zeros((4, 5, 5))
+        telemetry["wavefront"] = np.broadcast_to(pupil.astype(float), (4, 5, 5))
         telemetry["coma"] = np.zeros((4, 2))
         telemetry["magnitudes"] = [14.0, 16.0]
         telemetry["tilt"] = np.ones((4, 2, 8, 2))
@@ -135,6 +138,7 @@ def test_ini_loader_resolves_zenith_template_relative_to_ini(tmp_path):
         "Wavelength = [710e-9]\n"
         "FieldRadius = 60\n"
         "ObscurationRatio = 0.16\n"
+        "PupilMaskPath = captures/pupil.h5\n"
         "LoopGain_LO = 0.3\n"
         "LoopDelaySteps_LO = 2\n"
         "SensorFrameRate_LO = 500\n"
@@ -151,6 +155,10 @@ def test_ini_loader_resolves_zenith_template_relative_to_ini(tmp_path):
     assert measurement.zenith_angle == 22.5 * u.deg
     assert measurement.sensing_wavelength == 710e-9 * u.m
     assert measurement.photometry.photons_per_frame_zeropoint == 1e8 * u.photon
+    ini.write_text(ini.read_text().replace("PupilMaskPath = captures/pupil.h5\n", ""))
+    annulus_calibration = load_telemetry_calibration(ini, dtype=np.float64)
+    with pytest.raises(ValueError, match="wavefront, coma and pupil must be aligned"):
+        next(annulus_calibration.measure_coma())
 
 
 @pytest.mark.parametrize(

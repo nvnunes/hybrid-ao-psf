@@ -95,6 +95,8 @@ class TelemetryCalibration(_CalibrationWorkflow):
         sensing_wavelength: WFS wavelength as a physical length.
         field_radius: Angular radius of the sensing model's calibrated field.
         obscuration_ratio: Central obscuration diameter divided by pupil diameter.
+        pupil_mask_path: Optional HDF5 file containing the shared boolean `pupil`
+            dataset on the coma wavefront grid. Read only during coma measurement.
         asterism_counts: Numbers of one-, two-, and three-NGS asterisms per
             zenith angle. Required for sensing-noise simulation.
     """
@@ -110,6 +112,7 @@ class TelemetryCalibration(_CalibrationWorkflow):
         sensing_wavelength: u.Quantity,
         field_radius: u.Quantity,
         obscuration_ratio: float,
+        pupil_mask_path: str | Path | None = None,
         asterism_counts: tuple[int, int, int] | None = None,
     ):
         super().__init__(configuration)
@@ -150,6 +153,11 @@ class TelemetryCalibration(_CalibrationWorkflow):
         if not 0 <= obscuration_ratio < 1:
             raise ValueError("Obscuration ratio must be in [0, 1).")
         self._obscuration_ratio = obscuration_ratio
+        self._pupil_mask_path = (
+            None
+            if pupil_mask_path is None
+            else Path(pupil_mask_path).expanduser().resolve()
+        )
         self._asterism_counts = None
         if asterism_counts is not None:
             if len(asterism_counts) != 3:
@@ -257,11 +265,15 @@ class TelemetryCalibration(_CalibrationWorkflow):
     def measure_coma(self) -> Iterator[ComaCalibrationMeasurements]:
         """Read and reduce each zenith angle's paired wavefronts and WFS draws.
 
-        Infer the wavefront and draw counts from each file, construct the
-        annular pupil on the saved wavefront grid, and retain four detector-batch
-        means with the noiseless references for fitting.
+        Infer the wavefront and draw counts from each file and retain four
+        detector-batch means with the noiseless references. Validate wavefronts
+        against the configured sampled pupil or an annulus spanning the grid.
         """
         dtype = self.configuration.dtype
+        pupil = None
+        if self._pupil_mask_path is not None:
+            with h5py.File(self._pupil_mask_path, "r") as file:
+                pupil = file["pupil"][:]
         for plane in self._planes.values():
             with h5py.File(plane.coma_path, "r") as telemetry:
                 wavefront = telemetry["wavefront"][:]
@@ -275,13 +287,19 @@ class TelemetryCalibration(_CalibrationWorkflow):
             if wavefront.ndim != 3 or wavefront.shape[1] != wavefront.shape[2]:
                 raise ValueError("Coma telemetry requires square wavefront arrays.")
 
-            coords = np.linspace(-1, 1, wavefront.shape[-1])
-            radius_squared = coords[:, None] ** 2 + coords**2
-            pupil = (radius_squared <= 1) & (
-                radius_squared >= self._obscuration_ratio**2
-            )
+            if pupil is None:
+                coords = np.linspace(-1, 1, wavefront.shape[-1])
+                radius_squared = coords[:, None] ** 2 + coords**2
+                sampled_pupil = (radius_squared <= 1) & (
+                    radius_squared >= self._obscuration_ratio**2
+                )
+            else:
+                sampled_pupil = pupil
             wavefronts = ComaWavefronts(
-                wavefront=wavefront * u.nm, coma=coma * u.nm, pupil=pupil, dtype=dtype
+                wavefront=wavefront * u.nm,
+                coma=coma * u.nm,
+                pupil=sampled_pupil,
+                dtype=dtype,
             )
             settings = replace(
                 self.configuration.coma,
@@ -670,6 +688,16 @@ def load_telemetry_calibration(
                 )
             counts = tuple(sensing.getint(key) for key in keys)
 
+    pupil_mask_path = (
+        resolve_ini_path(
+            system["PupilMaskPath"],
+            source=source,
+            label="system.PupilMaskPath",
+            must_exist=False,
+        )
+        if "PupilMaskPath" in system
+        else None
+    )
     return TelemetryCalibration(
         config,
         reconstructor_path=_telemetry_path(
@@ -684,5 +712,6 @@ def load_telemetry_calibration(
         obscuration_ratio=read_ini_scalar(
             system, "ObscurationRatio", label="system.ObscurationRatio"
         ),
+        pupil_mask_path=pupil_mask_path,
         asterism_counts=counts,
     )

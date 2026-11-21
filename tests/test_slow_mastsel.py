@@ -9,7 +9,7 @@ from pathlib import Path
 import h5py
 import numpy as np
 import pytest
-from ao_core.models.config import parse_ini
+from ao_core.io.ini import parse_ini
 from astropy import units as u
 
 from hybrid_ao_psf import (

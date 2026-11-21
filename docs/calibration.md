@@ -117,10 +117,13 @@ frame counts at each zenith.
 | `tilt` | `(realization, magnitude, draw, 2)` | Noisy WFS tip/tilt in mas |
 
 Each realization supplies one independent residual HO wavefront, held fixed
-across all magnitudes and noise draws. Sample it on a square grid with each axis
-spaced uniformly from −1 to 1. Set the OPD to zero outside the annulus defined
-by the unit outer radius and `ObscurationRatio` inner radius. Use the same
-primary-coma basis and component order as in covariance telemetry.
+across all magnitudes and noise draws. Use a square wavefront grid and set
+OPD to zero outside the sampled pupil. For a grid that represents the aperture
+as an annulus spanning the grid, the reader uses axes spaced uniformly from
+−1 to 1 and takes `ObscurationRatio` as the inner radius. For an explicitly
+sampled pupil, set `[system] PupilMaskPath` to an HDF5 file with a boolean
+`pupil` dataset of shape `(y, x)`. The file is shared across zeniths.
+Use the same primary-coma basis and component order as in covariance telemetry.
 
 The realization and draw counts must each be divisible by four. Use one common
 strictly increasing magnitude grid with at least two magnitudes across zenith
