@@ -445,6 +445,7 @@ class SensingResponseResult:
 
     _model: SensingResponseModel
     _noise_samples: Mapping
+    _spot_metrics: Mapping
     _sampling: object
     _displacement: u.Quantity
 
@@ -485,6 +486,11 @@ class SensingResponseResult:
         result = object.__new__(type(self))
         object.__setattr__(result, "_model", self.model.prepare(dtype=dtype))
         object.__setattr__(result, "_noise_samples", MappingProxyType(noise_samples))
+        metrics = {
+            tuple(map(float, np.asarray(key, dtype=dtype))): value
+            for key, value in self._spot_metrics.items()
+        }
+        object.__setattr__(result, "_spot_metrics", MappingProxyType(metrics))
         object.__setattr__(result, "_sampling", self._sampling)
         object.__setattr__(
             result,
@@ -607,7 +613,8 @@ def build_sensing_response(
         measurements: Compatible raw WFS measurements over field and magnitude.
         field_radius: Positive angular radius enclosing the sampled directions.
         magnitude_intervals: Optional measured magnitude intervals used to
-            bound interpolation. Defaults to the measured magnitude range.
+            bound interpolation. Without them, spacings above the minimum measured
+            spacing mark gaps in the interpolation range.
         dtype: Calculation precision, either float32 or float64.
 
     Returns:
@@ -619,6 +626,7 @@ def build_sensing_response(
     dtype = validate_psf_dtype(dtype)
     rows = []
     noise_samples = {}
+    spot_metrics = {}
     first = None
     coordinate_precision = dtype
     for item in measurements:
@@ -655,6 +663,12 @@ def build_sensing_response(
         )
         if point in noise_samples:
             raise ValueError("duplicate sensing calibration point")
+        if item.ee is not None:
+            metrics = float(item.ee.value), float(item.fwhm.value)
+            if spot_metrics.setdefault(point[:3], metrics) != metrics:
+                raise ValueError(
+                    "Spot metrics must match across magnitudes at a direction."
+                )
         stats = item.statistics()
         gain = stats.gain
         variance = float(stats.variance.value)
@@ -712,6 +726,7 @@ def build_sensing_response(
     result = object.__new__(SensingResponseResult)
     object.__setattr__(result, "_model", model)
     object.__setattr__(result, "_noise_samples", MappingProxyType(noise_samples))
+    object.__setattr__(result, "_spot_metrics", MappingProxyType(spot_metrics))
     object.__setattr__(result, "_sampling", first.sampling)
     object.__setattr__(result, "_displacement", first.displacement)
     return result

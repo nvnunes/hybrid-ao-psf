@@ -72,14 +72,11 @@ NGS PSFs, then run the E2E-Calibrated example from the repository root.
 ./examples/e2e-calibrated/run.sh
 ```
 
-The script builds the interpolators and synthetic calibration products in
-`examples/e2e-calibrated/products/` and writes the result to
-`examples/e2e-calibrated/results/hybrid.h5`. To use your own PSFs, set the
-builder's input paths in the run script to directories in the
-[example PSF library format](docs/interpolation.md#example-psf-libraries).
-The example demonstrates prediction with synthetic calibration products,
-even when you supply your own PSFs. See [E2E Calibration](docs/calibration.md)
-for the measurements that produce models for a physical system.
+The runner builds the PSF interpolators, generates synthetic telemetry, and
+fits all four calibration models before predicting the Hybrid PSFs. See the
+[calibrated example](docs/configuration.md#executable-e2e-calibrated-example)
+for the individual steps and [E2E Calibration](docs/calibration.md) for the
+inputs supplied by a physical system.
 
 See [Configuration](docs/configuration.md#executable-sample) for the MASTSEL example
 and [Calibrated Low-Order Prediction](docs/e2e-model.md) for the Python entry

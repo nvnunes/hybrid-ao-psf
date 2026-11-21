@@ -101,6 +101,11 @@ from ._sensing_response import (
     SensingResponseResult,
     build_sensing_response,
 )
+from ._telemetry_calibration import (
+    TelemetryCalibration,
+    ZenithTelemetry,
+    load_telemetry_calibration,
+)
 from ._version import __version__
 from .config import HybridConfiguration, load_configuration
 from .contracts import (
@@ -205,6 +210,9 @@ __all__ = [  # noqa: RUF022
     "E2ELowOrderPrediction",
     # Calibration configuration and reusable measurements
     "E2ECalibration",
+    "TelemetryCalibration",
+    "ZenithTelemetry",
+    "load_telemetry_calibration",
     "E2ECalibrationConfiguration",
     "load_e2e_calibration_configuration",
     "CalibrationPhotometry",

@@ -82,7 +82,7 @@ def array_file_destination(path: Path, kind: str, digest: str) -> tuple[Path, bo
             return array_file, False
 
 
-def save_product(path, kind, metadata, arrays=None):
+def save_product(path, kind, metadata, arrays=None, *, diagnostics=None):
     """Save one model.json after its complete numeric array file is durable.
 
     Separate array file revisions keep the previously accepted manifest usable if
@@ -100,6 +100,8 @@ def save_product(path, kind, metadata, arrays=None):
     }
     if set(metadata) & {"schema", "version", "array_file", "array_file_sha256"}:
         raise ValueError("product metadata cannot replace envelope fields")
+    diagnostics = json_metadata(diagnostics)
+    json.dumps(diagnostics, allow_nan=False)
     path.parent.mkdir(parents=True, exist_ok=True)
     if arrays is not None:
         # The temporary NPZ is complete before the manifest can refer to it.
@@ -121,7 +123,7 @@ def save_product(path, kind, metadata, arrays=None):
                 ):
                     shutil.copyfileobj(source, destination, length=1024 * 1024)
             header.update(array_file=array_file.name, array_file_sha256=digest)
-    save_manifest(path, header)
+    save_manifest(path, header, diagnostics=diagnostics)
 
 
 def save_manifest(path, header, *, diagnostics=None):

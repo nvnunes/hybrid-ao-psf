@@ -342,13 +342,19 @@ def configured(synthetic, tmp_path):
     )
     ini = tmp_path / "prediction.ini"
     ini.write_text(
-        "[e2e]\nprecision = float64\n"
-        + "".join(
-            f"{f}_model = {f}/model.json\n"
-            for f in ("covariance", "coma", "sensing", "reconstructor")
-        )
-        + "science_psf = science.pkl\nngs_metrics = metrics.pkl\nngs_psf = unavailable.pkl\n[native]\nsource = unavailable\n"
-        + "[hybrid]\nlo_model = e2e-calibrated\noutput = result.h5\nscience_x_arcsec = [0,0]\nscience_y_arcsec = [0,1]\nngs_x_arcsec = [-1,1]\nngs_y_arcsec = [-1,1]\nngs_magnitude = [9,9]\nwavelength_um = 1.65\nzenith_angle_deg = 20\n"
+        "[settings]\nPrecision = float64\n"
+        "[inputs]\n"
+        "CovarianceModelPath = covariance/model.json\n"
+        "ComaModelPath = coma/model.json\n"
+        "SensingModelPath = sensing/model.json\n"
+        "ReconstructorModelPath = reconstructor/model.json\n"
+        "SciencePSFPath = science.pkl\nNGSMetricsPath = metrics.pkl\n"
+        "[outputs]\nOutputPath = result.h5\n"
+        "[native]\nsource = unavailable\n"
+        "[telescope]\nZenithAngle = 20\n"
+        "[sources_science]\nWavelength = [1.65e-6]\n"
+        "[hybrid]\nLOModel = e2e-calibrated\nScienceX = [0,0]\nScienceY = [0,1]\n"
+        "NGSX = [-1,1]\nNGSY = [-1,1]\nNGSMagnitude = [9,9]\n"
     )
     return ini
 
@@ -441,6 +447,14 @@ def test_e2e_configuration_rejects_foreign_hybrid_fields(configured, field):
     with configured.open("a") as stream:
         stream.write(f"{field} = ignored\n")
     with pytest.raises(ValueError, match="unsupported E2E"):
+        load_configuration(configured)
+
+
+@pytest.mark.parametrize("key", ["SciencePSFPath", "NGSMetricsPath", "CovarianceModelPath"])
+def test_e2e_prediction_requires_its_input_paths(configured, key):
+    lines = configured.read_text().splitlines(keepends=True)
+    configured.write_text("".join(line for line in lines if not line.startswith(f"{key} = ")))
+    with pytest.raises(ValueError, match=key):
         load_configuration(configured)
 
 

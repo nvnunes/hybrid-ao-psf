@@ -6,10 +6,16 @@ Whole-PH Gram matrices retain a common feature ordering for uncertainty checks.
 
 from __future__ import annotations
 
+from collections.abc import Mapping
+from typing import TYPE_CHECKING
+
 import numpy as np
 from ao_core.models.control import scalar_filter, settling_cut
+from astropy import units as u
 from scipy.interpolate import RegularGridInterpolator
 
+from ._calibration_contracts import CovarianceTelemetry
+from ._calibration_products import immutable_metadata
 from ._covariance_grid import rectangular_mapping
 from ._covariance_statistics import (
     FUNCTIONS,
@@ -19,6 +25,11 @@ from ._covariance_statistics import (
     covariance_tables,
     features,
 )
+
+if TYPE_CHECKING:
+    from ._covariance_calibration import CovarianceFunctions
+    from ._reconstructor_calibration import ReconstructorNoiseModel
+
 
 BOOTSTRAP_DRAWS = 200
 BOOTSTRAP_SEED = 20261013
@@ -296,8 +307,10 @@ class InterpolationDiagnostics:
             else None,
             "spatial_training_count": len(self.training),
             "spatial_withheld_indices": self.withheld.tolist(),
-            "limitations": ("Same-PH checks at withheld points on a coarser spatial grid. "
-                "No reference comparison between points on the final grid or between zenith angles."),
+            "limitations": (
+                "Same-PH checks at withheld points on a coarser spatial grid. "
+                "No reference comparison between points on the final grid or between zenith angles."
+            ),
         }
 
 
@@ -553,3 +566,201 @@ def pilot_diagnostics(
         "matrix_loop_assembly": assemblies,
         "retained_frames": sources[0].tilt.shape[-1] - settings.discard,
     }
+
+
+# Validate filtered covariance against direct loop simulation
+
+
+def _check_covariance_against_loop(result, reconstructor, validation_telemetry):
+    """Attach a direct-loop comparison for each measured zenith plane."""
+    from ._covariance_calibration import CovarianceCalibrationResult
+
+    checks = {}
+    for telemetry in validation_telemetry:
+        angle = float(telemetry.zenith_angle.value)
+        if angle in checks:
+            raise ValueError("duplicate validation telemetry planes")
+        checks[angle] = _validate_covariance_reconstructor(
+            result.model, reconstructor, telemetry
+        )
+    if set(checks) != set(result.model.zenith_angles.value):
+        raise ValueError("validation telemetry must cover every measured ZA plane")
+    return CovarianceCalibrationResult(
+        model=result.model,
+        diagnostics={
+            **result.diagnostics,
+            "calibrated_reconstructor": {
+                str(angle): check for angle, check in checks.items()
+            },
+        },
+    )
+
+
+def _validate_covariance_reconstructor(
+    covariances: CovarianceFunctions,
+    noise: ReconstructorNoiseModel,
+    telemetry: CovarianceTelemetry,
+) -> Mapping:
+    """Check calibrated-weight atmospheric assembly against direct matrix simulation.
+
+    Use matching uncentred telemetry for one measured ZA plane and the interpolator's
+    settled window. Choose one/two/three measured directions, build absolute
+    weights with the calibrated prior, and use a controlled full-matrix sensing
+    response whose feedback eigenvalues are grid points. This isolates numerical
+    assembly from feedback interpolation and physical gain modelling. Compare
+    command, science/command and residual covariances using one pooled mean.
+    Raise on incompatible timing/directions or discrepancies above rtol=1e-12,
+    atol=1e-10 mas squared. Return immutable per-asterism numerical evidence.
+    No native files, WFS model or MASTSEL calculation is used.
+
+    Args:
+        covariances: Measured covariance interpolators.
+        noise: Accepted reconstructor noise prior.
+        telemetry: Matched histories at one measured zenith plane.
+
+    Returns:
+        Immutable per-asterism evidence comparing interpolator and direct simulation.
+
+    Raises:
+        TypeError: If inputs are not the required typed records.
+        ValueError: If compatibility or agreement checks fail.
+    """
+    from ._covariance_calibration import CovarianceFunctions
+    from ._reconstructor_calibration import (
+        ReconstructorNoiseModel,
+        build_lo_reconstructor,
+    )
+
+    if (
+        not isinstance(covariances, CovarianceFunctions)
+        or not isinstance(noise, ReconstructorNoiseModel)
+        or not isinstance(telemetry, CovarianceTelemetry)
+    ):
+        raise TypeError(
+            "calibrated interpolator, prior and physical telemetry required"
+        )
+    if telemetry.frame_rate != covariances.controller.frame_rate:
+        raise ValueError("validation and covariance frame rates differ")
+    dtype = covariances.dtype
+    cut = covariances.discard
+    if telemetry.tilt.shape[1] - cut < 3:
+        raise ValueError("insufficient validation frames after settling")
+    feedback_endpoints = covariances.feedback[[0, -1]]
+    feedback = np.diag(feedback_endpoints)
+    chosen = np.linspace(
+        0, len(telemetry.positions) - 1, min(3, len(telemetry.positions)), dtype=int
+    )
+    science_position = telemetry.positions[chosen[0]]
+    science = telemetry.tilt.value[:, cut:, chosen[0]]
+    width = np.sqrt(noise.fwhm.value[0] * noise.fwhm.value[-1])
+    signal = np.sqrt(
+        noise.photons_per_frame.value[0] * noise.photons_per_frame.value[-1]
+    )
+    fraction = (
+        0.5 if noise.ee is None else np.sqrt(noise.ee.value[0] * noise.ee.value[-1])
+    )
+    projections = [np.diag([1, 0]), np.diag([0, 1])]
+    angle = telemetry.zenith_angle
+    evidence = {}
+
+    def covariance(left, right):
+        left, right = left.reshape(-1, 2), right.reshape(-1, 2)
+        return (left - left.mean(0)).T @ (right - right.mean(0)) / len(left)
+
+    for count in range(1, len(chosen) + 1):
+        indices = chosen[:count]
+        positions = telemetry.positions[indices]
+        photons = signal / fraction if noise.ee is None else signal
+        weights = build_lo_reconstructor(
+            covariances,
+            noise,
+            ngs_positions=positions,
+            zenith_angle=angle,
+            photons_per_frame=np.full(count, photons, dtype=dtype) * u.photon,
+            ee=np.full(count, fraction, dtype=dtype) * u.one,
+            fwhm=np.full(count, width, dtype=dtype) * u.mas,
+            dtype=dtype,
+        )
+        blocks = [weights[:, 2 * g : 2 * g + 2] for g in range(count)]
+        sensing = np.linalg.solve(sum(blocks, np.zeros((2, 2), dtype=dtype)), feedback)
+        transforms = [block @ sensing for block in blocks]
+        inputs = sum(
+            (
+                telemetry.tilt.value[:, :, index] @ transform.T
+                for index, transform in zip(indices, transforms, strict=True)
+            ),
+            np.zeros(telemetry.tilt.shape[:2] + (2,), dtype=dtype),
+        )
+        commands = np.broadcast_to(
+            np.linalg.solve(feedback, inputs[:, 0].T).T[:, None], inputs.shape
+        ).copy()
+        gain, delay = covariances.controller.gain, covariances.controller.delay
+        for frame in range(delay, inputs.shape[1]):
+            commands[:, frame] = (
+                commands[:, frame - 1]
+                - gain * (commands[:, frame - delay] @ feedback.T)
+                + gain * inputs[:, frame - delay]
+            )
+        commands = commands[:, cut:]
+        q, k = np.zeros((2, 2), dtype=dtype), np.zeros((2, 2), dtype=dtype)
+        for (xi, yi), left in zip(positions, transforms, strict=True):
+            for p, projection in enumerate(projections):
+                a = projection @ left
+                k += (
+                    covariances.C_t_Tt(
+                        *science_position,
+                        xi,
+                        yi,
+                        feedback_endpoints[p],
+                        zenith_angle=angle,
+                    ).value
+                    @ a.T
+                )
+                for (xg, yg), right in zip(positions, transforms, strict=True):
+                    for j, other in enumerate(projections):
+                        b = other @ right
+                        q += (
+                            a
+                            @ covariances.C_Tt_Tt(
+                                xi,
+                                yi,
+                                xg,
+                                yg,
+                                feedback_endpoints[p],
+                                feedback_endpoints[j],
+                                zenith_angle=angle,
+                            ).value
+                            @ b.T
+                        )
+        residual = (
+            covariances.C_t_t(
+                *science_position, *science_position, zenith_angle=angle
+            ).value
+            + q
+            - k
+            - k.T
+        )
+        comparisons = {
+            "command": (q, covariance(commands, commands)),
+            "science_command": (k, covariance(science, commands)),
+            "residual": (residual, covariance(science - commands, science - commands)),
+        }
+        errors = {}
+        for name, (predicted, expected) in comparisons.items():
+            roundoff = (
+                128
+                * np.finfo(dtype).eps
+                * max(np.linalg.norm(predicted), np.linalg.norm(expected))
+            )
+            if not np.allclose(
+                predicted, expected, rtol=1e-12, atol=max(1e-10, roundoff)
+            ):
+                raise ValueError(
+                    f"calibrated-reconstructor validation failed: {count} NGS, {name}"
+                )
+            errors[name] = float(np.max(np.abs(predicted - expected)))
+        evidence[str(count)] = {
+            "weights": weights.tolist(),
+            "max_absolute_mas2": errors,
+        }
+    return immutable_metadata(evidence)

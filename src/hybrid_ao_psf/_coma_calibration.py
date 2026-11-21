@@ -15,6 +15,9 @@ from ._calibration_config import ComaCalibrationSettings
 from ._calibration_contracts import (
     CalibrationPhotometry,
     ComaResponseMeasurements,
+    ComaWavefronts,
+    ComaWfsMeasurements,
+    ComaWfsSampling,
     _angle,
     _count,
     _PhysicalRecord,
@@ -281,6 +284,41 @@ class ComaCalibrationResult:
         )
 
 
+def _reduce_coma_measurements(
+    zenith_angle: u.Quantity,
+    *,
+    sensing_wavelength: u.Quantity,
+    photometry: CalibrationPhotometry,
+    wavefronts: ComaWavefronts,
+    measured: ComaWfsMeasurements,
+    sampling: ComaWfsSampling,
+    settings: ComaCalibrationSettings,
+) -> ComaCalibrationMeasurements:
+    """Group paired coma draws into four batch means for fitting."""
+    expected = (settings.samples, len(sampling.magnitudes), settings.noise_draws, 2)
+    if measured.measured.shape != expected:
+        raise ValueError("coma WFS returned different sample/magnitude/draw axes")
+    batches = measured.measured.reshape(
+        settings.samples, len(sampling.magnitudes), 4, settings.noise_draws // 4, 2
+    ).mean(axis=3)
+    response = ComaResponseMeasurements(
+        coma=wavefronts.coma,
+        magnitudes=sampling.magnitudes,
+        tilt_mean=batches.mean(axis=2),
+        tilt_batches=batches,
+        tilt_noiseless=measured.noiseless,
+        dtype=sampling.dtype,
+    )
+    return ComaCalibrationMeasurements(
+        zenith_angle=zenith_angle,
+        response=response,
+        sensing_wavelength=sensing_wavelength,
+        photometry=photometry,
+        settings=settings,
+        dtype=sampling.dtype,
+    )
+
+
 def build_coma_calibration(
     measurements: Iterable[ComaCalibrationMeasurements],
     *,
@@ -313,7 +351,9 @@ def build_coma_calibration(
     ):
         raise ValueError("at least three typed coma measurement planes required")
     dtype = validate_psf_dtype(dtype)
-    coordinate_precision = coarsest_precision(dtype, *(item.dtype for item in measurements))
+    coordinate_precision = coarsest_precision(
+        dtype, *(item.dtype for item in measurements)
+    )
     measurements = [
         replace(
             item,
@@ -388,17 +428,24 @@ def build_coma_calibration(
     )
 
 
-def save_coma_calibration(model: ComaResponseModel, path: str | Path) -> None:
+def save_coma_calibration(
+    model: ComaResponseModel | ComaCalibrationResult, path: str | Path
+) -> None:
     """Atomically save a JSON-only response model with physical ranges.
 
     Args:
         model: The fitted primary-coma response and its measured range.
+            Pass the calibration result to save its diagnostics with the model.
         path: Destination model.json manifest. Create its parent directories if
             needed. Atomically replace any existing destination.
 
     Raises:
         TypeError: If the input is not the expected calibration record.
     """
+    diagnostics = None
+    if isinstance(model, ComaCalibrationResult):
+        diagnostics = model.diagnostics
+        model = model.model
     if not isinstance(model, ComaResponseModel):
         raise TypeError("model must be ComaResponseModel")
     save_product(
@@ -420,6 +467,7 @@ def save_coma_calibration(model: ComaResponseModel, path: str | Path) -> None:
             "photometry": photometry_header(model.photometry),
             "units": {"response": "mas/nm", "magnitude": "mag", "zenith": "deg"},
         },
+        diagnostics=diagnostics,
     )
 
 

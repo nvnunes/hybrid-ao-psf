@@ -9,15 +9,14 @@ from io import StringIO
 from pathlib import Path
 
 import numpy as np
-from ao_core.models.config import (
-    Configuration,
+from ao_core.io.ini import (
     IniSource,
-    load_ao_configuration,
     parse_ini,
     read_ini_array,
     read_ini_scalar,
     resolve_ini_path,
 )
+from ao_core.models.config import Configuration, load_ao_configuration
 from ao_core.photometry import WFSPhotometryConfig, photons_per_frame_to_magnitudes
 from astropy import units as u
 from numpy.typing import DTypeLike
@@ -82,7 +81,7 @@ def load_configuration(
 
     Paths in the INI are relative to the INI's directory. MASTSEL is the
     default and reads the combined INI with polar source coordinates.
-    E2E-Calibrated reads Cartesian coordinates and the shared `[e2e]` section.
+    E2E-Calibrated reads Cartesian coordinates and separate `[inputs]` and `[outputs]`.
     The returned configuration carries file paths for later provider loading.
 
     Args:
@@ -112,8 +111,9 @@ def _decode_configuration(
     assert ini_path is not None and base_ini_text is not None
     if not parser.has_section(_HYBRID_SECTION):
         raise ValueError("Configuration requires [hybrid].")
+    hybrid_section = parser[_HYBRID_SECTION]
     low_order_model = LowOrderModel(
-        parser[_HYBRID_SECTION].get("lo_model", LowOrderModel.MASTSEL.value)
+        hybrid_section.get("LOModel", hybrid_section.get("lo_model", LowOrderModel.MASTSEL.value))
     )
     if low_order_model is LowOrderModel.E2E_CALIBRATED:
         return _decode_calibrated_configuration(ini_source, ao_config, dtype)
@@ -127,7 +127,6 @@ def _decode_configuration(
         if not parser.has_section(section):
             raise ValueError(f"Configuration requires [{section}].")
 
-    hybrid_section = parser[_HYBRID_SECTION]
     for option in ("science_psf_file", "ngs_metric_file"):
         previous = option.removesuffix("_file") + "_artifact"
         if previous in hybrid_section:
@@ -257,10 +256,10 @@ def _read_mastsel_magnitudes(
     return magnitudes, zeropoint, standard
 
 
-def _read_mag_standard(section: SectionProxy) -> str | None:
-    standard = section.get("ngs_mag_standard")
+def _read_mag_standard(section: SectionProxy, key: str = "ngs_mag_standard") -> str | None:
+    standard = section.get(key)
     if standard is not None and not standard.strip():
-        raise ValueError("hybrid.ngs_mag_standard must be nonempty when supplied.")
+        raise ValueError(f"hybrid.{key} must be nonempty when supplied.")
     return standard
 
 
@@ -272,71 +271,81 @@ def _decode_calibrated_configuration(
     assert ini_path is not None and base_ini_text is not None
     hybrid_section = parser[_HYBRID_SECTION]
     allowed = {
-        "lo_model",
-        "output",
-        "science_x_arcsec",
-        "science_y_arcsec",
-        "ngs_x_arcsec",
-        "ngs_y_arcsec",
-        "ngs_magnitude",
-        "ngs_mag_standard",
-        "wavelength_um",
-        "zenith_angle_deg",
-        "diagnostics_level",
-        "non_psd_policy",
+        "LOModel",
+        "ScienceX",
+        "ScienceY",
+        "NGSX",
+        "NGSY",
+        "NGSMagnitude",
+        "NGSMagStandard",
+        "DiagnosticsLevel",
+        "NonPSDPolicy",
     }
+    output_section = _HYBRID_SECTION if "e2e" in parser else "outputs"
+    output_key = "output" if output_section == _HYBRID_SECTION else "OutputPath"
+    if output_section == _HYBRID_SECTION:
+        allowed.add(output_key)
     unknown = set(hybrid_section) - allowed
     if unknown:
         raise ValueError(
-            f"unsupported E2E [hybrid] keys: {sorted(unknown)}; precision belongs in [e2e]"
+            f"unsupported E2E [hybrid] keys: {sorted(unknown)}; Precision belongs in [settings]"
         )
-    calibration_config = _read_e2e_calibration_configuration(parser, ini_path)
-    policy = NonPsdPolicy(hybrid_section.get("non_psd_policy", NonPsdPolicy.ERROR.value))
+    calibration_config = _read_e2e_calibration_configuration(parser, ini_path, prediction=True)
+    policy = NonPsdPolicy(hybrid_section.get("NonPSDPolicy", NonPsdPolicy.ERROR.value))
     if policy is not NonPsdPolicy.ERROR:
         raise ValueError(
-            "E2E-calibrated configuration requires non_psd_policy = error."
+            "E2E-calibrated configuration requires NonPSDPolicy = error."
         )
+    sources = ao_config.science_sources
+    if sources is None or sources.wavelengths is None or sources.wavelengths.size != 1:
+        raise ValueError("[sources_science] Wavelength requires one science wavelength.")
+    telescope = ao_config.telescope
+    if telescope is None or telescope.zenith_angle is None:
+        raise ValueError("[telescope] requires ZenithAngle.")
+
     request = HybridRequest(
         dtype=calibration_config.dtype if dtype is None else dtype,
-        science_positions=_read_cartesian_positions(hybrid_section, "science"),
-        ngs_positions=_read_cartesian_positions(hybrid_section, "ngs"),
+        science_positions=_read_cartesian_positions(hybrid_section, "Science"),
+        ngs_positions=_read_cartesian_positions(hybrid_section, "NGS"),
         ngs_magnitude=read_ini_array(
-            hybrid_section, "ngs_magnitude", label="hybrid.ngs_magnitude"
+            hybrid_section, "NGSMagnitude", label="hybrid.NGSMagnitude"
         )
         * u.mag,
-        wavelength=read_ini_scalar(
-            hybrid_section, "wavelength_um", label="hybrid.wavelength_um"
-        )
-        * u.um,
-        zenith_angle=read_ini_scalar(
-            hybrid_section, "zenith_angle_deg", label="hybrid.zenith_angle_deg"
-        )
-        * u.deg,
+        wavelength=sources.wavelengths[0],
+        zenith_angle=telescope.zenith_angle,
         diagnostics_level=hybrid_section.get(
-            "diagnostics_level", DiagnosticsLevel.NONE.value
+            "DiagnosticsLevel", DiagnosticsLevel.NONE.value
         ),
     )
-    if not calibration_config.science_psf.is_file():
-        raise FileNotFoundError(
-            f"science PSF file not found: {calibration_config.science_psf}"
-        )
+    science_psf_path = calibration_config.science_psf
+    if science_psf_path is None:
+        raise ValueError("[inputs] requires SciencePSFPath for standalone prediction.")
+    if calibration_config.ngs_metrics is None:
+        raise ValueError("[inputs] requires NGSMetricsPath for calibrated prediction.")
+    if not science_psf_path.is_file():
+        raise FileNotFoundError(f"science PSF file not found: {science_psf_path}")
     return HybridConfiguration.from_config(
         ao_config,
         request=request,
         lo_model=LowOrderModel.E2E_CALIBRATED,
-        science_psf_file=calibration_config.science_psf,
+        science_psf_file=science_psf_path,
         ngs_metric_file=None,
-        output=_resolved_path(hybrid_section, "output", source=ini_path, must_exist=False),
+        output=resolve_ini_path(
+            parser.get(output_section, output_key, fallback=""),
+            source=ini_path,
+            label=f"{output_section}.{output_key}",
+            must_exist=False,
+        ),
         source=ini_path,
         e2e_configuration=ini_path,
         base_config=base_ini_text,
-        ngs_mag_standard=_read_mag_standard(hybrid_section),
+        ngs_mag_standard=_read_mag_standard(hybrid_section, "NGSMagStandard"),
     )
 
 
 def _read_cartesian_positions(section, field: str) -> u.Quantity:
     """Read the INI's x and y vectors as a single array of angular pairs."""
-    x_key, y_key = f"{field}_x_arcsec", f"{field}_y_arcsec"
+    x_key, y_key = f"{field}X", f"{field}Y"
     x = read_ini_array(section, x_key, label=f"hybrid.{x_key}")
     y = read_ini_array(section, y_key, label=f"hybrid.{y_key}")
     if x.shape != y.shape:

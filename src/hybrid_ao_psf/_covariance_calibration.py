@@ -1008,17 +1008,24 @@ def build_covariance_calibration(
 # Save and load fitted interpolators
 
 
-def save_covariance_calibration(model: CovarianceFunctions, path: str | Path) -> None:
+def save_covariance_calibration(
+    model: CovarianceFunctions | CovarianceCalibrationResult, path: str | Path
+) -> None:
     """Save one combined runtime interpolator at model.json, retaining measurements.
 
     Args:
         model: Fitted covariance interpolators to save.
+            Pass the calibration result to save its diagnostics with the model.
         path: Destination JSON manifest. The companion array file is stored
             beside it. The manifest is replaced after saving the array file.
 
     Raises:
         TypeError: If model is not a CovarianceFunctions interpolator.
     """
+    diagnostics = None
+    if isinstance(model, CovarianceCalibrationResult):
+        diagnostics = model.diagnostics
+        model = model.model
     if not isinstance(model, CovarianceFunctions):
         raise TypeError("model must be CovarianceFunctions")
     save_product(
@@ -1036,6 +1043,7 @@ def save_covariance_calibration(model: CovarianceFunctions, path: str | Path) ->
             "discard": model.discard,
         },
         model._interpolator.arrays,
+        diagnostics=diagnostics,
     )
 
 

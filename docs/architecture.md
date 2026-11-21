@@ -118,7 +118,9 @@ measurement/build/simulation operations, numerical diagnostics, model persistenc
 and calibrated model file checks. `E2ECalibration` supplies common workflows with
 distinct native reading/measurement hooks. Downstream subclasses own E2E setup,
 source compatibility/conversion, normalization, native execution and reuse
-checks. No opaque native metadata exchange or adapter registry is required.
+checks. `TelemetryCalibration` reads the Hybrid HDF5 schema directly and
+uses the same fitting and saving operations. Its INI loader resolves file
+templates and reads system settings. The example runs the calibration stages.
 
 Reusable calibration data, model building and model saving remain separate.
 Configured build methods return results without writing files; explicit save

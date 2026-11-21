@@ -16,7 +16,6 @@ from numpy.typing import DTypeLike
 from scipy.interpolate import RegularGridInterpolator
 
 from ._calibration_contracts import (
-    CovarianceTelemetry,
     ReconstructorNoiseInputs,
     ReconstructorNoiseMeasurements,
     _count,
@@ -58,8 +57,10 @@ class ReconstructorCalibrationMeasurements(_PhysicalRecord):
         inputs: Flattened grid, interpolation check points, then 24 triples with
             identical P*EE and width but distinct P and EE.
         covariance: Matching (queries,2,2) angular-squared measurements.
-        seed: Recorded seed for verifying previously measured inputs. Defaults
-            to the seed used by `measure_reconstructor()`.
+        seed: Acquisition seed for native measurements. Use None for captured
+            validation points supplied directly by a file producer.
+        grid_precision: Stored precision of the grid coordinates when it differs
+            from the measurement array precision.
 
     No detector settings or native files are retained. The full validation
     measurements are required to justify isotropy and the product reduction.
@@ -69,14 +70,20 @@ class ReconstructorCalibrationMeasurements(_PhysicalRecord):
     fwhm: u.Quantity
     inputs: ReconstructorNoiseInputs
     covariance: u.Quantity
-    seed: int = _INTERPOLATION_CHECK_SEED
+    seed: int | None = _INTERPOLATION_CHECK_SEED
     ee: u.Quantity | None = None
 
     dtype: DTypeLike = field(default=np.float32, kw_only=True)
+    grid_precision: DTypeLike | None = None
     _interpolation_check_count: int = field(init=False, repr=False)
 
     def __post_init__(self):
         object.__setattr__(self, "dtype", validate_psf_dtype(self.dtype))
+        grid_precision = coarsest_precision(
+            self.dtype,
+            self.dtype if self.grid_precision is None else self.grid_precision,
+        )
+        object.__setattr__(self, "grid_precision", grid_precision)
         photons = _axis(
             self.photons_per_frame, u.photon, "photons_per_frame", dtype=self.dtype
         )
@@ -86,7 +93,6 @@ class ReconstructorCalibrationMeasurements(_PhysicalRecord):
         )
         if encircled is not None and np.any(encircled.value > 1):
             raise ValueError("ee must be <=1")
-        _count(self.seed, "seed", 0)
         if not isinstance(self.inputs, ReconstructorNoiseInputs):
             raise TypeError("inputs must be ReconstructorNoiseInputs")
         if self.inputs.dtype != self.dtype:
@@ -105,23 +111,79 @@ class ReconstructorCalibrationMeasurements(_PhysicalRecord):
             grid_count *= encircled.size
         check_count = len(self.inputs.ee) - grid_count - _REDUCTION_QUERY_COUNT
         _count(check_count, "interpolation check count")
-        expected = _reconstructor_calibration_inputs(
-            photons,
-            widths,
-            ee=encircled,
-            check_count=check_count,
-            seed=self.seed,
-            dtype=self.dtype,
-        )
-        for name in ("photons_per_frame", "ee", "fwhm"):
-            if not np.array_equal(
-                getattr(expected, name).value, getattr(self.inputs, name).value
-            ):
-                raise ValueError(
-                    "measurement inputs do not match the ordered grid and validation points"
-                )
+        if self.seed is None:
+            _check_captured_reconstructor_inputs(self, grid_count, check_count)
+        else:
+            _count(self.seed, "seed", 0)
+            expected = _reconstructor_calibration_inputs(
+                photons,
+                widths,
+                ee=encircled,
+                check_count=check_count,
+                seed=self.seed,
+                dtype=self.dtype,
+            )
+            for name in ("photons_per_frame", "ee", "fwhm"):
+                if not np.array_equal(
+                    getattr(expected, name).value, getattr(self.inputs, name).value
+                ):
+                    raise ValueError(
+                        "measurement inputs do not match the ordered grid and validation points"
+                    )
 
         object.__setattr__(self, "_interpolation_check_count", check_count)
+
+
+def _check_captured_reconstructor_inputs(measurements, grid_count, check_count):
+    """Validate captured grid points and probes by their physical coordinates."""
+    counts = measurements.inputs.photons_per_frame.value
+    fractions = measurements.inputs.ee.value
+    widths = measurements.inputs.fwhm.value
+    count_axis = measurements.photons_per_frame.value
+    width_axis = measurements.fwhm.value
+    product = measurements.ee is None
+    if product:
+        grid_counts, grid_widths = np.meshgrid(count_axis, width_axis, indexing="ij")
+        grid_fractions = np.ones_like(grid_counts)
+        interpolation_counts = counts * fractions
+    else:
+        ee_axis = measurements.ee.value
+        grid_counts, grid_fractions, grid_widths = np.meshgrid(
+            count_axis, ee_axis, width_axis, indexing="ij"
+        )
+        interpolation_counts = counts
+
+    for captured, grid in zip(
+        (counts, fractions, widths),
+        (grid_counts, grid_fractions, grid_widths),
+        strict=True,
+    ):
+        if not np.array_equal(captured[:grid_count], grid.ravel()):
+            raise ValueError(
+                "Reconstructor measurements do not match the ordered grid."
+            )
+
+    checks = slice(grid_count, grid_count + check_count)
+    axes = [(interpolation_counts[checks], count_axis), (widths[checks], width_axis)]
+    if not product:
+        axes.append((fractions[checks], ee_axis))
+    if any(np.any((values < axis[0]) | (values > axis[-1])) for values, axis in axes):
+        raise ValueError("Reconstructor interpolation checks must be inside the grid.")
+
+    equal_signal = slice(grid_count + check_count, None)
+    signal = (counts[equal_signal] * fractions[equal_signal]).reshape(-1, 3)
+    width = widths[equal_signal].reshape(-1, 3)
+    ee = fractions[equal_signal].reshape(-1, 3)
+    # The nominal signal is held fixed even when flux and EE were separately rounded.
+    tolerance = 8 * np.finfo(np.float32).eps
+    if (
+        not np.allclose(signal, signal[:, :1], rtol=tolerance, atol=0)
+        or not np.allclose(width, width[:, :1], rtol=tolerance, atol=0)
+        or np.any(np.diff(np.sort(ee, axis=1), axis=1) <= 0)
+    ):
+        raise ValueError(
+            "Each equal-signal check needs three distinct EE values at fixed signal and FWHM."
+        )
 
 
 def _reconstructor_calibration_inputs(
@@ -420,7 +482,7 @@ def build_reconstructor_calibration(
     """Validate measurements and build the calibrated prior without native access.
 
     Reject anisotropic/cross-axis priors and unjustified P*EE reduction. Preserve
-    population/isotropy thresholds, seeded interpolation checks and interpolation
+    population/isotropy thresholds, recorded interpolation checks and interpolation
     arithmetic. No files are opened or saved by this operation.
 
     Args:
@@ -473,7 +535,7 @@ def build_reconstructor_calibration(
     model = ReconstructorNoiseModel(
         dtype=dtype,
         producer_dtype=dtype,
-        grid_precision=coarsest_precision(dtype, measurements.dtype),
+        grid_precision=coarsest_precision(dtype, measurements.grid_precision),
         photons_per_frame=measurements.photons_per_frame,
         fwhm=measurements.fwhm,
         ee=measurements.ee,
@@ -494,8 +556,12 @@ def build_reconstructor_calibration(
         diagnostics={
             "grid_point_max_relative_error": grid_point_error,
             "interpolation_check_count": check_count,
-            "interpolation_check_median_abs_percent": float(np.median(abs(error)) * 100),
-            "interpolation_check_p95_abs_percent": float(np.percentile(abs(error), 95) * 100),
+            "interpolation_check_median_abs_percent": float(
+                np.median(abs(error)) * 100
+            ),
+            "interpolation_check_p95_abs_percent": float(
+                np.percentile(abs(error), 95) * 100
+            ),
             "interpolation_check_max_abs_percent": float(np.max(abs(error)) * 100),
             "isotropy_max_relative_error": isotropy,
             "product_max_relative_error": reduction,
@@ -512,12 +578,13 @@ def build_reconstructor_calibration(
 
 
 def save_reconstructor_calibration(
-    model: ReconstructorNoiseModel, path: str | Path
+    model: ReconstructorNoiseModel | ReconstructorCalibrationResult, path: str | Path
 ) -> None:
     """Save the runtime prior at model.json, preserving accepted data on failure.
 
     Args:
         model: The fitted pre-filter reconstructor noise prior.
+            Pass the calibration result to save its diagnostics with the model.
         path: Destination model.json manifest. Create its parent directories if
             needed. Store the numerical array file beside the manifest. Replace
             the manifest only after saving the array file.
@@ -525,6 +592,10 @@ def save_reconstructor_calibration(
     Raises:
         TypeError: If the input is not the expected calibration record.
     """
+    diagnostics = None
+    if isinstance(model, ReconstructorCalibrationResult):
+        diagnostics = model.diagnostics
+        model = model.model
     if not isinstance(model, ReconstructorNoiseModel):
         raise TypeError("model must be ReconstructorNoiseModel")
     arrays = {
@@ -553,6 +624,7 @@ def save_reconstructor_calibration(
             },
         },
         arrays,
+        diagnostics=diagnostics,
     )
 
 
@@ -637,6 +709,8 @@ def save_reconstructor_measurements(
         "representation": "product" if measurements.ee is None else "separate",
         "units": {"count": "ph", "fwhm": "mas", "ee": "", "covariance": "mas2"},
     }
+    if measurements.grid_precision != measurements.dtype:
+        header["grid_precision"] = measurements.grid_precision.name
     arrays = {
         "photons_per_frame": measurements.photons_per_frame.value,
         "fwhm": measurements.fwhm.value,
@@ -674,7 +748,14 @@ def load_reconstructor_measurements(
         header = json.loads(str(saved["__header__"]))
         validate_calibration_data_precision(header, saved)
         if (
-            (set(header) - ({"precision"} if header.get("version") == 2 else set()))
+            (
+                set(header)
+                - (
+                    {"precision", "grid_precision"}
+                    if header.get("version") == 2
+                    else set()
+                )
+            )
             != {"schema", "version", "holdouts", "seed", "representation", "units"}
             or header["schema"] != _MEASUREMENTS
             or type(header["version"]) is not int
@@ -711,9 +792,12 @@ def load_reconstructor_measurements(
             ),
             covariance=saved["covariance"] * u.mas**2,
             seed=header["seed"],
+            grid_precision=header.get("grid_precision"),
         )
         if header["holdouts"] != measurements._interpolation_check_count:
-            raise ValueError("stored interpolation check count does not match the measurements")
+            raise ValueError(
+                "stored interpolation check count does not match the measurements"
+            )
         return measurements
 
 
@@ -846,168 +930,3 @@ def build_lo_reconstructor(
     return lo_reconstructor(
         ngs_covariance.value, centre_ngs_covariance.value, prior, dtype=dtype
     )
-
-
-# Validate the reconstructor against telemetry
-
-
-def _validate_covariance_reconstructor(
-    covariances: CovarianceFunctions,
-    noise: ReconstructorNoiseModel,
-    telemetry: CovarianceTelemetry,
-) -> Mapping:
-    """Check calibrated-weight atmospheric assembly against direct matrix simulation.
-
-    Use matching uncentred telemetry for one measured ZA plane and the interpolator's
-    settled window. Choose one/two/three measured directions, build absolute
-    weights with the calibrated prior, and use a controlled full-matrix sensing
-    response whose feedback eigenvalues are grid points. This isolates numerical
-    assembly from feedback interpolation and physical gain modelling. Compare
-    command, science/command and residual covariances using one pooled mean.
-    Raise on incompatible timing/directions or discrepancies above rtol=1e-12,
-    atol=1e-10 mas squared. Return immutable per-asterism numerical evidence.
-    No native files, WFS model or MASTSEL calculation is used.
-
-    Args:
-        covariances: Measured covariance interpolators.
-        noise: Accepted reconstructor noise prior.
-        telemetry: Matched histories at one measured zenith plane.
-
-    Returns:
-        Immutable per-asterism evidence comparing interpolator and direct simulation.
-
-    Raises:
-        TypeError: If inputs are not the required typed records.
-        ValueError: If compatibility or agreement checks fail.
-    """
-    if (
-        not isinstance(covariances, CovarianceFunctions)
-        or not isinstance(noise, ReconstructorNoiseModel)
-        or not isinstance(telemetry, CovarianceTelemetry)
-    ):
-        raise TypeError("calibrated interpolator, prior and physical telemetry required")
-    if telemetry.frame_rate != covariances.controller.frame_rate:
-        raise ValueError("validation and covariance frame rates differ")
-    dtype = covariances.dtype
-    cut = covariances.discard
-    if telemetry.tilt.shape[1] - cut < 3:
-        raise ValueError("insufficient validation frames after settling")
-    feedback_endpoints = covariances.feedback[[0, -1]]
-    feedback = np.diag(feedback_endpoints)
-    chosen = np.linspace(
-        0, len(telemetry.positions) - 1, min(3, len(telemetry.positions)), dtype=int
-    )
-    science_position = telemetry.positions[chosen[0]]
-    science = telemetry.tilt.value[:, cut:, chosen[0]]
-    width = np.sqrt(noise.fwhm.value[0] * noise.fwhm.value[-1])
-    signal = np.sqrt(
-        noise.photons_per_frame.value[0] * noise.photons_per_frame.value[-1]
-    )
-    fraction = (
-        0.5 if noise.ee is None else np.sqrt(noise.ee.value[0] * noise.ee.value[-1])
-    )
-    projections = [np.diag([1, 0]), np.diag([0, 1])]
-    angle = telemetry.zenith_angle
-    evidence = {}
-
-    def covariance(left, right):
-        left, right = left.reshape(-1, 2), right.reshape(-1, 2)
-        return (left - left.mean(0)).T @ (right - right.mean(0)) / len(left)
-
-    for count in range(1, len(chosen) + 1):
-        indices = chosen[:count]
-        positions = telemetry.positions[indices]
-        photons = signal / fraction if noise.ee is None else signal
-        weights = build_lo_reconstructor(
-            covariances,
-            noise,
-            ngs_positions=positions,
-            zenith_angle=angle,
-            photons_per_frame=np.full(count, photons, dtype=dtype) * u.photon,
-            ee=np.full(count, fraction, dtype=dtype) * u.one,
-            fwhm=np.full(count, width, dtype=dtype) * u.mas,
-            dtype=dtype,
-        )
-        blocks = [weights[:, 2 * g : 2 * g + 2] for g in range(count)]
-        sensing = np.linalg.solve(sum(blocks, np.zeros((2, 2), dtype=dtype)), feedback)
-        transforms = [block @ sensing for block in blocks]
-        inputs = sum(
-            (
-                telemetry.tilt.value[:, :, index] @ transform.T
-                for index, transform in zip(indices, transforms, strict=True)
-            ),
-            np.zeros(telemetry.tilt.shape[:2] + (2,), dtype=dtype),
-        )
-        commands = np.broadcast_to(
-            np.linalg.solve(feedback, inputs[:, 0].T).T[:, None], inputs.shape
-        ).copy()
-        gain, delay = covariances.controller.gain, covariances.controller.delay
-        for frame in range(delay, inputs.shape[1]):
-            commands[:, frame] = (
-                commands[:, frame - 1]
-                - gain * (commands[:, frame - delay] @ feedback.T)
-                + gain * inputs[:, frame - delay]
-            )
-        commands = commands[:, cut:]
-        q, k = np.zeros((2, 2), dtype=dtype), np.zeros((2, 2), dtype=dtype)
-        for (xi, yi), left in zip(positions, transforms, strict=True):
-            for p, projection in enumerate(projections):
-                a = projection @ left
-                k += (
-                    covariances.C_t_Tt(
-                        *science_position,
-                        xi,
-                        yi,
-                        feedback_endpoints[p],
-                        zenith_angle=angle,
-                    ).value
-                    @ a.T
-                )
-                for (xg, yg), right in zip(positions, transforms, strict=True):
-                    for j, other in enumerate(projections):
-                        b = other @ right
-                        q += (
-                            a
-                            @ covariances.C_Tt_Tt(
-                                xi,
-                                yi,
-                                xg,
-                                yg,
-                                feedback_endpoints[p],
-                                feedback_endpoints[j],
-                                zenith_angle=angle,
-                            ).value
-                            @ b.T
-                        )
-        residual = (
-            covariances.C_t_t(
-                *science_position, *science_position, zenith_angle=angle
-            ).value
-            + q
-            - k
-            - k.T
-        )
-        comparisons = {
-            "command": (q, covariance(commands, commands)),
-            "science_command": (k, covariance(science, commands)),
-            "residual": (residual, covariance(science - commands, science - commands)),
-        }
-        errors = {}
-        for name, (predicted, expected) in comparisons.items():
-            roundoff = (
-                128
-                * np.finfo(dtype).eps
-                * max(np.linalg.norm(predicted), np.linalg.norm(expected))
-            )
-            if not np.allclose(
-                predicted, expected, rtol=1e-12, atol=max(1e-10, roundoff)
-            ):
-                raise ValueError(
-                    f"calibrated-reconstructor validation failed: {count} NGS, {name}"
-                )
-            errors[name] = float(np.max(np.abs(predicted - expected)))
-        evidence[str(count)] = {
-            "weights": weights.tolist(),
-            "max_absolute_mas2": errors,
-        }
-    return immutable_metadata(evidence)

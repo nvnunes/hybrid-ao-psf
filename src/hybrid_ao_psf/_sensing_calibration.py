@@ -194,9 +194,9 @@ def build_sensing_calibration(
         if any(
             getattr(measurement.settings, key) != getattr(response._sampling, key)
             for key in ("zero_draws", "gain_draws", "block_draws")
-        ) or measurement.settings.displacement != response._displacement.astype(
+        ) or measurement.settings.displacement.astype(
             measurement.dtype
-        ):
+        ) != response._displacement.astype(measurement.dtype):
             raise ValueError(
                 "measurement WFS sampling differs from response calibration"
             )
@@ -280,11 +280,14 @@ def build_sensing_calibration(
     return SensingCalibrationResult(model=model, diagnostics=diagnostic)
 
 
-def save_sensing_calibration(model: SensingModel, path: str | Path) -> None:
+def save_sensing_calibration(
+    model: SensingModel | SensingCalibrationResult, path: str | Path
+) -> None:
     """Save the complete shared response/shape product, retaining acquisition data.
 
     Args:
         model: The complete sensing response and displacement shape.
+            Pass the calibration result to save its diagnostics with the model.
         path: Destination model.json manifest. Create its parent directories if
             needed. Store the numerical array file beside the manifest. Replace
             the manifest only after saving the array file.
@@ -292,6 +295,10 @@ def save_sensing_calibration(model: SensingModel, path: str | Path) -> None:
     Raises:
         TypeError: If the input is not the expected calibration record.
     """
+    diagnostics = None
+    if isinstance(model, SensingCalibrationResult):
+        diagnostics = model.diagnostics
+        model = model.model
     if not isinstance(model, SensingModel):
         raise TypeError("complete SensingModel required")
     response = model.response
@@ -313,6 +320,7 @@ def save_sensing_calibration(model: SensingModel, path: str | Path) -> None:
             "centring": "pooled",
         },
         response._arrays,
+        diagnostics=diagnostics,
     )
 
 

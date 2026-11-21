@@ -1,4 +1,4 @@
-"""Native calibration extension boundary, separate from runtime model loading."""
+"""Shared calibration stages and native data acquisition hooks."""
 
 from __future__ import annotations
 
@@ -10,7 +10,7 @@ from typing import TYPE_CHECKING
 from ao_core.models.control import FixedGainIntegrator
 from astropy import units as u
 
-from ._calibration_config import E2ECalibrationConfiguration
+from ._calibration_config import E2ECalibrationConfiguration, SensingCalibrationSettings
 from ._calibration_contracts import (
     CalibrationPhotometry,
     ComaWavefronts,
@@ -29,10 +29,12 @@ if TYPE_CHECKING:
     from ._covariance_calibration import (
         CovarianceCalibrationMeasurements,
         CovarianceCalibrationResult,
+        CovarianceFunctions,
     )
     from ._reconstructor_calibration import (
         ReconstructorCalibrationMeasurements,
         ReconstructorCalibrationResult,
+        ReconstructorNoiseModel,
     )
     from ._sensing_calibration import SensingCalibrationResult
     from ._sensing_measurements import SensingCalibrationMeasurements
@@ -40,7 +42,270 @@ if TYPE_CHECKING:
     from ._sensing_response import SensingResponseResult
 
 
-class E2ECalibration(ABC):
+class _CalibrationWorkflow:
+    """Build and save calibration models from native or file-based measurements."""
+
+    def __init__(self, configuration: E2ECalibrationConfiguration):
+        if not isinstance(configuration, E2ECalibrationConfiguration):
+            raise TypeError("configuration must be E2ECalibrationConfiguration")
+        self._configuration = configuration
+
+    @property
+    def configuration(self) -> E2ECalibrationConfiguration:
+        """Return immutable shared paths/effective controls; outputs may not exist."""
+        return self._configuration
+
+    def build_reconstructor(
+        self, measurements: ReconstructorCalibrationMeasurements
+    ) -> ReconstructorCalibrationResult:
+        """Fit the reconstructor noise prior from retained measurements.
+
+        Use the configured interpolation type and the retained measurements.
+
+        Args:
+            measurements: An ordered native pre-filter covariance measurement record.
+
+        Returns:
+            The fitted prior with its fit and validation diagnostics.
+        """
+        from ._reconstructor_calibration import build_reconstructor_calibration
+
+        return build_reconstructor_calibration(
+            measurements,
+            interpolation=self.configuration.reconstructor.interpolation,
+            dtype=self.configuration.dtype,
+        )
+
+    def save_reconstructor(self, result: ReconstructorCalibrationResult) -> Path:
+        """Save the reconstructor noise prior and diagnostics to the configured path.
+
+        Create parent directories as needed. Write the model and diagnostics,
+        restoring the previous metadata if saving is interrupted.
+
+        Args:
+            result: Model and diagnostics returned by build_reconstructor.
+
+        Returns:
+            The absolute configured model.json path.
+
+        Raises:
+            TypeError: If result is not a ReconstructorCalibrationResult.
+        """
+        from ._reconstructor_calibration import (
+            ReconstructorCalibrationResult,
+            save_reconstructor_calibration,
+        )
+
+        if not isinstance(result, ReconstructorCalibrationResult):
+            raise TypeError("result must be ReconstructorCalibrationResult")
+        path = self.configuration.reconstructor_model
+        save_reconstructor_calibration(result, path)
+        return path
+
+    def build_covariance(
+        self,
+        measurements: Iterable[CovarianceCalibrationMeasurements],
+        *,
+        validation_telemetry: Iterable[CovarianceTelemetry] | None = None,
+        reconstructor: ReconstructorNoiseModel | None = None,
+    ) -> CovarianceCalibrationResult:
+        """Assemble covariance interpolators from retained zenith planes.
+
+        Args:
+            measurements: Compatible measured planes. Realization counts may differ.
+            validation_telemetry: Histories for direct loop simulation, one per
+                measured zenith plane. Omit to build from measurements alone.
+            reconstructor: Fitted reconstructor noise model for the direct-loop check.
+                Supply it with validation histories.
+
+        Returns:
+            The covariance interpolators and numerical diagnostics.
+
+        Raises:
+            ValueError: If validation inputs are incomplete, incompatible or disagree.
+        """
+        from ._covariance_calibration import build_covariance_calibration
+        from ._covariance_validation import _check_covariance_against_loop
+
+        if (validation_telemetry is None) != (reconstructor is None):
+            raise ValueError(
+                "Supply validation histories and the reconstructor model together."
+            )
+        result = build_covariance_calibration(
+            measurements, dtype=self.configuration.dtype
+        )
+        if validation_telemetry is not None:
+            return _check_covariance_against_loop(
+                result, reconstructor, validation_telemetry
+            )
+        return result
+
+    def save_covariance(self, result: CovarianceCalibrationResult) -> Path:
+        """Save the covariance interpolators and diagnostics to the configured path.
+
+        Create parent directories as needed. Write the model and diagnostics,
+        restoring the previous metadata if saving is interrupted.
+
+        Args:
+            result: Model and diagnostics returned by build_covariance.
+
+        Returns:
+            The absolute configured model.json path.
+
+        Raises:
+            TypeError: If result is not a CovarianceCalibrationResult.
+        """
+        from ._covariance_calibration import (
+            CovarianceCalibrationResult,
+            save_covariance_calibration,
+        )
+
+        if not isinstance(result, CovarianceCalibrationResult):
+            raise TypeError("result must be CovarianceCalibrationResult")
+        path = self.configuration.covariance_model
+        save_covariance_calibration(result, path)
+        return path
+
+    def build_coma(
+        self, measurements: Iterable[ComaCalibrationMeasurements]
+    ) -> ComaCalibrationResult:
+        """Fit the joint coma response from retained measurements.
+
+        Verify the fit using the seed recorded with each measurement plane.
+
+        Args:
+            measurements: Paired WFS response records at enough zenith angles to
+                fit the joint law.
+
+        Returns:
+            The fitted response model and its fit diagnostics.
+
+        Raises:
+            ValueError: If the measurements have insufficient span or conflict.
+        """
+        from ._coma_calibration import build_coma_calibration
+
+        return build_coma_calibration(
+            measurements,
+            dtype=self.configuration.dtype,
+        )
+
+    def save_coma(self, result: ComaCalibrationResult) -> Path:
+        """Save the joint coma response and diagnostics to the configured path.
+
+        Create parent directories as needed. Write the model and diagnostics,
+        restoring the previous metadata if saving is interrupted.
+
+        Args:
+            result: Model and diagnostics returned by build_coma.
+
+        Returns:
+            The absolute configured model.json path.
+
+        Raises:
+            TypeError: If result is not a ComaCalibrationResult.
+        """
+        from ._coma_calibration import (
+            ComaCalibrationResult,
+            save_coma_calibration,
+        )
+
+        if not isinstance(result, ComaCalibrationResult):
+            raise TypeError("result must be ComaCalibrationResult")
+        path = self.configuration.coma_model
+        save_coma_calibration(result, path)
+        return path
+
+    def simulate_sensing_noise(
+        self,
+        response: SensingResponseResult,
+        requests: Iterable[SensingNoiseRequest],
+        *,
+        covariance: CovarianceFunctions,
+        reconstructor: ReconstructorNoiseModel,
+    ) -> Iterator[SensingNoiseMeasurements]:
+        """Simulate noise-driven commands for the supplied physical asterisms.
+
+        Args:
+            response: Fitted gain and variance with retained WFS noise samples.
+            requests: Asterisms, spot metrics and random seeds for simulation.
+            covariance: Fitted atmospheric covariance functions.
+            reconstructor: Fitted pre-filter noise model for the reconstructor.
+
+        Yields:
+            Noise-driven displacement histories in request order for shape fitting.
+        """
+        from ._sensing_noise import simulate_sensing_noise
+
+        yield from simulate_sensing_noise(
+            response,
+            requests,
+            covariance,
+            reconstructor,
+            settings=self._sensing_simulation_settings(response),
+            dtype=self.configuration.dtype,
+        )
+
+    def _sensing_simulation_settings(
+        self, response: SensingResponseResult
+    ) -> SensingCalibrationSettings:
+        """Use the configured native acquisition settings to check retained samples."""
+        return self.configuration.sensing
+
+    def build_sensing(
+        self,
+        response: SensingResponseResult,
+        noise_measurements: Iterable[SensingNoiseMeasurements],
+    ) -> SensingCalibrationResult:
+        """Fit the complete sensing and blur model.
+
+        The fit uses the gain and variance tables and weights measurement cases equally
+        when fitting the displacement shape.
+
+        Args:
+            response: Response calibration that supplies the gain and variance tables.
+            noise_measurements: Retained noise histories covering every response zenith plane.
+
+        Returns:
+            The fitted sensing model and its fit diagnostics.
+
+        Raises:
+            ValueError: If measurement grid is incomplete or inconsistent with the response.
+        """
+        from ._sensing_calibration import build_sensing_calibration
+
+        return build_sensing_calibration(
+            response, noise_measurements, dtype=self.configuration.dtype
+        )
+
+    def save_sensing(self, result: SensingCalibrationResult) -> Path:
+        """Save the sensing and blur model and diagnostics to the configured path.
+
+        Create parent directories as needed. Write the model and diagnostics,
+        restoring the previous metadata if saving is interrupted.
+
+        Args:
+            result: Model and diagnostics returned by build_sensing.
+
+        Returns:
+            The absolute configured model.json path.
+
+        Raises:
+            TypeError: If result is not a SensingCalibrationResult.
+        """
+        from ._sensing_calibration import (
+            SensingCalibrationResult,
+            save_sensing_calibration,
+        )
+
+        if not isinstance(result, SensingCalibrationResult):
+            raise TypeError("result must be SensingCalibrationResult")
+        path = self.configuration.sensing_model
+        save_sensing_calibration(result, path)
+        return path
+
+
+class E2ECalibration(_CalibrationWorkflow, ABC):
     """Configured native calibration-data hooks for the four common calibrations.
 
     Construct with the parsed shared configuration. The downstream subclass
@@ -57,16 +322,6 @@ class E2ECalibration(ABC):
     After collecting the fixed-spot sensing measurements, call ``build_sensing_response()`` with the sampled
     field and magnitude grid before simulating the sensing loop.
     """
-
-    def __init__(self, configuration: E2ECalibrationConfiguration):
-        if not isinstance(configuration, E2ECalibrationConfiguration):
-            raise TypeError("configuration must be E2ECalibrationConfiguration")
-        self._configuration = configuration
-
-    @property
-    def configuration(self) -> E2ECalibrationConfiguration:
-        """Return immutable shared paths/effective controls; outputs may not exist."""
-        return self._configuration
 
     # Native adapter hooks
 
@@ -228,56 +483,6 @@ class E2ECalibration(ABC):
             dtype=self.configuration.dtype,
         )
 
-    def build_reconstructor(
-        self, measurements: ReconstructorCalibrationMeasurements
-    ) -> ReconstructorCalibrationResult:
-        """Fit the reconstructor noise prior from retained measurements.
-
-        Use the configured interpolation type and the retained measurements.
-
-        Args:
-            measurements: An ordered native pre-filter covariance measurement record.
-
-        Returns:
-            The fitted prior with its fit and validation diagnostics.
-        """
-        from ._reconstructor_calibration import build_reconstructor_calibration
-
-        return build_reconstructor_calibration(
-            measurements,
-            interpolation=self.configuration.reconstructor.interpolation,
-            dtype=self.configuration.dtype,
-        )
-
-    def save_reconstructor(self, result: ReconstructorCalibrationResult) -> Path:
-        """Save the reconstructor noise prior and diagnostics to the configured path.
-
-        Create parent directories as needed. Write the model and diagnostics,
-        restoring the previous metadata if saving is interrupted.
-
-        Args:
-            result: Model and diagnostics returned by build_reconstructor.
-
-        Returns:
-            The absolute configured model.json path.
-
-        Raises:
-            TypeError: If result is not a ReconstructorCalibrationResult.
-        """
-        from ._calibration_workflows import save_result
-        from ._reconstructor_calibration import (
-            ReconstructorCalibrationResult,
-            save_reconstructor_calibration,
-        )
-
-        if not isinstance(result, ReconstructorCalibrationResult):
-            raise TypeError("result must be ReconstructorCalibrationResult")
-        return save_result(
-            result,
-            self.configuration.reconstructor_model,
-            save_reconstructor_calibration,
-        )
-
     # Covariance calibration
 
     def measure_covariance(
@@ -306,96 +511,6 @@ class E2ECalibration(ABC):
                 dtype=self.configuration.dtype,
             )
 
-    def build_covariance(
-        self,
-        measurements: Iterable[CovarianceCalibrationMeasurements],
-        *,
-        validation_telemetry: Iterable[CovarianceTelemetry] | None = None,
-    ) -> CovarianceCalibrationResult:
-        """Assemble the covariance interpolators from retained zenith planes.
-
-        Use recorded controller and filtering settings with compatible field
-        directions and settled windows.
-
-        Args:
-            measurements: Compatible measured planes. Realization counts may differ.
-            validation_telemetry: Optional retained histories for direct loop simulation
-                with the configured reconstructor prior. Supply one record per
-                measured zenith plane.
-
-        Returns:
-            The assembled covariance interpolators and its diagnostics.
-
-        Raises:
-            FileNotFoundError: If validation needs a missing reconstructor prior.
-            ValueError: If measured planes conflict or validation fails to cover them.
-        """
-        from ._covariance_calibration import build_covariance_calibration
-
-        result = build_covariance_calibration(
-            measurements, dtype=self.configuration.dtype
-        )
-        if validation_telemetry is not None:
-            from ._calibration_products import json_metadata
-            from ._covariance_calibration import CovarianceCalibrationResult
-            from ._reconstructor_calibration import (
-                _validate_covariance_reconstructor,
-                load_reconstructor_calibration,
-            )
-
-            prior = load_reconstructor_calibration(
-                self.configuration.reconstructor_model
-            )
-            checks = {}
-            for telemetry in validation_telemetry:
-                angle = float(telemetry.zenith_angle.value)
-                if angle in checks:
-                    raise ValueError("duplicate validation telemetry planes")
-                checks[angle] = json_metadata(
-                    _validate_covariance_reconstructor(result.model, prior, telemetry)
-                )
-            if set(checks) != set(result.model.zenith_angles.value):
-                raise ValueError(
-                    "validation telemetry must cover every measured ZA plane"
-                )
-            result = CovarianceCalibrationResult(
-                model=result.model,
-                diagnostics={
-                    **json_metadata(result.diagnostics),
-                    "calibrated_reconstructor": {
-                        str(angle): check for angle, check in checks.items()
-                    },
-                },
-            )
-        return result
-
-    def save_covariance(self, result: CovarianceCalibrationResult) -> Path:
-        """Save the covariance interpolators and diagnostics to the configured path.
-
-        Create parent directories as needed. Write the model and diagnostics,
-        restoring the previous metadata if saving is interrupted.
-
-        Args:
-            result: Model and diagnostics returned by build_covariance.
-
-        Returns:
-            The absolute configured model.json path.
-
-        Raises:
-            TypeError: If result is not a CovarianceCalibrationResult.
-        """
-        from ._calibration_workflows import save_result
-        from ._covariance_calibration import (
-            CovarianceCalibrationResult,
-            save_covariance_calibration,
-        )
-
-        if not isinstance(result, CovarianceCalibrationResult):
-            raise TypeError("result must be CovarianceCalibrationResult")
-        return save_result(
-            result, self.configuration.covariance_model, save_covariance_calibration
-        )
-
     # Coma calibration
 
     def measure_coma(
@@ -422,12 +537,11 @@ class E2ECalibration(ABC):
                 draws on unexpected axes.
         """
         from ._calibration_contracts import (
-            ComaResponseMeasurements,
             ComaWfsSampling,
             _angle,
             _quantity,
         )
-        from ._coma_calibration import ComaCalibrationMeasurements
+        from ._coma_calibration import _reduce_coma_measurements
 
         zenith_angle = _angle(zenith_angle, dtype=self.configuration.dtype)
         sensing_wavelength = _quantity(
@@ -448,77 +562,15 @@ class E2ECalibration(ABC):
         )
         wavefronts = self.read_coma_wavefronts(zenith_angle, settings.samples)
         measured = self.measure_coma_wfs(zenith_angle, wavefronts, sampling)
-        expected = (settings.samples, len(sampling.magnitudes), settings.noise_draws, 2)
-        if measured.measured.shape != expected:
-            raise ValueError("coma WFS returned different sample/magnitude/draw axes")
-        batches = measured.measured.reshape(
-            settings.samples, len(sampling.magnitudes), 4, settings.noise_draws // 4, 2
-        ).mean(axis=3)
-        response = ComaResponseMeasurements(
-            coma=wavefronts.coma,
-            magnitudes=sampling.magnitudes,
-            tilt_mean=batches.mean(axis=2),
-            tilt_batches=batches,
-            tilt_noiseless=measured.noiseless,
-            dtype=self.configuration.dtype,
-        )
-        return ComaCalibrationMeasurements(
-            zenith_angle=zenith_angle,
-            response=response,
+        return _reduce_coma_measurements(
+            zenith_angle,
             sensing_wavelength=sensing_wavelength,
             photometry=self.photometry(zenith_angle),
+            wavefronts=wavefronts,
+            measured=measured,
+            sampling=sampling,
             settings=settings,
-            dtype=self.configuration.dtype,
         )
-
-    def build_coma(
-        self, measurements: Iterable[ComaCalibrationMeasurements]
-    ) -> ComaCalibrationResult:
-        """Fit the joint coma response from retained measurements.
-
-        Verify the fit using the seed recorded with each measurement plane.
-
-        Args:
-            measurements: Paired WFS response records at enough zenith angles to
-                fit the joint law.
-
-        Returns:
-            The fitted response model and its fit diagnostics.
-
-        Raises:
-            ValueError: If the measurements have insufficient span or conflict.
-        """
-        from ._coma_calibration import build_coma_calibration
-
-        return build_coma_calibration(
-            measurements,
-            dtype=self.configuration.dtype,
-        )
-
-    def save_coma(self, result: ComaCalibrationResult) -> Path:
-        """Save the joint coma response and diagnostics to the configured path.
-
-        Create parent directories as needed. Write the model and diagnostics,
-        restoring the previous metadata if saving is interrupted.
-
-        Args:
-            result: Model and diagnostics returned by build_coma.
-
-        Returns:
-            The absolute configured model.json path.
-
-        Raises:
-            TypeError: If result is not a ComaCalibrationResult.
-        """
-        from ._calibration_workflows import save_result
-        from ._coma_calibration import (
-            ComaCalibrationResult,
-            save_coma_calibration,
-        )
-
-        if not isinstance(result, ComaCalibrationResult):
-            raise TypeError("result must be ComaCalibrationResult")
-        return save_result(result, self.configuration.coma_model, save_coma_calibration)
 
     # Sensing calibration
 
@@ -650,9 +702,12 @@ class E2ECalibration(ABC):
             raise ValueError("wavelength must be positive")
         settings = self.configuration.sensing
         seeds = iter([settings.seed] * len(magnitudes) if seeds is None else seeds)
-        provider = load_psf_interpolator(
-            self.configuration.ngs_psf, dtype=self.configuration.dtype
-        )
+        ngs_psf_path = self.configuration.ngs_psf
+        if ngs_psf_path is None:
+            raise ValueError(
+                "[inputs] requires NGSPSFPath for live sensing measurements."
+            )
+        provider = load_psf_interpolator(ngs_psf_path, dtype=self.configuration.dtype)
         photometry = self.photometry(zenith_angle)
         previous = None
         prediction = None
@@ -692,92 +747,3 @@ class E2ECalibration(ABC):
             )
         if next(seeds, None) is not None:
             raise ValueError("too many effective sensing point seeds")
-
-    def simulate_sensing_noise(
-        self,
-        response: SensingResponseResult,
-        requests: Iterable[SensingNoiseRequest],
-    ) -> Iterator[SensingNoiseMeasurements]:
-        """Simulate noise-driven commands through the configured low-order loop.
-
-        This offline stage loads the configured covariance and reconstructor
-        products and yields histories for the later shape fit.
-
-        Args:
-            response: Response calibration with retained WFS noise samples.
-            requests: Physical asterisms and their spot metrics.
-
-        Yields:
-            Complete, reusable command histories in request order.
-
-        Raises:
-            FileNotFoundError: If either configured prerequisite product is missing.
-            ValueError: If the response, request or prerequisite products conflict.
-        """
-        from ._covariance_calibration import load_covariance_calibration
-        from ._reconstructor_calibration import load_reconstructor_calibration
-        from ._sensing_noise import simulate_sensing_noise
-
-        covariance = load_covariance_calibration(self.configuration.covariance_model)
-        prior = load_reconstructor_calibration(self.configuration.reconstructor_model)
-        yield from simulate_sensing_noise(
-            response,
-            requests,
-            covariance,
-            prior,
-            settings=self.configuration.sensing,
-            dtype=self.configuration.dtype,
-        )
-
-    def build_sensing(
-        self,
-        response: SensingResponseResult,
-        noise_measurements: Iterable[SensingNoiseMeasurements],
-    ) -> SensingCalibrationResult:
-        """Fit the complete sensing and blur model.
-
-        The fit uses the gain and variance tables and weights measurement cases equally
-        when fitting the displacement shape.
-
-        Args:
-            response: Response calibration that supplies the gain and variance tables.
-            noise_measurements: Retained noise histories covering every response zenith plane.
-
-        Returns:
-            The fitted sensing model and its fit diagnostics.
-
-        Raises:
-            ValueError: If measurement grid is incomplete or inconsistent with the response.
-        """
-        from ._sensing_calibration import build_sensing_calibration
-
-        return build_sensing_calibration(
-            response, noise_measurements, dtype=self.configuration.dtype
-        )
-
-    def save_sensing(self, result: SensingCalibrationResult) -> Path:
-        """Save the sensing and blur model and diagnostics to the configured path.
-
-        Create parent directories as needed. Write the model and diagnostics,
-        restoring the previous metadata if saving is interrupted.
-
-        Args:
-            result: Model and diagnostics returned by build_sensing.
-
-        Returns:
-            The absolute configured model.json path.
-
-        Raises:
-            TypeError: If result is not a SensingCalibrationResult.
-        """
-        from ._calibration_workflows import save_result
-        from ._sensing_calibration import (
-            SensingCalibrationResult,
-            save_sensing_calibration,
-        )
-
-        if not isinstance(result, SensingCalibrationResult):
-            raise TypeError("result must be SensingCalibrationResult")
-        return save_result(
-            result, self.configuration.sensing_model, save_sensing_calibration
-        )

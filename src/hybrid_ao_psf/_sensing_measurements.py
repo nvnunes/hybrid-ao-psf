@@ -173,6 +173,8 @@ class SensingCalibrationMeasurements(_PhysicalRecord):
         sampling: Effective native draw/batch counts and point seed.
         controller: Fixed delayed-integrator settings for subsequent simulation.
         photometry: Explicit incident-count conversion for this measured magnitude.
+        ee: Encircled-energy fraction of the fixed spot, when captured.
+        fwhm: Angular FWHM of the fixed spot, supplied with EE.
 
     No native setup or image is needed for offline statistics or rebuilding.
     """
@@ -185,6 +187,8 @@ class SensingCalibrationMeasurements(_PhysicalRecord):
     sampling: SensingWfsSampling
     controller: FixedGainIntegrator
     photometry: CalibrationPhotometry
+    ee: u.Quantity | None = None
+    fwhm: u.Quantity | None = None
 
     dtype: DTypeLike = field(default=np.float32, kw_only=True)
 
@@ -201,6 +205,13 @@ class SensingCalibrationMeasurements(_PhysicalRecord):
                 self.displacement, u.mas, "displacement", 0, dtype=self.dtype
             ),
         }
+        if (self.ee is None) != (self.fwhm is None):
+            raise ValueError("Supply EE and FWHM together.")
+        if self.ee is not None:
+            values["ee"] = _quantity(self.ee, u.one, "ee", 0, dtype=self.dtype)
+            values["fwhm"] = _quantity(self.fwhm, u.mas, "fwhm", 0, dtype=self.dtype)
+            if not 0 < values["ee"].value <= 1 or values["fwhm"].value <= 0:
+                raise ValueError("Spot metrics require EE in (0, 1] and positive FWHM.")
         if values["displacement"].value <= 0:
             raise ValueError("positive displacement required")
         if (
@@ -276,6 +287,11 @@ def save_sensing_measurements(
         "controller": controller_header(measurements.controller),
         "photometry": photometry_header(measurements.photometry),
     }
+    if measurements.ee is not None:
+        header["spot_metrics"] = {
+            "ee": float(measurements.ee.value),
+            "fwhm_mas": float(measurements.fwhm.value),
+        }
     with atomic_output_path(Path(path)) as temporary, temporary.open("wb") as stream:
         np.savez_compressed(
             stream,
@@ -301,8 +317,22 @@ def load_sensing_measurements(path: str | Path) -> SensingCalibrationMeasurement
     with np.load(Path(path), allow_pickle=False) as saved:
         header = json.loads(str(saved["__header__"]))
         validate_calibration_data_precision(header, saved)
+        metrics = header.get("spot_metrics")
+        if "spot_metrics" in header and (
+            header["version"] != 2
+            or not isinstance(metrics, dict)
+            or set(metrics) != {"ee", "fwhm_mas"}
+        ):
+            raise ValueError("invalid sensing spot metrics")
         if (
-            (set(header) - ({"precision"} if header.get("version") == 2 else set()))
+            (
+                set(header)
+                - (
+                    {"precision", "spot_metrics"}
+                    if header.get("version") == 2
+                    else set()
+                )
+            )
             != {
                 "schema",
                 "version",
@@ -335,6 +365,8 @@ def load_sensing_measurements(path: str | Path) -> SensingCalibrationMeasurement
             position=header["position_arcsec"] * u.arcsec,
             magnitude=header["magnitude"] * u.mag,
             displacement=header["displacement_mas"] * u.mas,
+            ee=None if metrics is None else metrics["ee"] * u.one,
+            fwhm=None if metrics is None else metrics["fwhm_mas"] * u.mas,
             samples=SensingWfsMeasurements(
                 dtype=header.get("precision", np.float64),
                 zero=saved["zero"] * u.mas,

@@ -96,9 +96,7 @@ def measured():
     controller = FixedGainIntegrator(
         gain=0.3, delay=2, frame_rate=500 * u.Hz, dtype=np.float64
     )
-    settings = CovarianceCalibrationSettings(
-        feedback=(0.5, 1.0, 1.5)
-    )
+    settings = CovarianceCalibrationSettings(feedback=(0.5, 1.0, 1.5))
     return record, measure_covariance_calibration(
         record, controller, settings=settings, dtype=np.float64
     )
@@ -203,3 +201,13 @@ def test_cadence_and_insufficient_settled_window_rejected():
             ),
             dtype=np.float64,
         )
+
+
+def test_rectangular_corner_fill_uses_angular_distance():
+    from hybrid_ao_psf._covariance_grid import rectangular_mapping
+
+    positions = np.asarray([(0, 0), (10, 2), (100, 1)])
+    x, y, nearest, measured = rectangular_mapping(positions)
+    ix, iy = np.searchsorted(x, 10), np.searchsorted(y, 1)
+    assert not measured[ix, iy]
+    np.testing.assert_array_equal(positions[nearest[ix, iy]], [10, 2])

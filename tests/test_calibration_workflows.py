@@ -143,9 +143,7 @@ def pipeline(tmp_path_factory, request):
         science_psf=tmp_path / "unused-science.pkl",
         ngs_psf=tmp_path / "spots.pkl",
         ngs_metrics=tmp_path / "unused-metrics.pkl",
-        covariance=CovarianceCalibrationSettings(
-            feedback=(0.5, 1, 1.5)
-        ),
+        covariance=CovarianceCalibrationSettings(feedback=(0.5, 1, 1.5)),
         coma=ComaCalibrationSettings(samples=32, noise_draws=16),
         sensing=SensingCalibrationSettings(
             zero_draws=128,
@@ -185,7 +183,9 @@ def pipeline(tmp_path_factory, request):
     covariances = list(calibration.measure_covariance())
     telemetry = list(calibration.read_covariance_telemetry())
     calibration.native_available = False
-    result = calibration.build_covariance(covariances, validation_telemetry=telemetry)
+    result = calibration.build_covariance(
+        covariances, validation_telemetry=telemetry, reconstructor=prior
+    )
     assert not config.covariance_model.parent.exists()
     assert calibration.save_covariance(result) == config.covariance_model
     covariances = result.model
@@ -221,6 +221,17 @@ def pipeline(tmp_path_factory, request):
         magnitude_intervals=[[8, 10]] * u.mag,
         dtype=config.dtype,
     )
+    simulation_inputs = {"covariance": covariances, "reconstructor": prior}
+    unexpected_displacement = SyntheticCalibration(
+        config.with_overrides(sensing={"displacement": 11 * u.mas})
+    )
+    with pytest.raises(ValueError, match="differ from captured measurements"):
+        list(
+            unexpected_displacement.simulate_sensing_noise(
+                response, (), **simulation_inputs
+            )
+        )
+
     requests = [
         SensingNoiseRequest(
             key=str(n),
@@ -234,7 +245,40 @@ def pipeline(tmp_path_factory, request):
         )
         for n in (1, 2, 3)
     ]
-    noise_measurements = list(calibration.simulate_sensing_noise(response, requests))
+    if config.dtype == np.float32:
+        full_precision_response = build_sensing_response(
+            [
+                replace(
+                    point,
+                    displacement=10.0000001 * u.mas,
+                    dtype=np.float64,
+                    samples=replace(point.samples, dtype=np.float64),
+                )
+                for point in points
+            ],
+            field_radius=2 * u.arcsec,
+            magnitude_intervals=[[8, 10]] * u.mag,
+            dtype=np.float64,
+        )
+        matching_displacement = SyntheticCalibration(
+            config.with_overrides(sensing={"displacement": 10.0000001 * u.mas})
+        )
+        histories = list(
+            matching_displacement.simulate_sensing_noise(
+                full_precision_response, requests, **simulation_inputs
+            )
+        )
+        assert len(histories) == len(requests)
+        mixed_result = matching_displacement.build_sensing(
+            full_precision_response, histories
+        )
+        assert mixed_result.model.dtype == np.float32
+
+    noise_measurements = list(
+        calibration.simulate_sensing_noise(
+            response, requests, covariance=covariances, reconstructor=prior
+        )
+    )
     result = calibration.build_sensing(response, noise_measurements)
     assert not config.sensing_model.parent.exists()
     assert calibration.save_sensing(result) == config.sensing_model
@@ -279,18 +323,14 @@ def test_configured_four_family_handoff_without_native_files(pipeline):
 def test_named_array_files_preserve_prior_revision_and_reuse_current(
     pipeline, tmp_path, configured
 ):
-    from hybrid_ao_psf._calibration_workflows import save_result
-
     _, models = pipeline
     model = models[0]
     path = tmp_path / "model.json"
 
     def save(prior):
         if configured:
-            save_result(
-                ReconstructorCalibrationResult(model=prior, diagnostics={}),
-                path,
-                save_reconstructor_calibration,
+            save_reconstructor_calibration(
+                ReconstructorCalibrationResult(model=prior, diagnostics={}), path
             )
         else:
             save_reconstructor_calibration(prior, path)
@@ -303,7 +343,9 @@ def test_named_array_files_preserve_prior_revision_and_reuse_current(
     save(updated)
 
     manifest = path.read_bytes()
-    assert json.loads(manifest)["array_file"] == "reconstructor-noise-interpolator-2.npz"
+    assert (
+        json.loads(manifest)["array_file"] == "reconstructor-noise-interpolator-2.npz"
+    )
     assert {file.name for file in tmp_path.glob("*.npz")} == {
         "reconstructor-noise-interpolator.npz",
         "reconstructor-noise-interpolator-2.npz",
@@ -395,9 +437,7 @@ def test_saving_interruption_leaves_complete_usable_product(
 
 
 def test_calibrated_reconstructor_validation_rejects_mismatched_telemetry(pipeline):
-    from hybrid_ao_psf._reconstructor_calibration import (
-        _validate_covariance_reconstructor,
-    )
+    from hybrid_ao_psf._covariance_validation import _validate_covariance_reconstructor
 
     calibration, models = pipeline
     calibration.native_available = True

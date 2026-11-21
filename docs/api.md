@@ -39,13 +39,13 @@ and reading saved PSFs.
 
 ## E2E Calibration
 
-The package root exports `E2ECalibration`, physical sample/settings/result types,
-family-specific measure/build/save/load operations and calibrated model file checks.
-The four model types are `ReconstructorNoiseModel`, `CovarianceFunctions`,
-`ComaResponseModel` and `SensingModel`. The configured subclass supplies
-native measurements; standalone builders, numerical simulation and loaded model
-evaluation need no native software. See [Calibration](calibration.md) for
-stages, physical conventions, configuration and product contracts.
+Use `load_telemetry_calibration()` for saved HDF5 telemetry configured in an
+INI. Python callers can also construct `TelemetryCalibration` with file paths
+and system settings. Subclass `E2ECalibration` to supply live native
+measurements. Both workflows build from reusable measurement records and
+save explicitly.
+See [Calibration](calibration.md#calibration-from-hdf5) for the file-backed
+workflow, physical conventions and model contracts.
 
 ## Calibrated Low-Order Model
 

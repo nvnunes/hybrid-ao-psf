@@ -25,10 +25,11 @@ def rectangular_mapping(
         grid[ix, iy] = index
     measured = grid >= 0
     valid_yx = np.argwhere(measured.T)
+    vy, vx = valid_yx.T
     for ix, iy in np.argwhere(~measured):
-        distance = np.sum((valid_yx - np.array([iy, ix])) ** 2, axis=1)
-        vy, vx = valid_yx[np.argmin(distance)]
-        grid[ix, iy] = grid[vx, vy]
+        distance = (xs[vx] - xs[ix]) ** 2 + (ys[vy] - ys[iy]) ** 2
+        nearest = np.argmin(distance)
+        grid[ix, iy] = grid[vx[nearest], vy[nearest]]
     return xs, ys, grid, measured
 
 

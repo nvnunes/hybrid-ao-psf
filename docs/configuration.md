@@ -1,7 +1,8 @@
 # Configuration
 
-Hybrid AO PSF uses one INI file for one simulation. `[hybrid] lo_model` selects
-`mastsel` (the default) or `e2e-calibrated`. Paths resolve relative to that file.
+Hybrid AO PSF uses one INI file for one simulation. MASTSEL is the default.
+For E2E-Calibrated prediction, set `[hybrid]` `LOModel = e2e-calibrated`.
+Paths resolve relative to the INI.
 The loader assembles each model's INI coordinates into Cartesian `(x, y)` rows
 for `HybridRequest.science_positions` and `HybridRequest.ngs_positions`.
 
@@ -123,48 +124,50 @@ The sample is also the Python-and-CLI real-MASTSEL end-to-end verification route
 
 ## E2E-Calibrated Configuration
 
-Use the same `[e2e]` model/provider paths as
-[calibration](calibration.md#shared-configuration). Add Cartesian prediction
-inputs in `[hybrid]`:
+Use the model files written by [calibration](calibration.md#shared-configuration).
+Set the model and interpolator paths in `[inputs]` and the result path in
+`[outputs]`. Use the standard AO sections for observing conditions and
+`[hybrid]` for the Cartesian positions.
 
 ```ini
-[e2e]
-precision = float32
-science_psf = products/science.pkl
-ngs_psf = products/ngs.pkl
-ngs_metrics = products/ngs-metrics.pkl
-reconstructor_model = products/reconstructor/model.json
-covariance_model = products/covariance/model.json
-coma_model = products/coma/model.json
-sensing_model = products/sensing/model.json
+[inputs]
+SciencePSFPath = products/science.pkl
+NGSMetricsPath = products/ngs-metrics.pkl
+ReconstructorModelPath = products/reconstructor/model.json
+CovarianceModelPath = products/covariance/model.json
+ComaModelPath = products/coma/model.json
+SensingModelPath = products/sensing/model.json
+
+[outputs]
+OutputPath = results/hybrid.h5
+
+[telescope]
+ZenithAngle = 20
+
+[sources_science]
+Wavelength = [2.179e-6]
 
 [hybrid]
-lo_model = e2e-calibrated
-output = results/hybrid.h5
-science_x_arcsec = [0.0, 12.0]
-science_y_arcsec = [0.0, 12.0]
-ngs_x_arcsec = [12.0, -24.0]
-ngs_y_arcsec = [-24.0, 12.0]
-ngs_magnitude = [15.0, 17.0]
-wavelength_um = 2.179
-zenith_angle_deg = 20.0
-diagnostics_level = validation
+LOModel = e2e-calibrated
+ScienceX = [0.0, 12.0]
+ScienceY = [0.0, 12.0]
+NGSX = [12.0, -24.0]
+NGSY = [-24.0, 12.0]
+NGSMagnitude = [15.0, 17.0]
+DiagnosticsLevel = validation
 ```
 
-All coordinates are Cartesian arcseconds; NGS magnitudes follow the fitted
+Give Cartesian coordinates in arcseconds, `Wavelength` in metres, and
+`ZenithAngle` in degrees. NGS magnitudes follow the fitted
 photometry convention. Science x/y arrays must match each other; NGS
 x/y/magnitude arrays must match each other. Science and NGS counts are independent.
-`output`, all coordinate arrays, magnitudes, wavelength and ZA are required.
-`diagnostics_level` defaults to `none`. `non_psd_policy` defaults to `error`
+`OutputPath`, all coordinate arrays, magnitudes, wavelength and ZA are required.
+`DiagnosticsLevel` defaults to `none`. `NonPSDPolicy` defaults to `error`
 and does not accept `clip` on this path. MASTSEL settings, external flux and
 zeropoint inputs are not used. Unsupported `[hybrid]` fields raise.
 
-E2E precision belongs in `[e2e]`, with float32 as the default. Python `dtype`
-and CLI `--precision` override it. Fitted products supply their own controller
-and photometry settings; calibration controls in the INI do not change those
-settings at prediction time. Native sections can remain in the shared INI but
-are not imported or executed. Complete prediction opens `science_psf`, the four
-model products and `ngs_metrics`; it does not open `ngs_psf` or native sources.
+Fitted products supply their own controller and photometry settings.
+Prediction loads the four fitted models, `SciencePSFPath`, and `NGSMetricsPath`.
 The requested wavelength, ZA, directions, magnitudes and feedback strengths
 must lie within the applicable provider/product supports.
 
@@ -178,8 +181,36 @@ Generate the sample PSFs and run the example from the repository root.
 ./examples/e2e-calibrated/run.sh
 ```
 
-The runner builds the PSF interpolators and calls
-`generate_synthetic_calibration.py --output-dir products` from the example
-directory. Both steps write inputs under `examples/e2e-calibrated/products/`.
-The simulation uses those inputs and writes
-`examples/e2e-calibrated/results/hybrid.h5`.
+The runner works from `examples/e2e-calibrated/`. It builds the PSF
+interpolators, then runs the following commands.
+
+```bash
+bin=../../.conda/bin
+"$bin/python" generate_synthetic_telemetry.py calibrate.ini \
+  --ngs-metrics products/ngs-metrics.pkl --output-dir products/telemetry
+"$bin/python" calibrate.py calibrate.ini
+"$bin/hybrid-ao-psf" hybrid.ini --precision float64 --overwrite
+```
+
+`calibrate.ini` lists the telemetry files in `[inputs]` and the four
+model destinations in `[outputs]`. `ReconstructorTelemetryPath` names a single file.
+`CovarianceTelemetryPath`, `ComaTelemetryPath`, and `SensingTelemetryPath`
+are formats relative to the INI. Use `{ZA}` to insert the angle in
+degrees without trailing zeros or exponent notation. The adapter uses the AO system settings and
+telemetry described in
+[HDF5 Telemetry](calibration.md#hdf5-telemetry). The
+`[sensing]` keys `OneNGSAsterisms`, `TwoNGSAsterisms`, and
+`ThreeNGSAsterisms` set the counts per zenith angle. `TelemetryCalibration`
+selects asterisms from the sensing grid for the noise-blur fit. The fit requires single- and multi-NGS
+cases. The reader takes the grid axes and measurement counts from the telemetry.
+The synthetic generator chooses its sampling before it writes those files.
+
+For the synthetic example, the generator samples spot EE and FWHM from the NGS
+metric interpolator and saves them in the sensing telemetry. `calibrate.py` uses
+the saved values when running the blur fit.
+`hybrid.ini` specifies the prediction and points to the fitted models.
+The prediction writes
+`results/hybrid.h5`.
+
+To substitute your own captured files, follow
+[Calibration From HDF5](calibration.md#calibration-from-hdf5).

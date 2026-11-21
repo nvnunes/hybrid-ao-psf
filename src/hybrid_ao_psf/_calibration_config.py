@@ -9,12 +9,11 @@ from dataclasses import dataclass, field, fields, replace
 from pathlib import Path
 
 import numpy as np
-from ao_core.models.config import read_ini, resolve_ini_path
+from ao_core.io.ini import read_ini, resolve_ini_path
 from astropy import units as u
 from numpy.typing import DTypeLike
 
 from ._calibration_contracts import (
-    SensingWfsSampling,
     _count,
     _PhysicalRecord,
     _quantity,
@@ -105,17 +104,18 @@ class SensingCalibrationSettings(_PhysicalRecord):
     displacement: u.Quantity = field(default_factory=lambda: 10.0 * u.mas)
 
     def __post_init__(self):
-        SensingWfsSampling(
-            zero_draws=self.zero_draws,
-            gain_draws=self.gain_draws,
-            block_draws=self.block_draws,
-            seed=self.seed,
-        )
+        for name in ("zero_draws", "gain_draws", "block_draws"):
+            _count(getattr(self, name), name, 4)
+        _count(self.seed, "seed", 0)
+        if self.seed >= 2**31:
+            raise ValueError("sensing seed must fit uint31")
         for name in ("noise_realizations", "noise_frames", "discard_frames"):
             _count(getattr(self, name), name)
         displacement = _quantity(self.displacement, u.mas, "displacement", 0)
         if self.noise_frames < 4 or displacement.value <= 0:
-            raise ValueError("need >=4 simulation frames and positive finite displacement")
+            raise ValueError(
+                "need >=4 simulation frames and positive finite displacement"
+            )
         object.__setattr__(self, "displacement", displacement)
 
 
@@ -162,9 +162,9 @@ class E2ECalibrationConfiguration:
         coma_model: Planned or existing response model.json path.
         sensing_model: Planned or existing sensor model.json path.
         reconstructor_model: Planned or existing prior model.json path.
-        science_psf: Science HO interpolator path.
-        ngs_psf: NGS HO PSF interpolator path for fixed-spot measurements.
-        ngs_metrics: NGS HO metric interpolator path for reconstruction.
+        science_psf: Science HO interpolator path for standalone prediction.
+        ngs_psf: NGS HO PSF interpolator path for live fixed-spot measurements.
+        ngs_metrics: NGS HO metric interpolator path for calibrated prediction.
         covariance: Effective common interpolator controls.
         coma: Effective response controls.
         sensing: Effective fixed-spot/simulation controls.
@@ -172,6 +172,7 @@ class E2ECalibrationConfiguration:
 
     Paths are resolved relative to the INI, without opening them. Loading this
     configuration does not imply that calibration or source products exist.
+    Each workflow requires the provider paths it uses.
     """
 
     dtype: DTypeLike = np.float32
@@ -180,9 +181,9 @@ class E2ECalibrationConfiguration:
     coma_model: Path
     sensing_model: Path
     reconstructor_model: Path
-    science_psf: Path
-    ngs_psf: Path
-    ngs_metrics: Path
+    science_psf: Path | None = None
+    ngs_psf: Path | None = None
+    ngs_metrics: Path | None = None
     covariance: CovarianceCalibrationSettings = field(
         default_factory=CovarianceCalibrationSettings
     )
@@ -197,16 +198,11 @@ class E2ECalibrationConfiguration:
     def __post_init__(self):
         object.__setattr__(self, "dtype", validate_psf_dtype(self.dtype))
         object.__setattr__(self, "source", Path(self.source).expanduser().resolve())
-        for name in (
-            "covariance_model",
-            "coma_model",
-            "sensing_model",
-            "reconstructor_model",
-            "science_psf",
-            "ngs_psf",
-            "ngs_metrics",
-        ):
-            path = Path(getattr(self, name)).expanduser()
+        for name in _MODEL_KEYS + _PROVIDER_KEYS:
+            value = getattr(self, name)
+            if value is None and name in _PROVIDER_KEYS:
+                continue
+            path = Path(value).expanduser()
             if not path.is_absolute():
                 path = self.source.parent / path
             object.__setattr__(self, name, path.resolve())
@@ -265,6 +261,12 @@ class E2ECalibrationConfiguration:
         return replace(self, **updates)
 
 
+_SENSING_ASTERISM_COUNT_KEYS = (
+    "OneNGSAsterisms",
+    "TwoNGSAsterisms",
+    "ThreeNGSAsterisms",
+)
+
 _SETTINGS = {
     "covariance": CovarianceCalibrationSettings,
     "coma": ComaCalibrationSettings,
@@ -276,18 +278,52 @@ _MODEL_KEYS = (
     "coma_model",
     "sensing_model",
     "reconstructor_model",
-    "science_psf",
-    "ngs_psf",
-    "ngs_metrics",
 )
+_PROVIDER_KEYS = ("science_psf", "ngs_psf", "ngs_metrics")
+
+
+def _ini_key(name: str) -> str:
+    """Convert a Python configuration field to its key in the split INIs."""
+    acronyms = {"ee", "fwhm", "ngs", "psf"}
+    return "".join(
+        word.upper() if word in acronyms else word.title() for word in name.split("_")
+    )
+
+
+def _read_path_section(
+    parser: ConfigParser,
+    source: Path,
+    section: str,
+    fields: Mapping[str, str],
+    *,
+    required: tuple[str, ...] = (),
+    additional: tuple[str, ...] = (),
+) -> dict[str, Path]:
+    """Validate one path section and resolve its shared configuration fields."""
+    paths = parser[section] if parser.has_section(section) else {}
+    if missing := set(required) - paths.keys():
+        raise ValueError(f"[{section}] requires paths: {', '.join(sorted(missing))}")
+    if unknown := paths.keys() - fields.keys() - set(additional):
+        raise ValueError(f"Unknown keys in [{section}]: {sorted(unknown)}")
+    return {
+        name: resolve_ini_path(
+            paths[key], source=source, label=f"[{section}] {key}", must_exist=False
+        )
+        for key, name in fields.items()
+        if key in paths
+    }
 
 
 def load_e2e_calibration_configuration(path: str | Path) -> E2ECalibrationConfiguration:
-    """Read shared [e2e] and [calibration.<family>] sections of one INI.
+    """Read model paths, precision and calibration settings from one INI.
 
-    Required [e2e] paths are resolved relative to the INI without opening model
-    or native sources. Other sections belong to downstream owners. Unknown keys
-    in owned sections raise. Values use Python literals; enum strings may be
+    Resolve model destinations in [outputs] and provider paths in [inputs]
+    relative to the INI. Read precision from [settings]. The four calibration
+    sections use their family names.
+    Provider paths can be omitted when the workflow uses saved telemetry.
+    Existing combined INIs can use [e2e] with [calibration.<family>].
+    Parsing opens no model or native files. Unknown keys in owned sections
+    raise. Values use Python literals; enum strings may be
     unquoted. Fixed controller and photometry settings are supplied by the
     configured native adapter, then saved with accepted products.
 
@@ -295,7 +331,7 @@ def load_e2e_calibration_configuration(path: str | Path) -> E2ECalibrationConfig
         path: Shared calibration INI. Relative file paths resolve from its directory.
 
     Returns:
-        Effective settings and resolved file paths for calibration and prediction.
+        Effective settings and resolved file paths for calibration.
 
     Raises:
         FileNotFoundError: If the INI is missing.
@@ -306,7 +342,7 @@ def load_e2e_calibration_configuration(path: str | Path) -> E2ECalibrationConfig
 
 
 def _read_e2e_calibration_configuration(
-    parser: ConfigParser, source: Path
+    parser: ConfigParser, source: Path, *, prediction: bool = False
 ) -> E2ECalibrationConfiguration:
     """Read calibration values and resolve paths from an already parsed INI."""
     unknown_sections = {
@@ -316,32 +352,90 @@ def _read_e2e_calibration_configuration(
         raise ValueError(f"Unknown calibration sections: {sorted(unknown_sections)}")
     if parser.defaults():
         raise ValueError("[DEFAULT] values are not supported in the shared E2E INI")
-    if not parser.has_section("e2e") or (set(parser["e2e"]) - {"precision"}) != set(
-        _MODEL_KEYS
-    ):
-        raise ValueError(f"[e2e] requires exactly {', '.join(_MODEL_KEYS)}")
-    values = {"dtype": validate_psf_dtype(parser["e2e"].get("precision", "float32"))}
-    for key in _MODEL_KEYS:
-        values[key] = resolve_ini_path(
-            parser["e2e"][key], source=source, label=f"[e2e] {key}", must_exist=False
+    combined = parser.has_section("e2e")
+    if combined and any(name in parser for name in ("inputs", "outputs", "settings")):
+        raise ValueError("Use either [e2e] or separate [inputs] and [outputs].")
+    if not combined and any(section.startswith("calibration.") for section in parser):
+        raise ValueError(
+            "Use short calibration section names with [inputs] and [outputs]."
         )
+
+    if combined:
+        names = _MODEL_KEYS + _PROVIDER_KEYS
+        values = _read_path_section(
+            parser,
+            source,
+            "e2e",
+            {name: name for name in names},
+            required=names,
+            additional=("precision",),
+        )
+        precision = parser["e2e"].get("precision", "float32")
+    else:
+        model_paths = {f"{_ini_key(name)}Path": name for name in _MODEL_KEYS}
+        if prediction:
+            values = _read_path_section(
+                parser,
+                source,
+                "inputs",
+                model_paths
+                | {"SciencePSFPath": "science_psf", "NGSMetricsPath": "ngs_metrics"},
+                required=tuple(model_paths),
+            )
+            _read_path_section(
+                parser, source, "outputs", {}, additional=("OutputPath",)
+            )
+        else:
+            values = _read_path_section(
+                parser, source, "outputs", model_paths, required=tuple(model_paths)
+            )
+            inputs = _read_path_section(
+                parser,
+                source,
+                "inputs",
+                {"NGSPSFPath": "ngs_psf"},
+                additional=(
+                    "ReconstructorTelemetryPath",
+                    "CovarianceTelemetryPath",
+                    "ComaTelemetryPath",
+                    "SensingTelemetryPath",
+                ),
+            )
+            values.update(inputs)
+        settings = parser["settings"] if parser.has_section("settings") else {}
+        if unknown := settings.keys() - {"Precision"}:
+            raise ValueError(f"Unknown keys in [settings]: {sorted(unknown)}")
+        precision = settings.get("Precision", "float32")
+    values["dtype"] = validate_psf_dtype(precision)
     for family, cls in _SETTINGS.items():
-        section = f"calibration.{family}"
+        section = f"calibration.{family}" if combined else family
         raw_values = dict(parser[section]) if parser.has_section(section) else {}
-        unknown = raw_values.keys() - {item.name for item in fields(cls)}
+        if section == "sensing":
+            # The calibration recipe selects the asterisms for the blur fit.
+            for key in _SENSING_ASTERISM_COUNT_KEYS:
+                raw_values.pop(key, None)
+        field_names = {
+            field.name if combined else _ini_key(field.name): field.name
+            for field in fields(cls)
+        }
+        unknown = raw_values.keys() - field_names.keys()
         if unknown:
             raise ValueError(f"Unknown keys in [{section}]: {sorted(unknown)}")
         kwargs = {}
-        for name, raw in raw_values.items():
-            if isinstance(getattr(cls(), name), u.Quantity):
-                kwargs[name] = u.Quantity(raw)
+        for key, raw in raw_values.items():
+            name = field_names[key]
+            default = getattr(cls(), name)
+            if isinstance(default, u.Quantity):
+                kwargs[name] = (
+                    u.Quantity(raw) if combined else float(raw) * default.unit
+                )
                 continue
             try:
                 kwargs[name] = ast.literal_eval(raw)
             except (ValueError, SyntaxError):
-                if isinstance(getattr(cls(), name), str):
+                if isinstance(default, str):
                     kwargs[name] = raw
                 else:
-                    raise TypeError(f"Invalid [{section}] {name}: {raw}") from None
+                    raise TypeError(f"Invalid [{section}] {key}: {raw}") from None
         values[family] = cls(**kwargs)
     return E2ECalibrationConfiguration(source=source, **values)

@@ -374,10 +374,23 @@ def test_precision_configuration_defaults_ini_and_explicit_override(tmp_path):
 
 
 def test_sensing_history_controls_load_from_ini(tmp_path):
-    path = ini(tmp_path, "[calibration.sensing]\nnoise_realizations = 3\nnoise_frames = 256\n")
-    settings = load_e2e_calibration_configuration(path).sensing
+    path = tmp_path / "calibration.ini"
+    path.write_text(
+        "[outputs]\n"
+        "CovarianceModelPath = products/covariance/model.json\n"
+        "ComaModelPath = products/coma/model.json\n"
+        "SensingModelPath = products/sensing/model.json\n"
+        "ReconstructorModelPath = products/reconstructor/model.json\n"
+        "[sensing]\nNoiseRealizations = 3\nNoiseFrames = 256\nDisplacement = 12\n"
+    )
+    config = load_e2e_calibration_configuration(path)
+    assert config.science_psf is None
+    assert config.ngs_psf is None
+    assert config.ngs_metrics is None
+    settings = config.sensing
     assert settings.noise_realizations == 3
     assert settings.noise_frames == 256
+    assert settings.displacement == 12 * u.mas
 
 
 @pytest.mark.parametrize("reference", [

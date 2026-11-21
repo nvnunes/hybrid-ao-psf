@@ -324,7 +324,7 @@ def simulate_sensing_noise(
             getattr(settings, key) != getattr(response._sampling, key)
             for key in ("zero_draws", "gain_draws", "block_draws")
         )
-        or settings.displacement != response._displacement
+        or settings.displacement.astype(dtype) != response._displacement
     ):
         raise ValueError(
             "measurement sampling/displacement settings differ from captured measurements"

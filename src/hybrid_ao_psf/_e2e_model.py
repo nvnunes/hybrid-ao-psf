@@ -12,6 +12,7 @@ from dataclasses import dataclass, field, replace
 from pathlib import Path
 
 import numpy as np
+from ao_core.io.ini import read_ini
 from ao_core.models.control import TipTiltControl
 from ao_core.models.residual import (
     TiltCommandCovariances,
@@ -21,7 +22,7 @@ from ao_core.models.residual import (
 from astropy import units as u
 from numpy.typing import DTypeLike, NDArray
 
-from ._calibration_config import load_e2e_calibration_configuration
+from ._calibration_config import _read_e2e_calibration_configuration
 from ._calibration_contracts import _angle, _quantity
 from ._calibration_io import CalibrationFile, read_calibration_model_files
 from ._coma_calibration import ComaResponseModel, load_coma_calibration
@@ -414,7 +415,11 @@ def load_e2e_calibrated_model(
         FileNotFoundError: If the configuration or a provider file is missing.
         ValueError: If products conflict or their data fail validation.
     """
-    config = load_e2e_calibration_configuration(path)
+    source, parser = read_ini(path)
+    config = _read_e2e_calibration_configuration(parser, source, prediction=True)
+    ngs_metrics_path = config.ngs_metrics
+    if ngs_metrics_path is None:
+        raise ValueError("[inputs] requires NGSMetricsPath for calibrated prediction.")
     paths = {
         name: getattr(config, name + "_model")
         for name in ("covariance", "coma", "sensing", "reconstructor")
@@ -423,18 +428,18 @@ def load_e2e_calibrated_model(
         name: read_calibration_model_files(value) for name, value in paths.items()
     }
     model_files["ngs_metrics"] = CalibrationFile(
-        config.ngs_metrics, hashlib.sha256(config.ngs_metrics.read_bytes()).hexdigest()
+        ngs_metrics_path, hashlib.sha256(ngs_metrics_path.read_bytes()).hexdigest()
     )
     model = E2ECalibratedModel(
         covariance=load_covariance_calibration(paths["covariance"]),
         coma=load_coma_calibration(paths["coma"]),
         sensing=load_sensing_calibration(paths["sensing"]),
         reconstructor=load_reconstructor_calibration(paths["reconstructor"]),
-        ngs_metrics=load_psf_metric_interpolator(config.ngs_metrics),
+        ngs_metrics=load_psf_metric_interpolator(ngs_metrics_path),
         dtype=config.dtype if dtype is None else dtype,
         _input_files={
             **{f"{name}_model": str(path) for name, path in paths.items()},
-            "ngs_metrics": str(config.ngs_metrics),
+            "ngs_metrics": str(ngs_metrics_path),
         },
     )
     for model_file in model_files.values():

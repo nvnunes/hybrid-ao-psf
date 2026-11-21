@@ -29,8 +29,8 @@ open `science_psf`, `ngs_psf` or native acquisition references. Missing products
 and conflicting controller or photometry settings raise. Calibration controls
 in the INI govern calibration, not reinterpretation of fitted products.
 
-Precision resolves from float32 default, then `[e2e] precision`, then an explicit
-`dtype` argument. `model.prepare(dtype=...)` converts immutable runtime state
+Precision resolves from the float32 default, then `[settings] Precision`
+in the INI, then an explicit `dtype` argument. `model.prepare(dtype=...)` converts immutable runtime state
 without changing saved products or recovering information lost during earlier
 rounding. Once prepared, prediction performs no file I/O. The loader verifies
 the calibrated model files and NGS metric interpolator. Standalone INI runs record their manifest and interpolator paths under
